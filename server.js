@@ -727,18 +727,7 @@ app.get('/postback/:slug', (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
 
-  let amount;
-  if (adv.payout_amount > 0) {
-    amount = adv.payout_amount;
-  } else {
-    const reqPayout = parseFloat(payout);
-    if (reqPayout > 0) {
-      console.warn(`[postback] advertiser ${slug} has no payout_amount — using request payout=${reqPayout}`);
-      amount = reqPayout;
-    } else {
-      amount = 0;
-    }
-  }
+  const amount = adv.payout_amount > 0 ? adv.payout_amount : 0;
 
   const pub = click.publisher;
 
