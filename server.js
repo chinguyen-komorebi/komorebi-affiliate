@@ -78,7 +78,7 @@ app.use(session({
 
 const PORT       = process.env.PORT       || 3000;
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-let ADMIN_PASS   = process.env.ADMIN_PASS || 'changeme';
+let ADMIN_PASS   = process.env.ADMIN_PASS;
 const BASE_URL   = process.env.BASE_URL   || `http://localhost:${PORT}`;
 
 if (!process.env.SESSION_SECRET) {
@@ -91,6 +91,11 @@ const GMAIL_PASS     = process.env.GMAIL_PASS;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT  = process.env.TELEGRAM_CHAT_ID   || '';
 const SLACK_URL      = process.env.SLACK_WEBHOOK_URL  || '';
+
+if (process.env.NODE_ENV === 'production' && !ADMIN_PASS) {
+  console.error('FATAL: ADMIN_PASS must be set in production.');
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
 // IP whitelist for /postback/*
@@ -1366,7 +1371,7 @@ app.post('/admin/publishers/:id/regenerate-key', requireAdmin, (req, res) => {
 app.post('/admin/publishers/:id/revoke-key', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
-  db.prepare('UPDATE publishers SET api_key = NULL WHERE id = ?').run(pub.id);
+  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = NULL WHERE id = ?').run(pub.id);
   logAudit('api_key.revoked', 'publisher', pub.username, {}, req);
   res.redirect(`/admin/publishers/${pub.id}/edit?msg=API+key+revoked`);
 });
@@ -4583,7 +4588,7 @@ cron.schedule('*/5 * * * *', () => {
 
 app.listen(PORT, () => {
   console.log(`\nKomorebi Affiliate Tracker`);
-  console.log(`  Admin      : ${BASE_URL}/admin  (HTTP Basic: ${ADMIN_USER} / ${ADMIN_PASS})`);
+  console.log(`  Admin      : ${BASE_URL}/admin  (user: ${ADMIN_USER})`);
   console.log(`  Publishers : ${BASE_URL}/publisher/login`);
   console.log(`  Track      : ${BASE_URL}/track/:advertiser?pub=PUBLISHER`);
   console.log(`  Postback   : ${BASE_URL}/postback/:advertiser?click_id=X&payout=Y&event=sale\n`);
