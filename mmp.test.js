@@ -1,0 +1,135 @@
+'use strict';
+// F20 — MMP (AppsFlyer) integration tests. Runs a mock AppsFlyer Reports API.
+// Boot server with: MMP_ENCRYPTION_KEY=<64hex> MMP_APPSFLYER_BASE=http://localhost:4600
+//   RATE_LIMIT_MAX=100000 POSTBACK_WHITELIST_ENABLED=false SESSION_SECRET=x ADMIN_USER=admin ADMIN_PASS=testpass123 PORT=3999
+
+const http = require('node:http');
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+
+const BASE = process.env.E2E_BASE || 'http://localhost:3999';
+const db = new DatabaseSync(path.join(__dirname, 'affiliate.db'));
+db.exec('PRAGMA busy_timeout = 5000');
+
+let pass = 0; const failures = [];
+const ok = (n, c, x = '') => { c ? pass++ : failures.push(n + (x ? ` — ${x}` : '')); };
+
+// ---- mock AppsFlyer server (mutable state) ----
+const mock = { validToken: 'VALID-TOKEN', csv: 'click_id,status\n' };
+const afServer = http.createServer((req, res) => {
+  const auth = req.headers.authorization || '';
+  if (auth !== `Bearer ${mock.validToken}`) { res.statusCode = 401; return res.end('unauthorized'); }
+  res.setHeader('Content-Type', 'text/csv');
+  res.end(mock.csv);
+});
+
+function makeJar() {
+  let cookie = '';
+  return {
+    get cookie() { return cookie; },
+    async req(method, p, { form, headers = {} } = {}) {
+      const h = { ...headers }; if (cookie) h.Cookie = cookie;
+      let body; if (form) { body = new URLSearchParams(form).toString(); h['Content-Type'] = 'application/x-www-form-urlencoded'; }
+      const res = await fetch(BASE + p, { method, headers: h, body, redirect: 'manual' });
+      for (const c of (res.headers.getSetCookie?.() || [])) {
+        const kv = c.split(';')[0], name = kv.split('=')[0];
+        const parts = (cookie ? cookie.split('; ') : []).filter(x => x.split('=')[0] !== name);
+        parts.push(kv); cookie = parts.join('; ');
+      }
+      return res;
+    },
+  };
+}
+const txt = r => r.text();
+async function csrf(jar, p) { return (((await txt(await jar.req('GET', p))).match(/name="_csrf" value="([a-f0-9]+)"/)) || [])[1] || ''; }
+async function adminPost(jar, p, form, csrfPage) { return jar.req('POST', p, { form: { ...form, _csrf: await csrf(jar, csrfPage) } }); }
+async function track(slug, pub) {
+  const res = await fetch(`${BASE}/track/${slug}?pub=${pub}`, { redirect: 'manual' });
+  return ((res.headers.get('location') || '').match(/click_id=([a-f0-9-]+)/) || [])[1] || null;
+}
+
+(async () => {
+  await new Promise(r => afServer.listen(4600, r));
+  const admin = makeJar();
+  await admin.req('POST', '/admin/login', { form: { username: 'admin', password: 'testpass123' } });
+
+  // create advertiser with AppsFlyer creds + publisher + assignment
+  await adminPost(admin, '/admin/advertisers',
+    { name: 'MMPAdv', slug: 'mmpadv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed',
+      click_lookback_window: 30, mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'VALID-TOKEN', status: 'active' },
+    '/admin/advertisers/new');
+  await adminPost(admin, '/admin/publishers', { username: 'mmppub', password: 'mmppubpass1', status: 'active' }, '/admin/publishers/new');
+  const advId = db.prepare("SELECT id FROM advertisers WHERE slug='mmpadv'").get().id;
+  const pubId = db.prepare("SELECT id FROM publishers WHERE username='mmppub'").get().id;
+  await adminPost(admin, `/admin/publishers/${pubId}/assign`, { advertiser_id: advId }, `/admin/publishers/${pubId}/edit`);
+
+  // ---- encryption at rest ----
+  const stored = db.prepare("SELECT mmp_api_token FROM advertisers WHERE slug='mmpadv'").get().mmp_api_token;
+  ok('encrypted token at rest (enc:v1 prefix, not plaintext)', stored.startsWith('enc:v1:') && !stored.includes('VALID-TOKEN'), stored.slice(0, 16));
+  // decrypt-for-display: edit page shows the real token in the field
+  const editHtml = await txt(await admin.req('GET', '/admin/advertisers/mmpadv/edit'));
+  ok('edit page decrypts token for masked field', editHtml.includes('id="mmptoken" name="mmp_api_token" value="VALID-TOKEN"'));
+
+  // ---- test connection ----
+  const testRes = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-test', {}, '/admin/advertisers/mmpadv/edit');
+  ok('mmp-test valid creds → ok=1', (testRes.headers.get('location') || '').includes('ok=1'));
+  // invalid token → 401 from mock
+  await adminPost(admin, '/admin/advertisers/mmpadv/update',
+    { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,
+      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'BAD-TOKEN', status: 'active' },
+    '/admin/advertisers/mmpadv/edit');
+  const testBad = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-test', {}, '/admin/advertisers/mmpadv/edit');
+  ok('mmp-test invalid creds → ok=0', (testBad.headers.get('location') || '').includes('ok=0'));
+  // restore valid token
+  await adminPost(admin, '/admin/advertisers/mmpadv/update',
+    { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,
+      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'VALID-TOKEN', status: 'active' },
+    '/admin/advertisers/mmpadv/edit');
+
+  // ---- create pending conversions, then sync ----
+  const cA = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cA}&event=sale`, { redirect: 'manual' });
+  const cB = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cB}&event=sale`, { redirect: 'manual' });
+  const cC = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cC}&event=sale`, { redirect: 'manual' });
+  ok('3 pending conversions created',
+    db.prepare("SELECT COUNT(*) n FROM conversions WHERE advertiser_slug='mmpadv' AND status='pending'").get().n === 3);
+
+  mock.csv = `click_id,status\n${cA},attributed\n${cB},organic\n${cC},fraud\nno-match-xyz,attributed\n`;
+  const runRes = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
+  ok('mmp-sync/run → ok=1 redirect', (runRes.headers.get('location') || '').includes('ok=1'));
+
+  const stA = db.prepare('SELECT status, reason FROM conversions WHERE click_id=?').get(cA);
+  const stB = db.prepare('SELECT status, reason FROM conversions WHERE click_id=?').get(cB);
+  const stC = db.prepare('SELECT status, reason FROM conversions WHERE click_id=?').get(cC);
+  ok('sync auto-approve attributed', stA.status === 'approved' && stA.reason === 'mmp_attributed');
+  ok('sync auto-reject organic', stB.status === 'rejected' && stB.reason === 'mmp_rejected');
+  ok('sync auto-reject fraud', stC.status === 'rejected' && stC.reason === 'mmp_rejected');
+
+  const log = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
+  ok('sync log: pulled=4 matched=3 approved=1 rejected=2 success',
+    log.events_pulled === 4 && log.matched === 3 && log.auto_approved === 1 && log.auto_rejected === 2 && log.status === 'success',
+    JSON.stringify({ p: log.events_pulled, m: log.matched, a: log.auto_approved, r: log.auto_rejected, s: log.status }));
+  ok('sync log records unmatched event in errors', !!log.errors && log.errors.includes('no-match-xyz'));
+
+  // re-sync should not re-decide already-decided conversions (idempotent on status)
+  const runRes2 = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
+  const log2 = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
+  ok('re-sync matches but approves/rejects 0 (already decided)', log2.matched === 3 && log2.auto_approved === 0 && log2.auto_rejected === 0);
+
+  // ---- sync failure path (bad token → mock 401) ----
+  await adminPost(admin, '/admin/advertisers/mmpadv/update',
+    { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,
+      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'BAD-TOKEN', status: 'active' },
+    '/admin/advertisers/mmpadv/edit');
+  await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
+  const failLog = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
+  ok('sync failure logged as failed with error', failLog.status === 'failed' && !!failLog.errors);
+
+  // ---- dashboard renders log entries ----
+  const dash = await txt(await admin.req('GET', '/admin/advertisers/mmpadv/mmp-sync'));
+  ok('sync dashboard renders runs + Run Sync button', dash.includes('MMP Sync') && dash.includes('Run Sync Now'));
+
+  afServer.close();
+  console.log(`\nPASSED: ${pass}`);
+  if (failures.length) { console.log(`FAILED: ${failures.length}`); failures.forEach(f => console.log('  ✗ ' + f)); process.exit(1); }
+  console.log('ALL GREEN ✓'); process.exit(0);
+})().catch(e => { console.error('HARNESS ERROR:', e); process.exit(2); });

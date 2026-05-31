@@ -62,17 +62,42 @@ app.use(helmet({
       imgSrc:     ["'self'", "data:"],
     },
   },
+  // F19(G) — explicit HSTS (sent by browsers only over HTTPS). 1 year + subdomains.
+  hsts: { maxAge: 31_536_000, includeSubDomains: true },
 }));
+// F19(G) — Permissions-Policy (opt out of FLoC/Topics)
+app.use((req, res, next) => { res.setHeader('Permissions-Policy', 'interest-cohort=()'); next(); });
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
+
+// F19(F) — input hardening on POST bodies: strip null bytes, reject oversized fields.
+app.use((req, res, next) => {
+  if (req.body && typeof req.body === 'object') {
+    for (const [k, v] of Object.entries(req.body)) {
+      if (typeof v === 'string') {
+        if (v.length > 2000) return res.status(400).json({ error: `Field "${k}" exceeds 2000 characters` });
+        req.body[k] = v.replace(/\0/g, '');
+      } else if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) {
+          if (typeof v[i] === 'string') {
+            if (v[i].length > 2000) return res.status(400).json({ error: `Field "${k}" exceeds 2000 characters` });
+            v[i] = v[i].replace(/\0/g, '');
+          }
+        }
+      }
+    }
+  }
+  next();
+});
+
 app.use(session({
   secret: process.env.SESSION_SECRET || 'komorebi-dev-secret-change-in-prod',
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite: 'strict',                 // F18(A) — hardened from 'lax'
     secure: process.env.NODE_ENV === 'production',
-    maxAge: 8 * 60 * 60 * 1000, // 8 hours
+    maxAge: 24 * 60 * 60 * 1000,        // F18(A) — 24h cookie ceiling; admin + publisher also have a 5-min idle timeout
   },
 }));
 
@@ -95,6 +120,111 @@ const SLACK_URL      = process.env.SLACK_WEBHOOK_URL  || '';
 if (process.env.NODE_ENV === 'production' && !ADMIN_PASS) {
   console.error('FATAL: ADMIN_PASS must be set in production.');
   process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// F20 — MMP (AppsFlyer) config + token encryption (AES-256-GCM)
+// ---------------------------------------------------------------------------
+const MMP_APPSFLYER_BASE = process.env.MMP_APPSFLYER_BASE || 'https://hq1.appsflyer.com';
+
+function mmpKey() {
+  const k = process.env.MMP_ENCRYPTION_KEY;
+  if (!k) return null;
+  return /^[0-9a-fA-F]{64}$/.test(k) ? Buffer.from(k, 'hex') : crypto.createHash('sha256').update(k).digest();
+}
+if (!mmpKey()) {
+  console.warn('WARNING: MMP_ENCRYPTION_KEY not set — MMP API tokens will be stored in PLAINTEXT. Set a 32-byte hex key in production.');
+}
+
+// Encrypt an MMP token for storage. Returns "enc:v1:<iv>:<tag>:<ct>" (hex) or, if
+// no key is configured, the plaintext (a startup warning is logged in that case).
+function encryptToken(plain) {
+  if (plain == null || plain === '') return null;
+  const key = mmpKey();
+  if (!key) return plain;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+  return `enc:v1:${iv.toString('hex')}:${cipher.getAuthTag().toString('hex')}:${ct.toString('hex')}`;
+}
+// Decrypt a stored token. Plaintext (no "enc:v1:" prefix) is returned as-is.
+function decryptToken(stored) {
+  if (stored == null || stored === '') return null;
+  if (!String(stored).startsWith('enc:v1:')) return stored;
+  const key = mmpKey();
+  if (!key) return null;
+  try {
+    const [, , ivh, tagh, cth] = stored.split(':');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivh, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagh, 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(cth, 'hex')), decipher.final()]).toString('utf8');
+  } catch { return null; }
+}
+
+// Pull in-app events from the AppsFlyer Reports API v5 (CSV) for a date range.
+// Returns [{ click_id, status }]. Throws on missing creds / non-2xx.
+async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
+  const token = decryptToken(adv.mmp_api_token);
+  if (!token) throw new Error('No API token configured');
+  if (!adv.mmp_app_id) throw new Error('No app ID configured');
+  const url = `${MMP_APPSFLYER_BASE}/api/raw-data/export/app/${encodeURIComponent(adv.mmp_app_id)}/in_app_events_report/v5`
+    + `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&maximum_rows=${maxRows}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}`, accept: 'text/csv' }, signal: AbortSignal.timeout(30_000) });
+  if (!resp.ok) throw new Error(`AppsFlyer API HTTP ${resp.status}`);
+  const rows = parseCSV(await resp.text()); // headers lowercased + underscored by parseCSV
+  return rows
+    .map(r => ({ click_id: (r.click_id || r.clickid || '').trim(), status: (r.status || r.af_status || '').trim().toLowerCase() }))
+    .filter(r => r.click_id || r.status);
+}
+
+// Lightweight connection test — a 1-row report request validates token + app access.
+async function mmpTestConnection(adv) {
+  const token = decryptToken(adv.mmp_api_token);
+  if (!token) return { ok: false, message: 'No API token configured.' };
+  if (!adv.mmp_app_id) return { ok: false, message: 'No app ID configured.' };
+  const today = new Date().toISOString().slice(0, 10);
+  const url = `${MMP_APPSFLYER_BASE}/api/raw-data/export/app/${encodeURIComponent(adv.mmp_app_id)}/in_app_events_report/v5?from=${today}&to=${today}&maximum_rows=1`;
+  try {
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}`, accept: 'text/csv' }, signal: AbortSignal.timeout(15_000) });
+    if (resp.ok) return { ok: true, message: 'Connection OK — AppsFlyer credentials valid.' };
+    if (resp.status === 401 || resp.status === 403) return { ok: false, message: `Authentication failed (HTTP ${resp.status}).` };
+    return { ok: false, message: `AppsFlyer returned HTTP ${resp.status}.` };
+  } catch (e) { return { ok: false, message: `Connection error: ${e.message}` }; }
+}
+
+// Manual sync: pull last 24h of events, match by click_id, auto-approve/reject
+// pending conversions, log the run, and send a Telegram summary.
+async function runMmpSync(adv) {
+  const fromStr = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 10);
+  const toStr   = new Date().toISOString().slice(0, 10);
+  let events;
+  try {
+    events = await mmpFetchEvents(adv, fromStr, toStr);
+  } catch (e) {
+    db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, errors, status) VALUES (?,?,?,?,?,?,?)')
+      .run(adv.slug, 0, 0, 0, 0, JSON.stringify([e.message]), 'failed');
+    sendTelegram(`\u{274C} MMP sync failed for <b>${adv.name}</b>: ${e.message}`).catch(() => {});
+    return { ok: false, error: e.message };
+  }
+
+  let matched = 0, approved = 0, rejected = 0; const errors = [];
+  const findConv  = db.prepare("SELECT id, status FROM conversions WHERE advertiser_slug = ? AND click_id = ? ORDER BY (status='pending') DESC, id DESC LIMIT 1");
+  const setStatus = db.prepare('UPDATE conversions SET status = ?, reason = ? WHERE id = ?');
+  for (const ev of events) {
+    if (!ev.click_id) { errors.push(`event with no click_id (status=${ev.status || '?'})`); continue; }
+    const conv = findConv.get(adv.slug, ev.click_id);
+    if (!conv) { errors.push(`unmatched click_id ${ev.click_id}`); continue; }
+    matched++;
+    if (conv.status !== 'pending') continue; // never override an already-decided conversion
+    const s = ev.status;
+    if (s === 'attributed' || s === 'non-organic' || s === 'nonorganic') { setStatus.run('approved', 'mmp_attributed', conv.id); approved++; }
+    else if (s === 'organic' || s === 'fraud' || s === 'rejected')        { setStatus.run('rejected', 'mmp_rejected', conv.id); rejected++; }
+  }
+
+  db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, errors, status) VALUES (?,?,?,?,?,?,?)')
+    .run(adv.slug, events.length, matched, approved, rejected, errors.length ? JSON.stringify(errors.slice(0, 500)) : null, 'success');
+  sendTelegram(`\u{1F4E5} MMP sync — <b>${adv.name}</b>: ${events.length} pulled, ${matched} matched, ${approved} auto-approved, ${rejected} auto-rejected.`).catch(() => {});
+  return { ok: true, events_pulled: events.length, matched, auto_approved: approved, auto_rejected: rejected, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -140,26 +270,33 @@ function isWhitelisted(ip) {
 // Rate limiter — 100 req/min per IP (all routes)
 // ---------------------------------------------------------------------------
 
-const rlMap          = new Map();
+const RATE_LIMIT_MAX          = parseInt(process.env.RATE_LIMIT_MAX, 10) > 0 ? parseInt(process.env.RATE_LIMIT_MAX, 10) : 100; // global req/min per IP
+const POSTBACK_RATE_LIMIT_MAX = parseInt(process.env.POSTBACK_RATE_LIMIT_MAX, 10) > 0 ? parseInt(process.env.POSTBACK_RATE_LIMIT_MAX, 10) : 300; // F19(E) — MMP bulk postbacks
 const adminLoginAttempts     = new Map(); // ip → { count, firstAt, blockedUntil }
 const publisherLoginAttempts = new Map();
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, r] of rlMap) if (now > r.resetAt) rlMap.delete(k);
-}, 60_000).unref();
 
-function rateLimit(req, res, next) {
-  const ip  = req.ip;
-  const now = Date.now();
-  let r = rlMap.get(ip);
-  if (!r || now > r.resetAt) { r = { count: 0, resetAt: now + 60_000 }; rlMap.set(ip, r); }
-  r.count++;
-  res.setHeader('X-RateLimit-Limit', '100');
-  res.setHeader('X-RateLimit-Remaining', Math.max(0, 100 - r.count));
-  if (r.count > 100) return res.status(429).json({ error: 'Rate limit exceeded — max 100 req/min' });
-  next();
+// Per-IP fixed-window rate limiter factory (60s window). Each limiter has its own map.
+function makeRateLimiter(max) {
+  const map = new Map();
+  setInterval(() => { const now = Date.now(); for (const [k, r] of map) if (now > r.resetAt) map.delete(k); }, 60_000).unref();
+  return function (req, res, next) {
+    const ip = req.ip, now = Date.now();
+    let r = map.get(ip);
+    if (!r || now > r.resetAt) { r = { count: 0, resetAt: now + 60_000 }; map.set(ip, r); }
+    r.count++;
+    res.setHeader('X-RateLimit-Limit', String(max));
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, max - r.count));
+    if (r.count > max) return res.status(429).json({ error: `Rate limit exceeded — max ${max} req/min` });
+    next();
+  };
 }
-app.use(rateLimit);
+
+const globalLimiter   = makeRateLimiter(RATE_LIMIT_MAX);
+const postbackLimiter = makeRateLimiter(POSTBACK_RATE_LIMIT_MAX); // F19(E) mounted on /postback/*
+const applyLimiter    = makeRateLimiter(10);                      // F19(E) mounted on /marketplace/apply
+
+// Global limiter applies everywhere except /postback/* (those get their own higher limit).
+app.use((req, res, next) => (req.path.startsWith('/postback/') ? next() : globalLimiter(req, res, next)));
 
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_MAX_FAILS = 5;
@@ -310,13 +447,33 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+// F18(C) — PII masking for audit-log detail. Masks API keys, emails, phones.
+function maskValue(s) {
+  if (typeof s !== 'string') return s;
+  let out = s;
+  out = out.replace(/kom_live_[A-Za-z0-9]+/g, 'kom_live_***');                       // never store full API keys
+  out = out.replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g,
+    (_m, a, d) => `${a}***@${d}`);                                                    // c***@domain
+  out = out.replace(/(?:\+?84|0)\d[\d\s-]{7,11}\d/g, (m) => {                          // VN phone → 0967***857
+    const d = m.replace(/\D/g, '');
+    return (d.length >= 9 && d.length <= 12) ? d.slice(0, 4) + '***' + d.slice(-3) : m;
+  });
+  return out;
+}
+function maskPII(v) {
+  if (typeof v === 'string') return maskValue(v);
+  if (Array.isArray(v)) return v.map(maskPII);
+  if (v && typeof v === 'object') { const o = {}; for (const [k, val] of Object.entries(v)) o[k] = maskPII(val); return o; }
+  return v;
+}
+
 function logAudit(action, entityType, entityId, detail, reqOrIp) {
   const isReq = reqOrIp && typeof reqOrIp === 'object';
   const ip = isReq ? getIp(reqOrIp) : (reqOrIp || '');
   const tz = isReq ? detectTz(reqOrIp) : FALLBACK_TZ;
   db.prepare(
     'INSERT INTO audit_log (action, entity_type, entity_id, detail, ip_address, timezone) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(action, entityType ?? null, String(entityId ?? ''), JSON.stringify(detail ?? {}), ip, tz);
+  ).run(action, entityType ?? null, String(entityId ?? ''), JSON.stringify(maskPII(detail ?? {})), ip, tz);
 }
 
 
@@ -530,15 +687,23 @@ async function sendDailySummaryEmail() {
 const S2S_MAX_ATTEMPTS = 3;
 const S2S_RETRY_MS     = 5 * 60 * 1_000; // 5 minutes
 
-async function fireS2SPostback(publisher, { click_id, payout, event, advertiser }, attempt = 1) {
+async function fireS2SPostback(publisher, data, attempt = 1) {
+  const { click_id, payout, event, advertiser } = data;
   const pub = db.prepare('SELECT postback_url FROM publishers WHERE username = ?').get(publisher);
   if (!pub?.postback_url) return;
 
-  const url = pub.postback_url
-    .replace('{click_id}',   encodeURIComponent(click_id))
-    .replace('{payout}',     payout)
-    .replace('{event}',      encodeURIComponent(event))
-    .replace('{advertiser}', encodeURIComponent(advertiser));
+  // Macro map — supports {click_id} {payout} {event} {advertiser},
+  // sub-params {sub1}…{sub5} {subpub} (F7), and mapped {campaign} {adgroup} {creative} {network} (F10).
+  // Missing values resolve to empty string; every occurrence is replaced.
+  const macros = {
+    click_id, payout, event, advertiser,
+    sub1: data.sub1, sub2: data.sub2, sub3: data.sub3, sub4: data.sub4, sub5: data.sub5, subpub: data.subpub,
+    campaign: data.campaign, adgroup: data.adgroup, creative: data.creative, network: data.network,
+  };
+  const url = Object.entries(macros).reduce(
+    (u, [k, v]) => u.replaceAll(`{${k}}`, encodeURIComponent(v == null ? '' : String(v))),
+    pub.postback_url
+  );
 
   let http_status = null;
   let success     = false;
@@ -559,7 +724,7 @@ async function fireS2SPostback(publisher, { click_id, payout, event, advertiser 
 
   if (!success && attempt < S2S_MAX_ATTEMPTS) {
     setTimeout(
-      () => fireS2SPostback(publisher, { click_id, payout, event, advertiser }, attempt + 1).catch(() => {}),
+      () => fireS2SPostback(publisher, data, attempt + 1).catch(() => {}),
       S2S_RETRY_MS
     );
   }
@@ -582,8 +747,19 @@ function verifyCsrf(req, res, next) {
   next();
 }
 
+// Idle timeouts. ADMIN_IDLE_SECONDS (env) overrides BOTH admin and publisher (for tests).
+const IDLE_OVERRIDE_MS = parseInt(process.env.ADMIN_IDLE_SECONDS, 10) > 0 ? parseInt(process.env.ADMIN_IDLE_SECONDS, 10) * 1000 : null;
+const ADMIN_IDLE_MS     = IDLE_OVERRIDE_MS ?? 5 * 60 * 1000; // admin auto-logout after 5 min idle
+const PUBLISHER_IDLE_MS = IDLE_OVERRIDE_MS ?? 5 * 60 * 1000; // publisher auto-logout after 5 min idle
+
 function requireAdmin(req, res, next) {
   if (!req.session?.isAdmin) return res.redirect('/admin/login');
+  // F18(A) — enforce idle timeout: destroy session if inactive > 5 min, else bump activity.
+  const now = Date.now();
+  if (req.session.adminLastActivity && now - req.session.adminLastActivity > ADMIN_IDLE_MS) {
+    return req.session.destroy(() => res.redirect('/admin/login?err=' + encodeURIComponent('Session expired due to inactivity')));
+  }
+  req.session.adminLastActivity = now;
   if (!req.session.csrfToken) req.session.csrfToken = generateCsrfToken();
   res.cookie('_csrf', req.session.csrfToken, {
     httpOnly: false,
@@ -614,13 +790,156 @@ function checkPassword(plain, stored) {
 function requirePublisher(req, res, next) {
   const id = req.session?.pubId;
   if (!id) return res.redirect('/publisher/login');
+  // Idle timeout (same pattern as requireAdmin): destroy session if inactive > 5 min.
+  const now = Date.now();
+  if (req.session.pubLastActivity && now - req.session.pubLastActivity > PUBLISHER_IDLE_MS) {
+    return req.session.destroy(() => res.redirect('/publisher/login?err=' + encodeURIComponent('Session expired')));
+  }
   const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(id);
   if (!pub || pub.status !== 'active') {
     req.session.destroy(() => {});
     return res.redirect('/publisher/login?err=Account+is+disabled');
   }
+  req.session.pubLastActivity = now;
+  // Ensure a CSRF token exists for the portal's POST forms (change password).
+  if (!req.session.csrfToken) req.session.csrfToken = generateCsrfToken();
   req.publisher = pub;
   next();
+}
+
+// ---------------------------------------------------------------------------
+// Publisher ↔ advertiser assignment + conversion-goal helpers
+// ---------------------------------------------------------------------------
+
+// Advertisers a publisher is assigned to (active, non-legacy), with the
+// assignment metadata (payout_override / validity window / monthly cap).
+function assignedAdvertisers(publisherId) {
+  return db.prepare(`
+    SELECT a.*, pa.payout_override, pa.valid_from, pa.valid_until, pa.monthly_cap, pa.assigned_at
+    FROM publisher_advertisers pa
+    JOIN advertisers a ON a.id = pa.advertiser_id
+    WHERE pa.publisher_id = ? AND a.slug != 'legacy'
+    ORDER BY a.name
+  `).all(publisherId);
+}
+
+// Returns the assignment row for a publisher (username) ↔ advertiser (slug)
+// pair, or null if the publisher is not assigned to that advertiser.
+function getAssignment(username, slug) {
+  return db.prepare(`
+    SELECT pa.*
+    FROM publisher_advertisers pa
+    JOIN publishers  p ON p.id = pa.publisher_id
+    JOIN advertisers a ON a.id = pa.advertiser_id
+    WHERE p.username = ? AND a.slug = ?
+  `).get(username, slug) || null;
+}
+
+// Pick an active goal for an advertiser whose event_token matches the postback
+// event, or null. Used to choose a per-event payout.
+function matchGoal(advertiserId, event) {
+  return db.prepare(
+    "SELECT * FROM goals WHERE advertiser_id = ? AND event_token = ? AND status = 'active'"
+  ).get(advertiserId, event) || null;
+}
+
+// Resolve the payout for a conversion. Precedence:
+//   1. assignment.payout_override — always a fixed dollar amount, wins outright
+//   2. matching goal           — fixed dollars, or percent of loan_amount
+//   3. advertiser default      — fixed dollars, or percent of loan_amount
+// Percentage with a missing/zero loan_amount yields 0 (note: 'missing_loan_amount');
+// it never falls back to a fixed default. Returns { amount, note }.
+function computePayout(assignment, adv, goal, loanAmount) {
+  if (assignment.payout_override != null) {
+    return { amount: assignment.payout_override, note: null };
+  }
+  const src = goal
+    ? { type: goal.payout_type, value: goal.payout }
+    : { type: adv.payout_type,  value: adv.payout_amount };
+
+  if (src.type === 'percent') {
+    if (!loanAmount || loanAmount <= 0) return { amount: 0, note: 'missing_loan_amount' };
+    return { amount: Math.round(loanAmount * src.value) / 100, note: null }; // value% of loanAmount, 2dp
+  }
+  return { amount: src.value > 0 ? src.value : 0, note: null };
+}
+
+// Enforce an assignment's validity window and monthly cap at postback time.
+// Returns { reason, message } when the conversion must be blocked, else null.
+//   - valid_from / valid_until: inclusive UTC date window (YYYY-MM-DD)
+//   - monthly_cap: max APPROVED conversions for this pair in the UTC month.
+//     Note: conversions are recorded as 'pending' and only count once approved
+//     (e.g. via reconciliation), so the cap blocks new postbacks only after
+//     enough prior conversions have been approved.
+function assignmentBlock(assignment, publisher, slug) {
+  const today = new Date().toISOString().slice(0, 10); // UTC date
+  if (assignment.valid_from && today < assignment.valid_from) {
+    return { reason: 'assignment_not_active', message: `Assignment for "${slug}" is not active until ${assignment.valid_from}` };
+  }
+  if (assignment.valid_until && today > assignment.valid_until) {
+    return { reason: 'assignment_expired', message: `Assignment for "${slug}" expired on ${assignment.valid_until}` };
+  }
+  if (assignment.monthly_cap != null) {
+    const used = db.prepare(`
+      SELECT COUNT(*) AS n FROM conversions
+      WHERE publisher = ? AND advertiser_slug = ? AND status = 'approved'
+        AND strftime('%Y-%m', received_at) = strftime('%Y-%m', 'now')
+    `).get(publisher, slug).n;
+    if (used >= assignment.monthly_cap) {
+      return { reason: 'monthly_cap_reached', message: `Monthly cap of ${assignment.monthly_cap} reached for "${slug}" this month` };
+    }
+  }
+  return null;
+}
+
+// F12 — count APPROVED conversions for an advertiser in the current UTC month,
+// excluding anything before the manual cap-reset floor (cap_reset_at).
+function advertiserApprovedCount(adv) {
+  return db.prepare(`
+    SELECT COUNT(*) AS n FROM conversions
+    WHERE advertiser_slug = ? AND status = 'approved'
+      AND strftime('%Y-%m', received_at) = strftime('%Y-%m', 'now')
+      AND (? IS NULL OR received_at > ?)
+  `).get(adv.slug, adv.cap_reset_at, adv.cap_reset_at).n;
+}
+
+// F12 — send a Telegram cap alert at a threshold (80 or 100) at most once per
+// UTC month per threshold. Alert-throttle state lives on the advertiser row.
+function maybeAlertAdvertiserCap(adv, used, cap, threshold) {
+  const month = new Date().toISOString().slice(0, 7);
+  const row = db.prepare('SELECT cap_alert_month, cap_alerted_80, cap_alerted_100 FROM advertisers WHERE id = ?').get(adv.id);
+  let alerted80  = row.cap_alert_month === month ? row.cap_alerted_80  : 0;
+  let alerted100 = row.cap_alert_month === month ? row.cap_alerted_100 : 0;
+  if (threshold === 100 ? alerted100 : alerted80) {
+    // already alerted this month for this threshold — just keep month current
+    db.prepare('UPDATE advertisers SET cap_alert_month = ?, cap_alerted_80 = ?, cap_alerted_100 = ? WHERE id = ?')
+      .run(month, alerted80, alerted100, adv.id);
+    return;
+  }
+  if (threshold === 100) alerted100 = 1; else alerted80 = 1;
+  db.prepare('UPDATE advertisers SET cap_alert_month = ?, cap_alerted_80 = ?, cap_alerted_100 = ? WHERE id = ?')
+    .run(month, alerted80, alerted100, adv.id);
+  const msg = threshold === 100
+    ? `\u{1F6D1} Advertiser <b>${adv.name}</b> hit its monthly conversion cap (${used}/${cap}) — auto-paused.`
+    : `\u{26A0}\u{FE0F} Advertiser <b>${adv.name}</b> at ${threshold}% of monthly conversion cap (${used}/${cap}).`;
+  sendTelegram(msg).catch(() => {});
+}
+
+// Generate a single-use 24h password-reset token for a publisher and return it.
+function createResetToken(publisherId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expires = new Date(Date.now() + 24 * 3600_000).toISOString().replace('T', ' ').slice(0, 19);
+  db.prepare('INSERT INTO password_resets (publisher_id, token, expires_at) VALUES (?, ?, ?)')
+    .run(publisherId, token, expires);
+  return { token, expires };
+}
+
+// Look up a valid (unused, unexpired) reset token; returns { ...row } or null.
+function validResetToken(token) {
+  if (!token) return null;
+  return db.prepare(
+    "SELECT * FROM password_resets WHERE token = ? AND used_at IS NULL AND expires_at > datetime('now')"
+  ).get(token) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +993,48 @@ function parseUA(ua = '') {
 }
 
 // ---------------------------------------------------------------------------
+// Click recording — shared by /track and /go (smart links). Captures geo,
+// device, sub-params (F7), enhanced tracking (F8), AppsFlyer/Adjust (F10).
+// Returns { clickId, device, country }.
+// ---------------------------------------------------------------------------
+
+function recordClick(req, slug, pub) {
+  const clickId = crypto.randomUUID();
+  const clickIp = getIp(req);
+  const clickUa = req.get('User-Agent') || '';
+  const { device, os, browser } = parseUA(clickUa);
+  const country = geoLookup(clickIp);
+
+  const q = name => {
+    const v = req.query[name];
+    return (typeof v === 'string' && v.trim() !== '') ? v.trim().slice(0, 500) : null;
+  };
+  const sub1 = q('sub1'), sub2 = q('sub2'), sub3 = q('sub3'), sub4 = q('sub4'), sub5 = q('sub5'), subpub = q('subpub');
+  const gclid = q('gclid'), fbclid = q('fbclid');
+  const referrer = (req.get('Referer') || '').slice(0, 500) || null;
+  const af_siteid = q('af_siteid'), af_campaign = q('af_campaign'), af_adset = q('af_adset'), af_ad = q('af_ad');
+  const adjust_network = q('adjust_network'), adjust_campaign = q('adjust_campaign'),
+        adjust_adgroup = q('adjust_adgroup'), adjust_creative = q('adjust_creative');
+  const campaign = af_campaign || adjust_campaign || null;
+  const adgroup  = af_adset    || adjust_adgroup  || null;
+  const creative = af_ad       || adjust_creative || null;
+  const network  = af_siteid   || adjust_network  || null;
+
+  db.prepare(
+    `INSERT INTO clicks (click_id, advertiser_slug, publisher, ip, user_agent, country, device_type, os, browser,
+       sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
+       af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
+       campaign, adgroup, creative, network)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(clickId, slug, pub, clickIp, clickUa, country, device, os, browser,
+    sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
+    af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
+    campaign, adgroup, creative, network);
+
+  return { clickId, device, country };
+}
+
+// ---------------------------------------------------------------------------
 // Tracking  GET /track/:slug?pub=PUBLISHER
 // ---------------------------------------------------------------------------
 
@@ -688,14 +1049,7 @@ app.get('/track/:slug', (req, res) => {
   if (!adv)                    return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
   if (adv.status !== 'active') return res.status(404).json({ error: `Advertiser ${slug} is paused` });
 
-  const clickId  = crypto.randomUUID();
-  const clickIp  = getIp(req);
-  const clickUa  = req.get('User-Agent') || '';
-  const { device, os, browser } = parseUA(clickUa);
-  const country  = geoLookup(clickIp);
-  db.prepare(
-    'INSERT INTO clicks (click_id, advertiser_slug, publisher, ip, user_agent, country, device_type, os, browser) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(clickId, slug, pub, clickIp, clickUa, country, device, os, browser);
+  const { clickId } = recordClick(req, slug, pub);
 
   if (!adv.offer_url) return res.json({ click_id: clickId, advertiser: slug, publisher: pub });
 
@@ -705,10 +1059,53 @@ app.get('/track/:slug', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Smart link  GET /go/:publisher_slug  (F5)
+// Picks an advertiser by geo/device rule (highest priority = lowest number),
+// falling back to the publisher's first active assigned advertiser.
+// ---------------------------------------------------------------------------
+
+app.get('/go/:publisher_slug', (req, res) => {
+  const pubRow = db.prepare("SELECT * FROM publishers WHERE username = ? AND status = 'active'").get(req.params.publisher_slug);
+  if (!pubRow) return res.status(404).json({ error: 'Unknown publisher' });
+
+  const clickIp = getIp(req);
+  const country = geoLookup(clickIp);
+  const { device } = parseUA(req.get('User-Agent') || '');
+
+  // Rules joined to active advertisers, highest priority first.
+  const rules = db.prepare(`
+    SELECT slr.country, slr.device_type, slr.priority, a.slug, a.offer_url
+    FROM smart_link_rules slr
+    JOIN advertisers a ON a.id = slr.advertiser_id
+    WHERE slr.publisher_id = ? AND a.status = 'active'
+    ORDER BY slr.priority ASC, slr.id ASC
+  `).all(pubRow.id);
+
+  const countryMatch = rule => rule.country === '*' ||
+    rule.country.split(',').map(c => c.trim().toUpperCase()).filter(Boolean).includes(country);
+  const deviceMatch  = rule => rule.device_type === '*' || rule.device_type === device;
+
+  let target = rules.find(r => countryMatch(r) && deviceMatch(r)) || null;
+
+  // Fallback: first active assigned advertiser.
+  if (!target) {
+    target = assignedAdvertisers(pubRow.id).find(a => a.status === 'active') || null;
+  }
+  if (!target) return res.status(404).json({ error: 'No matching offer for this publisher' });
+
+  const { clickId } = recordClick(req, target.slug, pubRow.username);
+  if (!target.offer_url) return res.json({ click_id: clickId, advertiser: target.slug, publisher: pubRow.username });
+
+  const url = new URL(target.offer_url);
+  url.searchParams.set('click_id', clickId);
+  res.redirect(302, url.toString());
+});
+
+// ---------------------------------------------------------------------------
 // Postback  GET /postback/:slug?click_id=X&payout=Y[&event=sale][&publisher=Z]
 // ---------------------------------------------------------------------------
 
-app.get('/postback/:slug', (req, res) => {
+app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const ip = getIp(req);
   if (!isWhitelisted(ip)) {
     logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted' });
@@ -717,13 +1114,25 @@ app.get('/postback/:slug', (req, res) => {
 
   const { slug }                             = req.params;
   const { click_id, payout, event = 'sale' } = req.query;
+  // loan_amount is the basis for percentage payouts; revenue is what the
+  // advertiser pays Komorebi (used for margin reporting). Both optional.
+  const loanAmount = req.query.loan_amount != null && req.query.loan_amount !== '' && !isNaN(parseFloat(req.query.loan_amount))
+    ? parseFloat(req.query.loan_amount) : null;
+  const revenue = req.query.revenue != null && req.query.revenue !== '' && !isNaN(parseFloat(req.query.revenue))
+    ? parseFloat(req.query.revenue) : null;
+  // F9 transaction_id — advertiser's own conversion id (optional)
+  const transactionId = (typeof req.query.transaction_id === 'string' && req.query.transaction_id.trim() !== '')
+    ? req.query.transaction_id.trim().slice(0, 200) : null;
+  // F15 user_id — advertiser's end-user id, for duplicate-user detection (optional)
+  const userId = (typeof req.query.user_id === 'string' && req.query.user_id.trim() !== '')
+    ? req.query.user_id.trim().slice(0, 200) : null;
 
   if (!click_id) {
     logPostback(req, { status: 'rejected', reason: 'missing_click_id' });
     return res.status(400).json({ error: 'Missing required param: click_id' });
   }
 
-  const click = db.prepare('SELECT publisher FROM clicks WHERE click_id = ?').get(click_id);
+  const click = db.prepare('SELECT * FROM clicks WHERE click_id = ?').get(click_id);
   if (!click) {
     logPostback(req, { status: 'rejected', reason: 'invalid_click_id', click_id });
     return res.status(400).json({ error: 'Invalid click_id' });
@@ -732,16 +1141,95 @@ app.get('/postback/:slug', (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
 
-  const amount = adv.payout_amount > 0 ? adv.payout_amount : 0;
+  // F18(B) — optional per-advertiser HMAC signature. If a secret is set, require
+  // &sig=HMAC-SHA256(secret, click_id + event + payout). No secret → accept as before.
+  if (adv.postback_secret) {
+    const sig = String(req.query.sig || '').toLowerCase();
+    const base = `${click_id}${event}${payout ?? ''}`;
+    const expected = crypto.createHmac('sha256', adv.postback_secret).update(base).digest('hex');
+    const valid = sig.length === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+    if (!valid) {
+      logPostback(req, { status: 'rejected', reason: 'invalid_signature', advertiser: slug });
+      return res.status(403).json({ error: 'Invalid or missing postback signature' });
+    }
+  }
 
   const pub = click.publisher;
+
+  // F11 click expiry — reject if the click is older than the advertiser's lookback window.
+  const lookbackDays = adv.click_lookback_window != null ? adv.click_lookback_window : 30;
+  const clickAgeMs = Date.now() - new Date((click.created_at || '').replace(' ', 'T') + 'Z').getTime();
+  if (Number.isFinite(clickAgeMs) && clickAgeMs > lookbackDays * 86_400_000) {
+    logPostback(req, { status: 'rejected', reason: 'click_expired', click_id, advertiser: slug, age_days: Math.floor(clickAgeMs / 86_400_000) });
+    return res.status(410).json({ error: `Click expired — older than ${lookbackDays}-day lookback window` });
+  }
+
+  // Assignment gating — only accept postbacks for publisher↔advertiser pairs
+  // that have been explicitly assigned. Existing pairs were backfilled from
+  // click/conversion history on migration, so live traffic is not dropped.
+  const assignment = getAssignment(pub, slug);
+  if (!assignment) {
+    logPostback(req, { status: 'rejected', reason: 'publisher_not_assigned', publisher: pub, advertiser: slug });
+    return res.status(403).json({ error: `Publisher "${pub}" is not assigned to advertiser "${slug}"` });
+  }
+
+  // Enforce the assignment's validity window and monthly cap.
+  const block = assignmentBlock(assignment, pub, slug);
+  if (block) {
+    logPostback(req, { status: 'rejected', reason: block.reason, publisher: pub, advertiser: slug });
+    return res.status(403).json({ error: block.message });
+  }
+
+  // F12 — advertiser-level monthly conversion cap (hard ceiling on approved conversions).
+  // At/over cap → reject (429), auto-pause the advertiser, fire the 100% alert. Below cap
+  // but ≥80% → fire the 80% alert. Alerts are throttled to once per threshold per month.
+  if (adv.monthly_conversion_cap != null) {
+    const used = advertiserApprovedCount(adv);
+    const cap  = adv.monthly_conversion_cap;
+    if (used >= cap) {
+      maybeAlertAdvertiserCap(adv, used, cap, 100);
+      if (adv.status === 'active') {
+        db.prepare("UPDATE advertisers SET status = 'paused' WHERE id = ?").run(adv.id);
+        logAudit('advertiser.auto_paused', 'advertiser', slug, { reason: 'advertiser_cap_reached', used, cap }, req);
+      }
+      logPostback(req, { status: 'rejected', reason: 'advertiser_cap_reached', advertiser: slug, used, cap });
+      return res.status(429).json({ error: `Advertiser "${slug}" monthly conversion cap reached (${used}/${cap})` });
+    }
+    if (used >= Math.floor(cap * 0.8)) maybeAlertAdvertiserCap(adv, used, cap, 80);
+  }
+
+  // Payout precedence: assignment override → matching conversion goal → advertiser default.
+  // Percent payouts use loan_amount; revenue is recorded for margin reporting.
+  const goal = matchGoal(adv.id, event);
+  let { amount, note } = computePayout(assignment, adv, goal, loanAmount);
+
+  // F15 — duplicate-user detection. If this user_id already converted for this advertiser
+  // (any publisher, any prior event), record the row as a zero-payout duplicate (HTTP 200).
+  // First conversion for the user_id+advertiser wins and keeps its payout.
+  let convStatus = null, convReason = null, duplicate = false;
+  if (userId) {
+    const prior = db.prepare(
+      'SELECT 1 FROM conversions WHERE advertiser_slug = ? AND user_id = ? LIMIT 1'
+    ).get(slug, userId);
+    if (prior) {
+      duplicate = true;
+      convStatus = 'duplicate';
+      convReason = 'duplicate_user';
+      amount = 0;
+      note = note || 'duplicate_user';
+    }
+  }
 
   let result;
   try {
     db.prepare(
-      'INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, raw_params) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(click_id, slug, pub, event, amount, JSON.stringify(req.query));
-    result = { status: 'ok', click_id, advertiser: slug, publisher: pub, event, payout: amount };
+      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?)`
+    ).run(click_id, slug, pub, event, amount, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(req.query));
+    result = { status: duplicate ? 'duplicate' : 'ok', click_id, advertiser: slug, publisher: pub, event,
+               payout: amount, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId };
+    if (note) result.note = note;
   } catch (err) {
     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err.message && err.message.includes('UNIQUE constraint'))) {
       logPostback(req, { status: 'duplicate', click_id, event });
@@ -753,8 +1241,17 @@ app.get('/postback/:slug', (req, res) => {
   logPostback(req, result);
   res.json(result);
 
+  // Duplicate-user conversions ($0, flagged) are not payable events — skip the
+  // S2S postback / email / webhook notifications for them.
+  if (duplicate) return;
+
   // Fire S2S postback, email, and webhooks — all async, do not block response
-  fireS2SPostback(pub, { click_id, payout: amount, event, advertiser: slug }).catch(() => {});
+  // Pass sub-params (F7) and mapped AppsFlyer/Adjust fields (F10) for macro substitution.
+  fireS2SPostback(pub, {
+    click_id, payout: amount, event, advertiser: slug,
+    sub1: click.sub1, sub2: click.sub2, sub3: click.sub3, sub4: click.sub4, sub5: click.sub5, subpub: click.subpub,
+    campaign: click.campaign, adgroup: click.adgroup, creative: click.creative, network: click.network,
+  }).catch(() => {});
   sendConversionEmail({
     advertiserName: adv.name, publisher: pub, payout: amount,
     click_id, event, received_at: new Date().toISOString().replace('T', ' ').slice(0, 19),
@@ -786,7 +1283,27 @@ app.get('/privacy', (req, res) => res.send(renderLegal('privacy')));
 // ---------------------------------------------------------------------------
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  const h = res.getHeaders(); // headers already set by helmet + our middleware
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    // F19(D) — secrets configured? (booleans only, never values)
+    secrets: {
+      SESSION_SECRET:     !!process.env.SESSION_SECRET,
+      ADMIN_PASS:         !!process.env.ADMIN_PASS,
+      GMAIL_USER:         !!process.env.GMAIL_USER,
+      TELEGRAM_BOT_TOKEN: !!process.env.TELEGRAM_BOT_TOKEN,
+    },
+    // F19(G) — which security headers are actually active on responses
+    security_headers: {
+      content_security_policy:   !!h['content-security-policy'],
+      strict_transport_security: !!h['strict-transport-security'],
+      permissions_policy:        h['permissions-policy'] || null,
+      x_content_type_options:    h['x-content-type-options'] || null,
+      x_frame_options:           h['x-frame-options'] || null,
+      referrer_policy:           h['referrer-policy'] || null,
+    },
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -796,27 +1313,73 @@ app.get('/health', (req, res) => {
 app.get('/docs', (req, res) => res.send(renderDocs()));
 
 // ---------------------------------------------------------------------------
+// Affiliate marketplace (F6)  — public listing, publisher self-apply
+// ---------------------------------------------------------------------------
+
+app.get('/marketplace', (req, res) => {
+  const campaigns = db.prepare(
+    "SELECT * FROM advertisers WHERE is_public = 1 AND status = 'active' AND slug != 'legacy' ORDER BY name"
+  ).all();
+
+  // If logged in, compute each campaign's state for this publisher.
+  const pubId = req.session?.pubId;
+  let assignedIds = new Set(), pendingIds = new Set();
+  if (pubId) {
+    assignedIds = new Set(db.prepare('SELECT advertiser_id FROM publisher_advertisers WHERE publisher_id = ?').all(pubId).map(r => r.advertiser_id));
+    pendingIds  = new Set(db.prepare("SELECT advertiser_id FROM marketplace_applications WHERE publisher_id = ? AND status = 'pending'").all(pubId).map(r => r.advertiser_id));
+  }
+  const flash = req.query.msg || null;
+  res.send(renderMarketplace({ campaigns, loggedIn: !!pubId, assignedIds, pendingIds, flash }));
+});
+
+app.post('/marketplace/apply', applyLimiter, (req, res) => {
+  const pubId = req.session?.pubId;
+  if (!pubId) return res.redirect('/publisher/login?next=' + encodeURIComponent('/marketplace'));
+  const advId = parseInt(req.body.advertiser_id, 10);
+  const adv = advId ? db.prepare("SELECT id, name FROM advertisers WHERE id = ? AND is_public = 1 AND status = 'active'").get(advId) : null;
+  if (!adv) return res.redirect('/marketplace?msg=' + encodeURIComponent('Campaign not available'));
+
+  const assigned = db.prepare('SELECT 1 FROM publisher_advertisers WHERE publisher_id = ? AND advertiser_id = ?').get(pubId, adv.id);
+  if (assigned) return res.redirect('/marketplace?msg=' + encodeURIComponent('You are already running this campaign'));
+  const pending = db.prepare("SELECT 1 FROM marketplace_applications WHERE publisher_id = ? AND advertiser_id = ? AND status = 'pending'").get(pubId, adv.id);
+  if (pending) return res.redirect('/marketplace?msg=' + encodeURIComponent('Your application is already pending'));
+
+  db.prepare("INSERT INTO marketplace_applications (publisher_id, advertiser_id, status) VALUES (?, ?, 'pending')").run(pubId, adv.id);
+  const pub = db.prepare('SELECT username FROM publishers WHERE id = ?').get(pubId);
+  logAudit('marketplace.applied', 'advertiser', adv.id, { publisher: pub?.username, advertiser: adv.name }, req);
+  res.redirect('/marketplace?msg=' + encodeURIComponent('Application submitted — pending review'));
+});
+
+// ---------------------------------------------------------------------------
 // Publisher portal
 // ---------------------------------------------------------------------------
 
 app.get('/',                (req, res) => res.redirect('/publisher/login'));
 app.get('/publisher',       requirePublisher, (req, res) => res.redirect('/publisher/dashboard'));
+// Only allow same-origin relative redirect targets (no open redirect).
+function safeNext(v) {
+  return (typeof v === 'string' && v.startsWith('/') && !v.startsWith('//')) ? v : null;
+}
+
 app.get('/publisher/login', (req, res) => {
-  if (req.session?.pubId) return res.redirect('/publisher/dashboard');
+  if (req.session?.pubId) return res.redirect(safeNext(req.query.next) || '/publisher/dashboard');
   const success = req.query.registered
     ? 'Application submitted! We\'ll review it and notify you when approved.'
-    : null;
-  res.send(renderPubLogin({ error: req.query.err, success }));
+    : req.query.reset
+      ? 'Your password has been reset. You can now sign in with your new password.'
+      : null;
+  res.send(renderPubLogin({ error: req.query.err, success, next: safeNext(req.query.next) }));
 });
 
 app.post('/publisher/login', (req, res) => {
   if (checkLoginLockout(req, res, publisherLoginAttempts)) return;
   const { username, password } = req.body;
+  const next = safeNext(req.body.next);
   const uname = (username || '').trim().toLowerCase();
   const pub = uname ? db.prepare('SELECT * FROM publishers WHERE username = ?').get(uname) : null;
   if (!pub || !checkPassword(password || '', pub.password_hash)) {
     recordLoginFailure(req.ip, publisherLoginAttempts);
-    return res.send(renderPubLogin({ error: 'Invalid username or password', username: uname }));
+    return res.send(renderPubLogin({ error: 'Invalid username or password', username: uname, next }));
   }
   if (pub.status !== 'active') {
     const msg = pub.status === 'pending'
@@ -824,7 +1387,7 @@ app.post('/publisher/login', (req, res) => {
       : pub.status === 'rejected'
         ? 'Your application was not approved. Contact chi@komorebimedia.com for details.'
         : 'Your account has been disabled. Contact your account manager.';
-    return res.send(renderPubLogin({ error: msg }));
+    return res.send(renderPubLogin({ error: msg, next }));
   }
   req.session.regenerate(err => {
     if (err) return res.status(500).send('Session error');
@@ -832,7 +1395,7 @@ app.post('/publisher/login', (req, res) => {
     req.session.save(saveErr => {
       if (saveErr) return res.status(500).send('Session error');
       recordLoginSuccess(req.ip, publisherLoginAttempts);
-      res.redirect('/publisher/dashboard');
+      res.redirect(next || '/publisher/dashboard');
     });
   });
 });
@@ -919,6 +1482,82 @@ app.post('/publisher/register', (req, res) => {
   res.redirect('/publisher/login?registered=1');
 });
 
+// ---------------------------------------------------------------------------
+// Publisher — forgot / reset password  (public)
+// ---------------------------------------------------------------------------
+
+app.get('/publisher/forgot-password', (req, res) => {
+  if (req.session?.pubId) return res.redirect('/publisher/dashboard');
+  res.send(renderForgotPassword());
+});
+
+app.post('/publisher/forgot-password', (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  // Generic response regardless of whether the email exists (no enumeration).
+  const generic = 'If an account exists for that email, a password reset link has been sent. Reset links expire in 24 hours.';
+
+  if (email) {
+    const pub = db.prepare("SELECT * FROM publishers WHERE lower(email) = ? AND status = 'active'").get(email);
+    if (pub) {
+      const { token } = createResetToken(pub.id);
+      const link = `${BASE_URL}/publisher/reset-password?token=${token}`;
+      logAudit('publisher.password_reset_requested', 'publisher', pub.username,
+        { emailed: !!transporter }, req);
+      if (transporter) {
+        sendMail({
+          to: pub.email,
+          subject: '[Komorebi] Reset your publisher password',
+          text:
+            `We received a request to reset the password for your Komorebi publisher account "${pub.username}".\n\n` +
+            `Reset your password using the link below (valid for 24 hours):\n${link}\n\n` +
+            `If you didn't request this, you can safely ignore this email.`,
+          html: `<div style="font-family:sans-serif;max-width:480px">
+            <h2 style="color:#1d1d1f;margin-bottom:6px">Reset your password</h2>
+            <p style="color:#6e6e73;font-size:13px">Account: <strong>${H(pub.username)}</strong></p>
+            <p style="font-size:13px">Click the button below to choose a new password. This link is valid for 24 hours.</p>
+            <p style="margin:20px 0">
+              <a href="${H(link)}" style="background:#0F6E56;color:#fff;padding:10px 20px;border-radius:7px;text-decoration:none;font-size:13px;font-weight:600">Reset Password →</a>
+            </p>
+            <p style="font-size:11px;color:#8e8e93;word-break:break-all">${H(link)}</p>
+            <p style="font-size:12px;color:#6e6e73">If you didn't request this, you can safely ignore this email.</p>
+          </div>`,
+        }).catch(() => {});
+      }
+      // When email isn't configured, the token surfaces on the admin publisher edit page.
+    }
+  }
+  res.send(renderForgotPassword({ success: generic }));
+});
+
+app.get('/publisher/reset-password', (req, res) => {
+  const reset = validResetToken((req.query.token || '').trim());
+  if (!reset) return res.send(renderResetPassword({ invalid: true }));
+  res.send(renderResetPassword({ token: reset.token }));
+});
+
+app.post('/publisher/reset-password', (req, res) => {
+  const token = (req.body.token || '').trim();
+  const reset = validResetToken(token);
+  if (!reset) return res.send(renderResetPassword({ invalid: true }));
+
+  const { new_password, confirm_password } = req.body;
+  if (!new_password || new_password.length < 8) {
+    return res.send(renderResetPassword({ token, error: 'Password must be at least 8 characters.' }));
+  }
+  if (new_password !== confirm_password) {
+    return res.send(renderResetPassword({ token, error: 'Passwords do not match.' }));
+  }
+
+  const pub = db.prepare('SELECT username FROM publishers WHERE id = ?').get(reset.publisher_id);
+  db.prepare('UPDATE publishers SET password_hash = ? WHERE id = ?').run(hashPassword(new_password), reset.publisher_id);
+  db.prepare("UPDATE password_resets SET used_at = datetime('now') WHERE id = ?").run(reset.id);
+  // Invalidate any other outstanding tokens for this publisher.
+  db.prepare("UPDATE password_resets SET used_at = datetime('now') WHERE publisher_id = ? AND used_at IS NULL")
+    .run(reset.publisher_id);
+  logAudit('publisher.password_reset', 'publisher', pub?.username ?? reset.publisher_id, { via: 'token' }, req);
+  res.redirect('/publisher/login?reset=1');
+});
+
 app.get('/publisher/dashboard', requirePublisher, (req, res) => {
   const pub       = req.publisher;
   const thisMonth = new Date().toISOString().slice(0, 7);
@@ -947,9 +1586,8 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
   const monthlyPayout        = monthlyRow.approved;
   const monthlyPendingPayout = monthlyRow.pending;
 
-  const advertisers = db.prepare(
-    "SELECT * FROM advertisers WHERE status = 'active' AND slug != 'legacy' ORDER BY name"
-  ).all();
+  // Only advertisers this publisher is assigned to and that are active.
+  const advertisers = assignedAdvertisers(pub.id).filter(a => a.status === 'active');
 
   const advClicks = db.prepare(
     'SELECT advertiser_slug, COUNT(*) as n FROM clicks WHERE publisher = ? GROUP BY advertiser_slug'
@@ -981,7 +1619,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
 
   const recent = db.prepare(`
     SELECT cv.received_at, cv.advertiser_slug, cv.click_id, cv.event,
-           cv.payout, cv.status, cv.reason, a.name as adv_name
+           cv.payout, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
     FROM conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE cv.publisher = ?
@@ -995,16 +1633,30 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
 
   const totalPaid = payments.reduce((s, p) => s + p.amount_usd, 0);
 
+  // F7 — breakdown by sub1 (clicks joined to their conversions) for this publisher.
+  const subStats = db.prepare(`
+    SELECT c.sub1 AS sub1,
+           COUNT(DISTINCT c.click_id) AS clicks,
+           COUNT(cv.id)               AS conversions,
+           COALESCE(SUM(cv.payout),0) AS payout
+    FROM clicks c
+    LEFT JOIN conversions cv ON cv.click_id = c.click_id
+    WHERE c.publisher = ? AND c.sub1 IS NOT NULL AND c.sub1 != ''
+    GROUP BY c.sub1
+    ORDER BY clicks DESC
+    LIMIT 50
+  `).all(pub.username);
+
   res.send(renderPubDashboard({ pub, totalClicks, totalConversions,
     totalPayout, pendingPayout, monthlyPayout, monthlyPendingPayout,
-    advStats, recent, thisMonth, payments, totalPaid }));
+    advStats, recent, thisMonth, payments, totalPaid, subStats }));
 });
 
 app.get('/publisher/conversions', requirePublisher, (req, res) => {
   const pub = req.publisher;
   const conversions = db.prepare(`
     SELECT cv.received_at, cv.advertiser_slug, cv.click_id, cv.event,
-           cv.payout, cv.status, cv.reason, a.name as adv_name
+           cv.payout, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
     FROM conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE cv.publisher = ?
@@ -1030,13 +1682,46 @@ app.get('/publisher/api-access', requirePublisher, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Publisher — profile / change password
+// ---------------------------------------------------------------------------
+
+app.get('/publisher/profile', requirePublisher, (req, res) => {
+  const flash = req.query.ok  ? 'Password updated successfully.' : null;
+  const error = req.query.err || null;
+  res.send(renderPubProfile({ pub: req.publisher, csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/publisher/change-password', requirePublisher, verifyCsrf, (req, res) => {
+  const { current_password, new_password, confirm_password } = req.body;
+  const pub = req.publisher;
+  const back = msg => res.send(renderPubProfile({ pub, csrfToken: req.session.csrfToken, error: msg }));
+
+  if (!checkPassword(current_password || '', pub.password_hash)) {
+    return back('Current password is incorrect.');
+  }
+  if (!new_password || new_password.length < 8) {
+    return back('New password must be at least 8 characters.');
+  }
+  if (new_password !== confirm_password) {
+    return back('New passwords do not match.');
+  }
+  if (current_password === new_password) {
+    return back('New password must be different from the current password.');
+  }
+
+  db.prepare('UPDATE publishers SET password_hash = ? WHERE id = ?').run(hashPassword(new_password), pub.id);
+  logAudit('publisher.password_changed', 'publisher', pub.username, { self_service: true }, req);
+  res.send(renderPubProfile({ pub, csrfToken: req.session.csrfToken, flash: 'Password updated successfully.' }));
+});
+
+// ---------------------------------------------------------------------------
 // Admin — main dashboard
 // ---------------------------------------------------------------------------
 
 // Admin login / logout
 app.get('/admin/login', (req, res) => {
   if (req.session?.isAdmin) return res.redirect('/admin');
-  res.send(renderAdminLogin(''));
+  res.send(renderAdminLogin(typeof req.query.err === 'string' ? req.query.err.slice(0, 200) : ''));
 });
 
 app.post('/admin/login', (req, res) => {
@@ -1066,6 +1751,10 @@ app.post('/admin/logout', (req, res) => {
 // CSRF verification for all admin POST routes except /login and /logout
 app.post('/admin/*', (req, res, next) => {
   if (req.path === '/login' || req.path === '/logout') return next();
+  // Multipart routes (e.g. /reconcile) parse their body via multer inside the
+  // handler, so req.body._csrf isn't available yet here — those routes call
+  // verifyCsrf themselves after the upload is parsed.
+  if (req.path.endsWith('/reconcile')) return next();
   verifyCsrf(req, res, next);
 });
 
@@ -1100,6 +1789,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   const advConv   = db.prepare(`
     SELECT advertiser_slug, COUNT(*) as n,
            COALESCE(SUM(payout),0) as payout,
+           COALESCE(SUM(revenue),0) as revenue,
            COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved_payout,
            SUM(CASE WHEN status='pending'  THEN 1 ELSE 0 END) as pending_count
     FROM conversions GROUP BY advertiser_slug
@@ -1113,15 +1803,18 @@ app.get('/admin', requireAdmin, (req, res) => {
     clicks:          clickMap[a.slug] || 0,
     conversions:     convMap[a.slug]?.n || 0,
     payout:          convMap[a.slug]?.payout || 0,
+    revenue:         convMap[a.slug]?.revenue || 0,
     approved_payout: convMap[a.slug]?.approved_payout || 0,
     pending_count:   convMap[a.slug]?.pending_count || 0,
+    cap_used:        a.monthly_conversion_cap != null ? advertiserApprovedCount(a) : null,
   }));
 
   const pubStats = db.prepare(`
     SELECT c.advertiser_slug, c.publisher,
            COUNT(DISTINCT c.click_id) as clicks,
            COUNT(cv.id) as conversions,
-           COALESCE(SUM(cv.payout),0) as payout
+           COALESCE(SUM(cv.payout),0) as payout,
+           COALESCE(SUM(cv.revenue),0) as revenue
     FROM clicks c
     LEFT JOIN conversions cv ON cv.click_id = c.click_id
     GROUP BY c.advertiser_slug, c.publisher
@@ -1129,7 +1822,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   `).all();
 
   const recent = db.prepare(
-    'SELECT received_at, advertiser_slug, click_id, publisher, event, payout FROM conversions ORDER BY received_at DESC LIMIT 50'
+    'SELECT id, received_at, advertiser_slug, click_id, publisher, event, payout, status, reason FROM conversions ORDER BY received_at DESC LIMIT 50'
   ).all();
 
   const publisherCount = db.prepare("SELECT COUNT(*) as n FROM publishers WHERE status='active'").get().n;
@@ -1159,7 +1852,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   res.send(renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
     approvedPayout, pendingPayout, monthlyPayout,
     thisMonth, advStats, pubStats, recent, flash, publisherCount,
-    topCountries, deviceSplit, osSplit, globalConvStatus }));
+    topCountries, deviceSplit, osSplit, globalConvStatus, csrfToken: req.session.csrfToken }));
 });
 
 // ---------------------------------------------------------------------------
@@ -1187,47 +1880,193 @@ app.get('/admin/advertisers', requireAdmin, (req, res) => {
     approved_payout: convMap[a.slug]?.approved_payout || 0,
     pending_count:   convMap[a.slug]?.pending_count || 0,
   }));
-  res.send(renderAdvList({ advStats, flash }));
+  res.send(renderAdvList({ advStats, flash, csrfToken: req.session.csrfToken }));
 });
 
 app.get('/admin/advertisers/new', requireAdmin, (req, res) => {
-  res.send(renderAdvForm({ title: 'New Advertiser', action: '/admin/advertisers', adv: {} }));
+  res.send(renderAdvForm({ title: 'New Advertiser', action: '/admin/advertisers', adv: {}, csrfToken: req.session.csrfToken }));
 });
 
 app.post('/admin/advertisers', requireAdmin, (req, res) => {
   const { name, slug, offer_url, payout_amount, status } = req.body;
+  const payoutType = req.body.payout_type === 'percent' ? 'percent' : 'fixed';
+  const lookback = parseInt(req.body.click_lookback_window, 10) > 0 ? parseInt(req.body.click_lookback_window, 10) : 30;
+  const cap = (req.body.monthly_conversion_cap !== '' && req.body.monthly_conversion_cap != null && parseInt(req.body.monthly_conversion_cap, 10) >= 0)
+    ? parseInt(req.body.monthly_conversion_cap, 10) : null;
+  const isPublic = req.body.is_public ? 1 : 0;
+  const category = (req.body.category || '').trim() || null;
+  const description = (req.body.description || '').trim() || null;
+  const countriesAllowed = (req.body.countries_allowed || '').trim() || null;
+  const postbackSecret = (req.body.postback_secret || '').trim() || null;
+  const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
+  const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
+  const mmpToken = encryptToken((req.body.mmp_api_token || '').trim() || null);
   const s = slug || slugify(name);
   if (!name || !s) return res.send(renderAdvForm({ title: 'New Advertiser', action: '/admin/advertisers',
-    adv: req.body, error: 'Name and slug are required.' }));
+    adv: req.body, error: 'Name and slug are required.', csrfToken: req.session.csrfToken }));
   if (!/^[a-z0-9-]+$/.test(s)) return res.send(renderAdvForm({ title: 'New Advertiser',
-    action: '/admin/advertisers', adv: req.body, error: 'Slug must be lowercase letters, numbers, and hyphens.' }));
+    action: '/admin/advertisers', adv: req.body, error: 'Slug must be lowercase letters, numbers, and hyphens.', csrfToken: req.session.csrfToken }));
   try {
-    db.prepare('INSERT INTO advertisers (slug, name, offer_url, payout_amount, status) VALUES (?, ?, ?, ?, ?)')
-      .run(s, name.trim(), offer_url || '', parseFloat(payout_amount) || 0, status || 'active');
+    db.prepare('INSERT INTO advertisers (slug, name, offer_url, payout_amount, payout_type, click_lookback_window, monthly_conversion_cap, is_public, category, description, countries_allowed, postback_secret, mmp_type, mmp_app_id, mmp_api_token, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(s, name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap, isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, status || 'active');
     logAudit('advertiser.created', 'advertiser', s,
-      { name: name.trim(), slug: s, offer_url: offer_url || '', status: status || 'active' }, req);
+      { name: name.trim(), slug: s, offer_url: offer_url || '', payout_type: payoutType, click_lookback_window: lookback, monthly_conversion_cap: cap, status: status || 'active' }, req);
     res.redirect(`/admin?msg=Advertiser+%22${encodeURIComponent(name)}%22+created`);
   } catch {
     res.send(renderAdvForm({ title: 'New Advertiser', action: '/admin/advertisers',
-      adv: req.body, error: `Slug "${s}" is already taken.` }));
+      adv: req.body, error: `Slug "${s}" is already taken.`, csrfToken: req.session.csrfToken }));
   }
 });
 
 app.get('/admin/advertisers/:slug/edit', requireAdmin, (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
-  res.send(renderAdvForm({ title: `Edit — ${adv.name}`, action: `/admin/advertisers/${adv.slug}/update`, adv }));
+  const goals = db.prepare('SELECT * FROM goals WHERE advertiser_id = ? ORDER BY created_at').all(adv.id);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  const capUsed = adv.monthly_conversion_cap != null ? advertiserApprovedCount(adv) : null;
+  // Decrypt the MMP token for the (masked) form field.
+  adv.mmp_api_token = decryptToken(adv.mmp_api_token);
+  res.send(renderAdvForm({ title: `Edit — ${adv.name}`, action: `/admin/advertisers/${adv.slug}/update`,
+    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed }));
+});
+
+// ---------------------------------------------------------------------------
+// Admin — MMP (AppsFlyer) integration: test connection, sync dashboard, run sync
+// ---------------------------------------------------------------------------
+
+app.post('/admin/advertisers/:slug/mmp-test', requireAdmin, async (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const result = await mmpTestConnection(adv);
+  logAudit('advertiser.mmp_test', 'advertiser', adv.slug, { ok: result.ok }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=${encodeURIComponent('MMP test: ' + result.message)}&ok=${result.ok ? '1' : '0'}`);
+});
+
+app.get('/admin/advertisers/:slug/mmp-sync', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const logs = db.prepare('SELECT * FROM mmp_sync_log WHERE advertiser_slug = ? ORDER BY synced_at DESC, id DESC LIMIT 30').all(adv.slug);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderMmpSync({ adv, logs, csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/admin/advertisers/:slug/mmp-sync/run', requireAdmin, async (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  if (adv.mmp_type !== 'appsflyer') {
+    return res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=${encodeURIComponent('MMP type is not AppsFlyer')}&ok=0`);
+  }
+  const r = await runMmpSync(adv);
+  logAudit('advertiser.mmp_sync', 'advertiser', adv.slug,
+    r.ok ? { events_pulled: r.events_pulled, matched: r.matched, approved: r.auto_approved, rejected: r.auto_rejected } : { error: r.error }, req);
+  const msg = r.ok
+    ? `Sync complete — ${r.events_pulled} pulled, ${r.matched} matched, ${r.auto_approved} approved, ${r.auto_rejected} rejected`
+    : `Sync failed — ${r.error}`;
+  res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=${encodeURIComponent(msg)}&ok=${r.ok ? '1' : '0'}`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin — manual conversion status override (F15: un-flag a duplicate)
+// ---------------------------------------------------------------------------
+
+app.post('/admin/conversions/:id/status', requireAdmin, (req, res) => {
+  const conv = db.prepare('SELECT * FROM conversions WHERE id = ?').get(req.params.id);
+  if (!conv) return res.redirect('/admin?msg=Conversion+not+found&ok=0');
+  const next = req.body.status;
+  if (!['pending', 'approved', 'rejected'].includes(next)) {
+    return res.redirect('/admin?msg=Invalid+status&ok=0');
+  }
+  db.prepare('UPDATE conversions SET status = ?, reason = ? WHERE id = ?')
+    .run(next, next === conv.status ? conv.reason : `manual_override_from_${conv.status}`, conv.id);
+  logAudit('conversion.status_override', 'conversion', conv.id,
+    { from: conv.status, to: next, click_id: conv.click_id, advertiser: conv.advertiser_slug }, req);
+  res.redirect('/admin?msg=Conversion+status+updated');
+});
+
+// ---------------------------------------------------------------------------
+// Admin — conversion goals per advertiser
+// ---------------------------------------------------------------------------
+
+app.post('/admin/advertisers/:slug/goals', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const name        = (req.body.name || '').trim();
+  const token       = (req.body.event_token || '').trim();
+  const payout      = parseFloat(req.body.payout) || 0;
+  const payoutType  = req.body.payout_type === 'percent' ? 'percent' : 'fixed';
+  const description = (req.body.description || '').trim();
+  if (!name || !token) {
+    return res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Goal+name+and+event+token+are+required&ok=0`);
+  }
+  try {
+    db.prepare('INSERT INTO goals (advertiser_id, name, event_token, payout, payout_type, description) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(adv.id, name, token, payout, payoutType, description);
+  } catch (err) {
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err.message && err.message.includes('UNIQUE'))) {
+      return res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=${encodeURIComponent(`Event token "${token}" already exists for this advertiser`)}&ok=0`);
+    }
+    throw err;
+  }
+  logAudit('advertiser.goal_added', 'advertiser', adv.slug, { name, event_token: token, payout, payout_type: payoutType }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=${encodeURIComponent(`Goal "${name}" added`)}`);
+});
+
+app.post('/admin/advertisers/:slug/goals/:goalId/delete', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const goal = db.prepare('SELECT * FROM goals WHERE id = ? AND advertiser_id = ?').get(req.params.goalId, adv.id);
+  if (goal) {
+    db.prepare('DELETE FROM goals WHERE id = ?').run(goal.id);
+    logAudit('advertiser.goal_deleted', 'advertiser', adv.slug, { name: goal.name, event_token: goal.event_token }, req);
+  }
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Goal+deleted`);
 });
 
 app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const { name, offer_url, payout_amount, status } = req.body;
+  const payoutType = req.body.payout_type === 'percent' ? 'percent' : 'fixed';
+  const lookback = parseInt(req.body.click_lookback_window, 10) > 0 ? parseInt(req.body.click_lookback_window, 10) : 30;
+  const cap = (req.body.monthly_conversion_cap !== '' && req.body.monthly_conversion_cap != null && parseInt(req.body.monthly_conversion_cap, 10) >= 0)
+    ? parseInt(req.body.monthly_conversion_cap, 10) : null;
+  const isPublic = req.body.is_public ? 1 : 0;
+  const category = (req.body.category || '').trim() || null;
+  const description = (req.body.description || '').trim() || null;
+  const countriesAllowed = (req.body.countries_allowed || '').trim() || null;
+  const postbackSecret = (req.body.postback_secret || '').trim() || null;
+  const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
+  const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
+  const mmpToken = encryptToken((req.body.mmp_api_token || '').trim() || null);
   const { slug } = req.params;
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
   if (!name) return res.send(renderAdvForm({ title: 'Edit Advertiser',
-    action: `/admin/advertisers/${slug}/update`, adv: { slug, ...req.body }, error: 'Name is required.' }));
-  db.prepare('UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, status=? WHERE slug=?')
-    .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, status || 'active', slug);
+    action: `/admin/advertisers/${slug}/update`, adv: { slug, ...req.body }, error: 'Name is required.', csrfToken: req.session.csrfToken }));
+
+  // F12 — a changed cap_reset_month resets the month's count: stamp the count floor
+  // (cap_reset_at = now), re-activate the advertiser, and clear the alert throttle.
+  const submittedReset = (req.body.cap_reset_month || '').trim() || null;
+  const isReset = submittedReset && submittedReset !== (adv.cap_reset_month || null);
+
+  if (isReset) {
+    db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
+        monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?,
+        status='active', cap_reset_month=?, cap_reset_at=datetime('now'),
+        cap_alert_month=strftime('%Y-%m','now'), cap_alerted_80=0, cap_alerted_100=0 WHERE slug=?`)
+      .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, submittedReset, slug);
+  } else {
+    db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
+        monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, status=? WHERE slug=?`)
+      .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, status || 'active', slug);
+  }
   logAudit('advertiser.updated', 'advertiser', slug,
-    { name: name.trim(), offer_url: offer_url || '', payout_amount: parseFloat(payout_amount) || 0, status: status || 'active' }, req);
+    { name: name.trim(), offer_url: offer_url || '', payout_amount: parseFloat(payout_amount) || 0, payout_type: payoutType,
+      click_lookback_window: lookback, monthly_conversion_cap: cap, cap_reset: isReset ? submittedReset : undefined, status: isReset ? 'active' : (status || 'active') }, req);
   res.redirect(`/admin?msg=Advertiser+%22${encodeURIComponent(name)}%22+updated`);
 });
 
@@ -1272,23 +2111,23 @@ app.get('/admin/publishers', requireAdmin, (req, res) => {
   const pending    = allPubs.filter(p => p.status === 'pending');
   const publishers = allPubs.filter(p => p.status !== 'pending');
 
-  res.send(renderPubList({ publishers, pending, flash }));
+  res.send(renderPubList({ publishers, pending, flash, csrfToken: req.session.csrfToken }));
 });
 
 app.get('/admin/publishers/new', requireAdmin, (req, res) => {
-  res.send(renderPubForm({ title: 'New Publisher', action: '/admin/publishers', pub: {} }));
+  res.send(renderPubForm({ title: 'New Publisher', action: '/admin/publishers', pub: {}, csrfToken: req.session.csrfToken }));
 });
 
 app.post('/admin/publishers', requireAdmin, (req, res) => {
   const { username, password, status, postback_url } = req.body;
   const uname = (username || '').trim().toLowerCase();
   if (!uname || !password) return res.send(renderPubForm({ title: 'New Publisher',
-    action: '/admin/publishers', pub: req.body, error: 'Username and password are required.' }));
+    action: '/admin/publishers', pub: req.body, error: 'Username and password are required.', csrfToken: req.session.csrfToken }));
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.send(renderPubForm({ title: 'New Publisher',
     action: '/admin/publishers', pub: req.body,
-    error: 'Username must be lowercase letters, numbers, underscores, or hyphens.' }));
+    error: 'Username must be lowercase letters, numbers, underscores, or hyphens.', csrfToken: req.session.csrfToken }));
   if (password.length < 8) return res.send(renderPubForm({ title: 'New Publisher',
-    action: '/admin/publishers', pub: req.body, error: 'Password must be at least 8 characters.' }));
+    action: '/admin/publishers', pub: req.body, error: 'Password must be at least 8 characters.', csrfToken: req.session.csrfToken }));
   const pbUrl  = (postback_url || '').trim();
   const apiKey = generateApiKey();
   try {
@@ -1299,7 +2138,7 @@ app.post('/admin/publishers', requireAdmin, (req, res) => {
     res.redirect(`/admin/publishers?msg=Publisher+%22${encodeURIComponent(uname)}%22+created`);
   } catch {
     res.send(renderPubForm({ title: 'New Publisher', action: '/admin/publishers',
-      pub: req.body, error: `Username "${uname}" is already taken.` }));
+      pub: req.body, error: `Username "${uname}" is already taken.`, csrfToken: req.session.csrfToken }));
   }
 });
 
@@ -1307,8 +2146,159 @@ app.get('/admin/publishers/:id/edit', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Publisher+not+found&ok=0');
   const flash = req.query.msg ? { type: 'success', text: req.query.msg } : null;
+  const assignments = db.prepare(`
+    SELECT pa.advertiser_id, pa.payout_override, pa.valid_from, pa.valid_until, pa.monthly_cap,
+           a.name, a.slug
+    FROM publisher_advertisers pa
+    JOIN advertisers a ON a.id = pa.advertiser_id
+    WHERE pa.publisher_id = ? AND a.slug != 'legacy'
+    ORDER BY a.name
+  `).all(pub.id);
+  const allAdvertisers = db.prepare("SELECT id, name, slug FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  const tokenRow = db.prepare(
+    "SELECT token, expires_at FROM password_resets WHERE publisher_id = ? AND used_at IS NULL AND expires_at > datetime('now') ORDER BY created_at DESC LIMIT 1"
+  ).get(pub.id);
+  const resetLink = tokenRow
+    ? { url: `${BASE_URL}/publisher/reset-password?token=${tokenRow.token}`, expires: tokenRow.expires_at }
+    : null;
   res.send(renderPubForm({ title: `Edit — ${pub.username}`,
-    action: `/admin/publishers/${pub.id}/update`, pub, flash }));
+    action: `/admin/publishers/${pub.id}/update`, pub, flash, csrfToken: req.session.csrfToken,
+    assignments, allAdvertisers, resetLink }));
+});
+
+// ---------------------------------------------------------------------------
+// Admin — publisher↔advertiser assignment + manual reset link
+// ---------------------------------------------------------------------------
+
+app.post('/admin/publishers/:id/assign', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+  const advId = parseInt(req.body.advertiser_id, 10);
+  const adv = advId ? db.prepare("SELECT id, name, slug FROM advertisers WHERE id = ? AND slug != 'legacy'").get(advId) : null;
+  if (!adv) return res.redirect(`/admin/publishers/${pub.id}/edit?msg=Invalid+advertiser&ok=0`);
+
+  const num = (v) => (v !== '' && v != null && !isNaN(parseFloat(v))) ? parseFloat(v) : null;
+  const int = (v) => (v !== '' && v != null && !isNaN(parseInt(v, 10))) ? parseInt(v, 10) : null;
+  const payoutOverride = num(req.body.payout_override);
+  const validFrom  = (req.body.valid_from  || '').trim() || null;
+  const validUntil = (req.body.valid_until || '').trim() || null;
+  const monthlyCap = int(req.body.monthly_cap);
+
+  db.prepare(`
+    INSERT INTO publisher_advertisers (publisher_id, advertiser_id, payout_override, valid_from, valid_until, monthly_cap)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(publisher_id, advertiser_id) DO UPDATE SET
+      payout_override = excluded.payout_override,
+      valid_from      = excluded.valid_from,
+      valid_until     = excluded.valid_until,
+      monthly_cap     = excluded.monthly_cap
+  `).run(pub.id, adv.id, payoutOverride, validFrom, validUntil, monthlyCap);
+
+  logAudit('publisher.advertiser_assigned', 'publisher', pub.username,
+    { advertiser: adv.slug, payout_override: payoutOverride, valid_from: validFrom, valid_until: validUntil, monthly_cap: monthlyCap }, req);
+  res.redirect(`/admin/publishers/${pub.id}/edit?msg=${encodeURIComponent(adv.name + ' assigned')}`);
+});
+
+app.post('/admin/publishers/:id/unassign', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+  const advId = parseInt(req.body.advertiser_id, 10);
+  const adv = advId ? db.prepare('SELECT slug FROM advertisers WHERE id = ?').get(advId) : null;
+  db.prepare('DELETE FROM publisher_advertisers WHERE publisher_id = ? AND advertiser_id = ?').run(pub.id, advId);
+  logAudit('publisher.advertiser_unassigned', 'publisher', pub.username, { advertiser: adv?.slug ?? advId }, req);
+  res.redirect(`/admin/publishers/${pub.id}/edit?msg=Advertiser+unassigned`);
+});
+
+app.post('/admin/publishers/:id/reset-link', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+  // Invalidate any previous outstanding tokens, then issue a fresh one.
+  db.prepare("UPDATE password_resets SET used_at = datetime('now') WHERE publisher_id = ? AND used_at IS NULL").run(pub.id);
+  createResetToken(pub.id);
+  logAudit('publisher.reset_link_generated', 'publisher', pub.username, { by: 'admin' }, req);
+  res.redirect(`/admin/publishers/${pub.id}/edit?msg=Reset+link+generated`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin — smart-link rules per publisher (F5)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/publishers/:id/smart-links', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Publisher+not+found&ok=0');
+  const rules = db.prepare(`
+    SELECT slr.*, a.name AS adv_name, a.slug AS adv_slug
+    FROM smart_link_rules slr JOIN advertisers a ON a.id = slr.advertiser_id
+    WHERE slr.publisher_id = ? ORDER BY slr.priority ASC, slr.id ASC
+  `).all(pub.id);
+  const advertisers = db.prepare("SELECT id, name, slug FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderSmartLinks({ pub, rules, advertisers, csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/admin/publishers/:id/smart-links', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+  const advId = parseInt(req.body.advertiser_id, 10);
+  const adv = advId ? db.prepare("SELECT id, slug FROM advertisers WHERE id = ? AND slug != 'legacy'").get(advId) : null;
+  if (!adv) return res.redirect(`/admin/publishers/${pub.id}/smart-links?msg=Invalid+advertiser&ok=0`);
+  // Country: '*' or comma-separated ISO codes (uppercased). Device: mobile/desktop/tablet/*.
+  const country = (req.body.country || '*').trim().toUpperCase() || '*';
+  const device  = ['mobile', 'desktop', 'tablet', '*'].includes(req.body.device_type) ? req.body.device_type : '*';
+  const priority = Number.isInteger(parseInt(req.body.priority, 10)) ? parseInt(req.body.priority, 10) : 100;
+  db.prepare('INSERT INTO smart_link_rules (publisher_id, advertiser_id, country, device_type, priority) VALUES (?, ?, ?, ?, ?)')
+    .run(pub.id, adv.id, country, device, priority);
+  logAudit('publisher.smart_link_added', 'publisher', pub.username, { advertiser: adv.slug, country, device_type: device, priority }, req);
+  res.redirect(`/admin/publishers/${pub.id}/smart-links?msg=Rule+added`);
+});
+
+app.post('/admin/publishers/:id/smart-links/:ruleId/delete', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+  db.prepare('DELETE FROM smart_link_rules WHERE id = ? AND publisher_id = ?').run(req.params.ruleId, pub.id);
+  logAudit('publisher.smart_link_deleted', 'publisher', pub.username, { rule_id: req.params.ruleId }, req);
+  res.redirect(`/admin/publishers/${pub.id}/smart-links?msg=Rule+deleted`);
+});
+
+// ---------------------------------------------------------------------------
+// Admin — marketplace application review (F6)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/marketplace', requireAdmin, (req, res) => {
+  const pending = db.prepare(`
+    SELECT ma.id, ma.applied_at, p.id AS pub_id, p.username, a.id AS adv_id, a.name AS adv_name, a.slug AS adv_slug
+    FROM marketplace_applications ma
+    JOIN publishers  p ON p.id = ma.publisher_id
+    JOIN advertisers a ON a.id = ma.advertiser_id
+    WHERE ma.status = 'pending'
+    ORDER BY ma.applied_at ASC
+  `).all();
+  const flash = req.query.msg || null;
+  res.send(renderAdminMarketplace({ pending, csrfToken: req.session.csrfToken, flash }));
+});
+
+app.post('/admin/marketplace/:appId/approve', requireAdmin, (req, res) => {
+  const app_ = db.prepare("SELECT * FROM marketplace_applications WHERE id = ? AND status = 'pending'").get(req.params.appId);
+  if (!app_) return res.redirect('/admin/marketplace?msg=' + encodeURIComponent('Application not found or already decided'));
+  // Auto-create the assignment (no-op if it somehow already exists), then mark approved.
+  db.prepare(`INSERT INTO publisher_advertisers (publisher_id, advertiser_id) VALUES (?, ?)
+              ON CONFLICT(publisher_id, advertiser_id) DO NOTHING`).run(app_.publisher_id, app_.advertiser_id);
+  db.prepare("UPDATE marketplace_applications SET status = 'approved', decided_at = datetime('now') WHERE id = ?").run(app_.id);
+  const pub = db.prepare('SELECT username FROM publishers WHERE id = ?').get(app_.publisher_id);
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE id = ?').get(app_.advertiser_id);
+  logAudit('marketplace.approved', 'publisher', pub?.username, { advertiser: adv?.slug, application_id: app_.id }, req);
+  res.redirect('/admin/marketplace?msg=' + encodeURIComponent('Approved — assignment created'));
+});
+
+app.post('/admin/marketplace/:appId/reject', requireAdmin, (req, res) => {
+  const app_ = db.prepare("SELECT * FROM marketplace_applications WHERE id = ? AND status = 'pending'").get(req.params.appId);
+  if (!app_) return res.redirect('/admin/marketplace?msg=' + encodeURIComponent('Application not found or already decided'));
+  db.prepare("UPDATE marketplace_applications SET status = 'rejected', decided_at = datetime('now') WHERE id = ?").run(app_.id);
+  const pub = db.prepare('SELECT username FROM publishers WHERE id = ?').get(app_.publisher_id);
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE id = ?').get(app_.advertiser_id);
+  logAudit('marketplace.rejected', 'publisher', pub?.username, { advertiser: adv?.slug, application_id: app_.id }, req);
+  res.redirect('/admin/marketplace?msg=' + encodeURIComponent('Application rejected'));
 });
 
 app.post('/admin/publishers/:id/update', requireAdmin, (req, res) => {
@@ -1318,7 +2308,7 @@ app.post('/admin/publishers/:id/update', requireAdmin, (req, res) => {
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
   if (password && password.length < 8) return res.send(renderPubForm({ title: `Edit — ${pub.username}`,
     action: `/admin/publishers/${id}/update`, pub: { ...pub, ...req.body },
-    error: 'Password must be at least 8 characters.' }));
+    error: 'Password must be at least 8 characters.', csrfToken: req.session.csrfToken }));
   const pbUrl  = (postback_url || '').trim();
   const minPay = parseFloat(minimum_payout) >= 0 ? parseFloat(minimum_payout) : 50;
   if (password) {
@@ -1388,7 +2378,7 @@ app.get('/admin/publishers/:id/payments', requireAdmin, (req, res) => {
   const approvedBalance = db.prepare(
     "SELECT COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as bal FROM conversions WHERE publisher=?"
   ).get(pub.username).bal;
-  res.send(renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, flash }));
+  res.send(renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, flash, csrfToken: req.session.csrfToken }));
 });
 
 app.post('/admin/publishers/:id/payments', requireAdmin, (req, res) => {
@@ -1510,7 +2500,7 @@ app.get('/admin/publishers/:id/invoice/:year/:month', requireAdmin, (req, res) =
   const flash = req.query.msg
     ? { type: req.query.ok === '0' ? 'error' : 'success', text: req.query.msg } : null;
 
-  res.send(renderInvoice({ inv, pub, lines, flash }));
+  res.send(renderInvoice({ inv, pub, lines, flash, csrfToken: req.session.csrfToken }));
 });
 
 // Regenerate (recalculate total from live approved conversions)
@@ -1679,12 +2669,19 @@ app.get('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res) => {
     }
   }
 
-  res.send(renderReconcilePage({ adv, runs, runResult }));
+  res.send(renderReconcilePage({ adv, runs, runResult, csrfToken: req.session.csrfToken }));
 });
 
 app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) => {
   csvUpload(req, res, err => {
     if (err) return res.redirect(`/admin/advertisers/${req.params.slug}/reconcile?msg=${encodeURIComponent(err.message)}&ok=0`);
+
+    // CSRF check now that multer has populated req.body from the multipart form
+    const bodyToken    = (req.body._csrf || '').trim();
+    const sessionToken = req.session.csrfToken || '';
+    if (!bodyToken || !sessionToken || bodyToken !== sessionToken) {
+      return res.status(403).send('Invalid CSRF token');
+    }
 
     const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
     if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
@@ -1706,40 +2703,49 @@ app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) =>
 
     for (const row of rows) {
       const click_id  = (row.click_id || row.clickid || row.click || '').trim();
+      // F9 — allow matching by the advertiser's transaction_id when click_id is absent
+      const txnId     = (row.transaction_id || row.transactionid || row.txn_id || '').trim();
       const rawStatus = (row.status || '').trim().toLowerCase();
       const reason    = (row.reason || row.note || row.notes || '').trim();
       const payout    = row.payout !== undefined && row.payout !== '' ? parseFloat(row.payout) : null;
+      const idLabel   = click_id || txnId;
 
-      if (!click_id) {
+      if (!click_id && !txnId) {
         unmatched++;
-        insertUnmatched.run(runId, '', rawStatus, reason, 'Missing click_id');
+        insertUnmatched.run(runId, '', rawStatus, reason, 'Missing click_id and transaction_id');
         continue;
       }
       if (!['approved', 'rejected'].includes(rawStatus)) {
         unmatched++;
-        insertUnmatched.run(runId, click_id, rawStatus, reason, `Invalid status: "${rawStatus}"`);
+        insertUnmatched.run(runId, idLabel, rawStatus, reason, `Invalid status: "${rawStatus}"`);
         continue;
       }
 
-      const conv = db.prepare(
-        'SELECT id FROM conversions WHERE click_id = ? AND advertiser_slug = ?'
-      ).get(click_id, adv.slug);
+      // Prefer click_id; fall back to transaction_id (F9).
+      let conv = null;
+      if (click_id) {
+        conv = db.prepare('SELECT id FROM conversions WHERE click_id = ? AND advertiser_slug = ?').get(click_id, adv.slug);
+      }
+      if (!conv && txnId) {
+        conv = db.prepare('SELECT id FROM conversions WHERE transaction_id = ? AND advertiser_slug = ?').get(txnId, adv.slug);
+      }
 
       if (!conv) {
         unmatched++;
-        insertUnmatched.run(runId, click_id, rawStatus, reason, 'click_id not found for this advertiser');
+        insertUnmatched.run(runId, idLabel, rawStatus, reason, 'No matching click_id or transaction_id for this advertiser');
         continue;
       }
 
       matched++;
       if (rawStatus === 'approved') approved++; else rejected++;
 
+      // Update by conversion id — robust whether matched by click_id or transaction_id.
       if (payout !== null && !isNaN(payout)) {
-        db.prepare('UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?, payout=? WHERE click_id=? AND advertiser_slug=?')
-          .run(rawStatus, reason, runId, payout, click_id, adv.slug);
+        db.prepare('UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?, payout=? WHERE id=?')
+          .run(rawStatus, reason, runId, payout, conv.id);
       } else {
-        db.prepare('UPDATE conversions SET status=?, reason=?, reconciliation_run_id=? WHERE click_id=? AND advertiser_slug=?')
-          .run(rawStatus, reason, runId, click_id, adv.slug);
+        db.prepare('UPDATE conversions SET status=?, reason=?, reconciliation_run_id=? WHERE id=?')
+          .run(rawStatus, reason, runId, conv.id);
       }
     }
 
@@ -1912,7 +2918,7 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
   const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
 
   const rows = db.prepare(
-    `SELECT received_at,advertiser_slug,click_id,publisher,event,payout,status,reason FROM conversions ${where} ORDER BY received_at`
+    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,status,reason FROM conversions ${where} ORDER BY received_at`
   ).all(...params);
 
   const parts = [advertiser, month].filter(Boolean);
@@ -1922,8 +2928,8 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   res.send([
-    'received_at,advertiser,click_id,publisher,event,payout,status,reason',
-    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.publisher, r.event, r.payout, r.status, r.reason].map(q).join(',')),
+    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,status,reason',
+    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.status, r.reason].map(q).join(',')),
   ].join('\r\n'));
 });
 
@@ -1932,6 +2938,10 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 // ---------------------------------------------------------------------------
 
 const H   = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Server-side CSRF hidden field — rendered directly into the form HTML so it
+// works even when client JS fails. The JS fallback in the admin shell only
+// injects _csrf into forms that don't already have it, so this never doubles up.
+const csrfField = token => `<input type="hidden" name="_csrf" value="${H(token)}">`;
 const $   = n  => Number(n).toFixed(2);
 const N   = n  => Number(n).toLocaleString();
 const cvr = (cl, co) => cl > 0 ? ((co / cl) * 100).toFixed(1) + '%' : '—';
@@ -2019,6 +3029,7 @@ const ADMIN_CSS = `
   .badge.approved{background:#ecfdf5;color:#0a7c5c}
   .badge.pending{background:#fffbeb;color:#92651a}
   .badge.rejected{background:#fef2f2;color:#991b1b}
+  .badge.duplicate{background:#f3e8ff;color:#6b21a8}
   .act{display:flex;gap:4px;flex-wrap:wrap}
   .btn{display:inline-flex;align-items:center;padding:4px 10px;border-radius:5px;font-size:11px;font-weight:500;cursor:pointer;border:1px solid transparent;white-space:nowrap;font-family:inherit}
   .btn-primary{background:#00e5c3;color:#0d1117;border-color:#00e5c3}
@@ -2088,6 +3099,8 @@ const PUB_CSS = `
   .sh h2{font-size:13px;font-weight:600;color:#111827}
   .sh .meta{font-size:11px;color:#9ca3af}
   table{width:100%;border-collapse:collapse}
+  /* F17 — mobile: let wide tables scroll horizontally instead of overflowing */
+  @media (max-width:640px){ .pub-content table, .pub-content .login-card table { display:block; max-width:100%; overflow-x:auto; white-space:nowrap } }
   th{background:#f9fafb;padding:8px 13px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:#6b7280;border-bottom:1px solid #f3f4f6;white-space:nowrap}
   td{padding:9px 13px;border-bottom:1px solid #f3f4f6;vertical-align:middle;font-size:13px;color:#111827}
   tr:last-child td{border-bottom:none}
@@ -2098,6 +3111,7 @@ const PUB_CSS = `
   .badge.approved{background:#ecfdf5;color:#0a7c5c}
   .badge.pending{background:#fffbeb;color:#92651a}
   .badge.rejected{background:#fef2f2;color:#991b1b}
+  .badge.duplicate{background:#f3e8ff;color:#6b21a8}
   .btn{display:inline-flex;align-items:center;padding:4px 10px;border-radius:5px;font-size:11px;font-weight:500;cursor:pointer;border:1px solid transparent;white-space:nowrap;font-family:inherit}
   .btn-ghost{background:#f9fafb;color:#374151;border-color:#e2e6ea}
   .btn-ghost:hover{background:#f3f4f6}
@@ -2302,11 +3316,11 @@ function renderAdminLogin(errorMsg) {
 function renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
   approvedPayout, pendingPayout, monthlyPayout,
   thisMonth, advStats, pubStats, recent, flash, publisherCount,
-  topCountries = [], deviceSplit = [], osSplit = [], globalConvStatus = {} }) {
+  topCountries = [], deviceSplit = [], osSplit = [], globalConvStatus = {}, csrfToken = '' }) {
 
   const advRows = advStats.filter(a => a.slug !== 'legacy' || a.clicks > 0).map(a => {
     const trackUrl   = `${BASE_URL}/track/${a.slug}?pub=PUBLISHER_NAME`;
-    const postbkUrl  = `${BASE_URL}/postback/${a.slug}?click_id=CLICK_ID&payout=AMOUNT&event=sale`;
+    const postbkUrl  = `${BASE_URL}/postback/${a.slug}?click_id=CLICK_ID&event=sale&loan_amount=AMOUNT&revenue=REVENUE`;
     const isLegacy   = a.slug === 'legacy';
     return `<tr>
       <td>
@@ -2321,16 +3335,21 @@ function renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
         <div>$${$(a.approved_payout)} <span style="font-size:10px;color:#2e7d32">approved</span></div>
         ${a.pending_count > 0 ? `<div style="font-size:11px;color:#f57f17">${N(a.pending_count)} pending</div>` : ''}
       </td>
+      <td>$${$(a.revenue)}</td>
+      <td>$${$(a.revenue - a.payout)}<div style="font-size:10px;color:#6e6e73">${a.revenue>0?(((a.revenue-a.payout)/a.revenue*100).toFixed(1)+'%'):'—'}</div></td>
+      <td>${a.monthly_conversion_cap != null
+        ? `<span style="${a.cap_used >= a.monthly_conversion_cap ? 'color:#c62828;font-weight:600' : (a.cap_used >= a.monthly_conversion_cap*0.8 ? 'color:#f57f17' : '')}">${N(a.cap_used)}/${N(a.monthly_conversion_cap)}</span>`
+        : '<span style="color:#8e8e93">—</span>'}</td>
       <td>${cvr(a.clicks,a.conversions)}</td>
       <td><div class="ubox" onclick="cp(this,'${H(postbkUrl)}')" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">/postback/${H(a.slug)}?click_id=…</div></td>
       <td><div class="act">
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
-        ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">
+        ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
           <button class="btn ${a.status==='active'?'btn-warn':'btn-ghost'}">${a.status==='active'?'Pause':'Activate'}</button></form>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/delete" style="display:inline"
-          onsubmit="return confirm('Delete ${H(a.name)}? Historical data is kept.')">
+          onsubmit="return confirm('Delete ${H(a.name)}? Historical data is kept.')">${csrfField(csrfToken)}
           <button class="btn btn-danger">Delete</button></form>`}
         <a href="/admin/export.csv?advertiser=${H(a.slug)}" class="btn btn-ghost">CSV</a>
       </div></td>
@@ -2343,24 +3362,38 @@ function renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
       <td>${H(adv?.name||r.advertiser_slug)}</td>
       <td><code>${H(r.publisher)}</code></td>
       <td>${N(r.clicks)}</td><td>${N(r.conversions)}</td>
-      <td>$${$(r.payout)}</td><td>${cvr(r.clicks,r.conversions)}</td>
+      <td>$${$(r.payout)}</td>
+      <td>$${$(r.revenue)}</td>
+      <td>$${$(r.revenue - r.payout)}<div style="font-size:10px;color:#6e6e73">${r.revenue>0?(((r.revenue-r.payout)/r.revenue*100).toFixed(1)+'%'):'—'}</div></td>
+      <td>${cvr(r.clicks,r.conversions)}</td>
       <td><a href="/admin/export.csv?advertiser=${H(r.advertiser_slug)}&month=${thisMonth}" class="btn btn-ghost">CSV</a></td>
     </tr>`;
   }).join('');
 
   const recentRows = recent.map(r => {
     const adv = advStats.find(a => a.slug === r.advertiser_slug);
+    const st = r.status || 'pending';
+    // F15 — duplicates get a badge + an inline override back to pending/approved.
+    const statusCell = st === 'duplicate'
+      ? `<span class="badge duplicate" title="${H(r.reason||'duplicate_user')}">duplicate</span>
+         <form method="POST" action="/admin/conversions/${r.id}/status" style="display:inline-flex;gap:3px;margin-top:3px">${csrfField(csrfToken)}
+           <select name="status" style="font-size:10px;padding:1px 3px"><option value="pending">pending</option><option value="approved">approved</option></select>
+           <button class="btn btn-ghost" style="font-size:10px;padding:1px 6px">Override</button>
+         </form>`
+      : `<span class="badge ${H(st)}">${H(st)}</span>`;
     return `<tr>
       <td>${H(r.received_at)}</td><td>${H(adv?.name||r.advertiser_slug)}</td>
       <td><code>${H(r.publisher)}</code></td>
       <td><code class="xs">${H(r.click_id)}</code></td>
       <td><span class="badge ev">${H(r.event)}</span></td>
       <td>$${$(r.payout)}</td>
+      <td>${statusCell}</td>
     </tr>`;
   }).join('');
 
   const body = `
-${adminHeader(`<a href="/admin/export.csv" class="hbtn ghost">Export All</a>
+${adminHeader(`<a href="/admin/marketplace" class="hbtn ghost">Marketplace</a>
+  <a href="/admin/export.csv" class="hbtn ghost">Export All</a>
   <a href="/admin/advertisers/new" class="hbtn">+ Advertiser</a>`)}
 <main>
 ${flashHtml(flash)}
@@ -2381,14 +3414,14 @@ ${flashHtml(flash)}
   ${advStats.filter(a=>a.slug!=='legacy'||a.clicks>0).length===0
     ? '<div class="empty">No advertisers yet. <a href="/admin/advertisers/new">Create one.</a></div>'
     : `<table><thead><tr><th>Advertiser / Tracking URL</th><th>Status</th><th>Clicks</th>
-        <th>Conv</th><th>Payout</th><th>CVR</th><th>Postback URL</th><th>Actions</th></tr></thead>
+        <th>Conv</th><th>Payout</th><th>Revenue</th><th>Margin</th><th>Cap (mo)</th><th>CVR</th><th>Postback URL</th><th>Actions</th></tr></thead>
         <tbody>${advRows}</tbody></table>`}
 </section>
 
 <section>
   <div class="sh"><h2>Publisher Performance</h2><span class="meta">Top 100 by payout</span></div>
   ${pubRows.length===0 ? '<div class="empty">No data yet.</div>'
-    : `<table><thead><tr><th>Advertiser</th><th>Publisher</th><th>Clicks</th><th>Conv</th><th>Payout</th><th>CVR</th><th></th></tr></thead>
+    : `<table><thead><tr><th>Advertiser</th><th>Publisher</th><th>Clicks</th><th>Conv</th><th>Payout</th><th>Revenue</th><th>Margin</th><th>CVR</th><th></th></tr></thead>
         <tbody>${pubRows}</tbody></table>`}
 </section>
 
@@ -2492,7 +3525,7 @@ ${(topCountries.length || deviceSplit.length) ? `
       <a href="/admin/export.csv?month=${thisMonth}" class="btn btn-ghost">${thisMonth} CSV</a></div>
   </div>
   ${recentRows.length===0 ? '<div class="empty">No conversions yet.</div>'
-    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>Payout</th></tr></thead>
+    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>Payout</th><th>Status</th></tr></thead>
         <tbody>${recentRows}</tbody></table>`}
 </section>
 </main><script>${CP_JS}</script>`;
@@ -2500,10 +3533,10 @@ ${(topCountries.length || deviceSplit.length) ? `
   return adminLayout('Dashboard', body);
 }
 
-function renderAdvList({ advStats, flash }) {
+function renderAdvList({ advStats, flash, csrfToken = '' }) {
   const rows = advStats.filter(a => a.slug !== 'legacy' || a.clicks > 0).map(a => {
     const trackUrl  = `${BASE_URL}/track/${a.slug}?pub=PUBLISHER_NAME`;
-    const postbkUrl = `${BASE_URL}/postback/${a.slug}?click_id=CLICK_ID&payout=AMOUNT&event=sale`;
+    const postbkUrl = `${BASE_URL}/postback/${a.slug}?click_id=CLICK_ID&event=sale&loan_amount=AMOUNT&revenue=REVENUE`;
     const isLegacy  = a.slug === 'legacy';
     return `<tr>
       <td>
@@ -2525,10 +3558,10 @@ function renderAdvList({ advStats, flash }) {
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
-        ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">
+        ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
           <button class="btn ${a.status==='active'?'btn-warn':'btn-ghost'}">${a.status==='active'?'Pause':'Activate'}</button></form>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/delete" style="display:inline"
-          onsubmit="return confirm('Delete ${H(a.name)}? Historical data is kept.')">
+          onsubmit="return confirm('Delete ${H(a.name)}? Historical data is kept.')">${csrfField(csrfToken)}
           <button class="btn btn-danger">Delete</button></form>`}
         <a href="/admin/export.csv?advertiser=${H(a.slug)}" class="btn btn-ghost">CSV</a>
       </div></td>
@@ -2555,17 +3588,82 @@ ${flashHtml(flash)}
   return adminLayout('Advertisers', body);
 }
 
-function renderAdvForm({ title, action, adv = {}, error }) {
+function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
+  const rows = logs.map(l => {
+    let errCount = 0; try { errCount = l.errors ? JSON.parse(l.errors).length : 0; } catch { errCount = l.errors ? 1 : 0; }
+    return `<tr>
+      <td style="white-space:nowrap;font-size:11px">${H((l.synced_at||'').slice(0,16))}</td>
+      <td><span class="badge ${l.status==='success'?'active':'rejected'}">${H(l.status)}</span></td>
+      <td>${N(l.events_pulled)}</td>
+      <td>${N(l.matched)}</td>
+      <td style="color:#2e7d32">${N(l.auto_approved)}</td>
+      <td style="color:#c62828">${N(l.auto_rejected)}</td>
+      <td>${errCount ? `<span title="${H((l.errors||'').slice(0,300))}" style="color:#f57f17">${errCount} issue(s)</span>` : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">← Edit advertiser</a>`)}
+<main><div class="fw">
+  <h2>MMP Sync — ${H(adv.name)}</h2>
+  ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
+  ${error ? `<div class="form-err">${H(error)}</div>` : ''}
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events and auto-approves attributed / auto-rejects organic+fraud conversions matched by <code>click_id</code>. Manual trigger only.</p>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp-sync/run" style="margin-bottom:18px"
+        onsubmit="return confirm('Run a manual AppsFlyer sync now?')">${csrfField(csrfToken)}
+    <button class="btn btn-primary"${adv.mmp_type==='appsflyer'?'':' disabled'}>Run Sync Now</button>
+    ${adv.mmp_type==='appsflyer' ? '' : '<small style="margin-left:8px;color:#8e8e93">Set MMP Type to AppsFlyer first.</small>'}
+  </form>
+  ${logs.length === 0
+    ? '<div class="empty">No sync runs yet.</div>'
+    : `<table><thead><tr><th>When</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Issues</th></tr></thead>
+        <tbody>${rows}</tbody></table>`}
+</div></main>`;
+  return adminLayout(`MMP Sync — ${adv.name}`, body);
+}
+
+function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], flash, capUsed = null }) {
   const isEdit = action.includes('/update');
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(adv.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
   ).join('');
 
+  const goalsSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Conversion Goals</h2>
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Define multiple payable events. A postback's <code>event</code> is matched against a goal's event token to choose the payout; if none match, the default payout above applies. A per-publisher payout override still takes precedence.</p>
+    ${goals.length === 0 ? '<div class="empty" style="margin-bottom:14px">No goals defined — the default payout applies to every conversion.</div>' : `
+    <table style="margin-bottom:16px"><thead><tr>
+      <th>Name</th><th>Event Token</th><th>Payout</th><th>Status</th><th>Description</th><th></th>
+    </tr></thead><tbody>
+    ${goals.map(g => `<tr>
+      <td><strong>${H(g.name)}</strong></td>
+      <td><code class="xs">${H(g.event_token)}</code></td>
+      <td>${g.payout_type === 'percent' ? `${H(g.payout)}% of loan` : `$${$(g.payout)}`}</td>
+      <td><span class="badge ${g.status==='active'?'active':'paused'}">${H(g.status)}</span></td>
+      <td style="font-size:11px;color:#6e6e73">${H(g.description||'—')}</td>
+      <td><form method="POST" action="/admin/advertisers/${H(adv.slug)}/goals/${H(g.id)}/delete" style="display:inline"
+            onsubmit="return confirm('Delete goal ${H(g.name)}?')">${csrfField(csrfToken)}
+            <button class="btn btn-danger">Delete</button></form></td>
+    </tr>`).join('')}
+    </tbody></table>`}
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/goals"
+          style="display:grid;grid-template-columns:1fr 1fr .7fr .8fr 1.4fr auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px">${csrfField(csrfToken)}
+      <div class="fg" style="margin:0"><label>Goal Name</label><input type="text" name="name" required placeholder="e.g. First Deposit"></div>
+      <div class="fg" style="margin:0"><label>Event Token</label><input type="text" name="event_token" required placeholder="e.g. ftd"></div>
+      <div class="fg" style="margin:0"><label>Payout</label><input type="number" name="payout" step="0.01" min="0" value="0" required></div>
+      <div class="fg" style="margin:0"><label>Type</label>
+        <select name="payout_type"><option value="fixed">Fixed $</option><option value="percent">Percent %</option></select></div>
+      <div class="fg" style="margin:0"><label>Description</label><input type="text" name="description" placeholder="optional"></div>
+      <button type="submit" class="btn btn-primary">Add Goal</button>
+    </form>
+  </div>`;
+
   const body = `${adminHeader()}
 <main><div class="fw">
   <h2>${H(title)}</h2>
+  ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
   ${error ? `<div class="form-err">${H(error)}</div>` : ''}
-  <form method="POST" action="${H(action)}">
+  <form method="POST" action="${H(action)}">${csrfField(csrfToken)}
     <div class="fg"><label>Advertiser Name *</label>
       <input type="text" name="name" value="${H(adv.name||'')}" required
              oninput="${isEdit?'':'autoSlug(this)'}"></div>
@@ -2577,23 +3675,86 @@ function renderAdvForm({ title, action, adv = {}, error }) {
       <input type="url" name="offer_url" value="${H(adv.offer_url||'')}" placeholder="https://…" required>
       <small>A <code>click_id</code> param will be appended automatically.</small></div>
     <div class="fg-row">
-      <div class="fg"><label>Default Payout ($)</label>
+      <div class="fg"><label>Default Payout</label>
         <input type="number" name="payout_amount" value="${H(adv.payout_amount||'0')}" step="0.01" min="0">
-        <small>Used when postback sends no payout.</small></div>
+        <small>Dollar amount when type is Fixed; percent of <code>loan_amount</code> when Percent.</small></div>
+      <div class="fg"><label>Payout Type</label>
+        <select name="payout_type">
+          <option value="fixed"   ${(adv.payout_type||'fixed')==='fixed'  ?'selected':''}>Fixed $</option>
+          <option value="percent" ${(adv.payout_type||'fixed')==='percent'?'selected':''}>Percent %</option>
+        </select></div>
       <div class="fg"><label>Status</label><select name="status">${statusOpts}</select></div>
     </div>
+    <div class="fg"><label>Click Lookback Window (days)</label>
+      <input type="number" name="click_lookback_window" value="${H(adv.click_lookback_window ?? 30)}" step="1" min="1" style="max-width:160px">
+      <small>Postbacks for clicks older than this are rejected (HTTP 410). Default 30.</small></div>
+    <div class="fg-row">
+      <div class="fg"><label>Monthly Conversion Cap</label>
+        <input type="number" name="monthly_conversion_cap" value="${adv.monthly_conversion_cap ?? ''}" step="1" min="0" placeholder="unlimited" style="max-width:160px">
+        <small>Hard ceiling on approved conversions per UTC month — blank = unlimited. At the cap the advertiser auto-pauses and postbacks are rejected (HTTP 429).${isEdit && adv.monthly_conversion_cap != null ? ` <strong>Used this month: ${capUsed ?? 0} / ${adv.monthly_conversion_cap}</strong>` : ''}</small></div>
+      ${isEdit ? `<div class="fg"><label>Reset Month Count</label>
+        <input type="month" name="cap_reset_month" value="${H(adv.cap_reset_month||'')}">
+        <small>Change this to reset the current month's cap count and re-activate if auto-paused.</small></div>` : ''}
+    </div>
+    <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <legend style="font-size:12px;font-weight:600;padding:0 6px">Marketplace</legend>
+      <div class="fg"><label style="display:flex;align-items:center;gap:8px;font-weight:500">
+        <input type="checkbox" name="is_public" value="1" ${adv.is_public ? 'checked' : ''} style="width:auto;margin:0"> List on the public marketplace</label>
+        <small>Publishers can browse this campaign at /marketplace and apply to run it.</small></div>
+      <div class="fg-row">
+        <div class="fg"><label>Category</label><input type="text" name="category" value="${H(adv.category||'')}" placeholder="e.g. Loans, Finance"></div>
+        <div class="fg"><label>Countries Allowed</label><input type="text" name="countries_allowed" value="${H(adv.countries_allowed||'')}" placeholder="e.g. VN, TH (display only)"></div>
+      </div>
+      <div class="fg"><label>Description</label>
+        <textarea name="description" rows="2" style="width:100%;padding:8px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px;resize:vertical">${H(adv.description||'')}</textarea></div>
+    </fieldset>
+    <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <legend style="font-size:12px;font-weight:600;padding:0 6px">Postback Security</legend>
+      <div class="fg"><label>HMAC Postback Secret</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="pbsecret" name="postback_secret" value="${H(adv.postback_secret||'')}"
+                 placeholder="blank = no signature required" style="flex:1;font-family:monospace;font-size:12px">
+          <button type="button" class="btn btn-ghost" onclick="cp(document.getElementById('pbsecret'), document.getElementById('pbsecret').value)">Copy</button>
+        </div>
+        <small>If set, postbacks must include <code>&amp;sig=HMAC_SHA256(secret, click_id+event+payout)</code> as a hex digest, or they are rejected (403). Leave blank to accept unsigned postbacks (backward compatible).</small></div>
+    </fieldset>
+    <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <legend style="font-size:12px;font-weight:600;padding:0 6px">MMP Integration (AppsFlyer)</legend>
+      <div class="fg-row">
+        <div class="fg"><label>MMP Type</label>
+          <select name="mmp_type">
+            <option value="none"      ${(adv.mmp_type||'none')==='none'      ?'selected':''}>None</option>
+            <option value="appsflyer" ${(adv.mmp_type||'none')==='appsflyer' ?'selected':''}>AppsFlyer</option>
+          </select></div>
+        <div class="fg"><label>App ID</label>
+          <input type="text" name="mmp_app_id" value="${H(adv.mmp_app_id||'')}" placeholder="e.g. id123456789 or com.app"></div>
+      </div>
+      <div class="fg"><label>API Token</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="password" id="mmptoken" name="mmp_api_token" value="${H(adv.mmp_api_token||'')}"
+                 placeholder="AppsFlyer API token" autocomplete="new-password" style="flex:1;font-family:monospace;font-size:12px">
+          <button type="button" class="btn btn-ghost" onclick="var i=document.getElementById('mmptoken');i.type=i.type==='password'?'text':'password';this.textContent=i.type==='password'?'Show':'Hide';">Show</button>
+        </div>
+        <small>Stored ${mmpKey() ? 'encrypted (AES-256-GCM)' : '<strong style="color:#c62828">in plaintext — set MMP_ENCRYPTION_KEY</strong>'}. Used to pull in-app events from AppsFlyer.</small></div>
+      ${isEdit ? `<div style="display:flex;gap:8px;margin-top:6px">
+        <button type="submit" formaction="/admin/advertisers/${H(adv.slug)}/mmp-test" formmethod="POST" class="btn btn-ghost">Test Connection</button>
+        <a href="/admin/advertisers/${H(adv.slug)}/mmp-sync" class="btn btn-ghost">Sync Dashboard →</a>
+      </div>
+      <small style="display:block;margin-top:6px;color:#8e8e93">Save credentials before testing — the test uses the saved token.</small>` : ''}
+    </fieldset>
     ${isEdit && adv.slug ? `
     <div class="fg"><label>Tracking URL format</label>
       <div class="ubox" onclick="cp(this,'${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME')">
         ${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME</div></div>
     <div class="fg"><label>Postback URL format</label>
-      <div class="ubox" onclick="cp(this,'${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&payout=AMOUNT&event=sale')">
-        ${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&amp;payout=AMOUNT&amp;event=sale</div></div>` : ''}
+      <div class="ubox" onclick="cp(this,'${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&event=sale&loan_amount=AMOUNT&revenue=REVENUE')">
+        ${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&amp;event=sale&amp;loan_amount=AMOUNT&amp;revenue=REVENUE</div></div>` : ''}
     <div class="form-act">
       <button type="submit" class="btn btn-primary btn-lg">Save Advertiser</button>
       <a href="/admin" class="btn btn-ghost btn-lg">Cancel</a>
     </div>
   </form>
+  ${goalsSection}
 </div></main>
 <script>
 function autoSlug(n){const s=document.getElementById('slug');if(s)s.value=n.value.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');}
@@ -2603,7 +3764,7 @@ ${CP_JS}
   return adminLayout(title, body);
 }
 
-function renderPubList({ publishers, pending = [], flash }) {
+function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
   const pendingRows = pending.map(p => `<tr style="background:#fffbf0">
     <td>
       <strong>${H(p.username)}</strong>
@@ -2616,15 +3777,15 @@ function renderPubList({ publishers, pending = [], flash }) {
     <td style="color:#8e8e93;font-size:11px">${H(p.created_at?.slice(0,10)||'')}</td>
     <td>
       <div class="act">
-        <form method="POST" action="/admin/publishers/${p.id}/approve" style="display:inline">
+        <form method="POST" action="/admin/publishers/${p.id}/approve" style="display:inline">${csrfField(csrfToken)}
           <button class="btn btn-primary">Approve</button>
         </form>
         <form method="POST" action="/admin/publishers/${p.id}/reject" style="display:inline"
-              onsubmit="return confirm('Reject application from ${H(p.username)}?')">
+              onsubmit="return confirm('Reject application from ${H(p.username)}?')">${csrfField(csrfToken)}
           <button class="btn btn-danger">Reject</button>
         </form>
         <form method="POST" action="/admin/publishers/${p.id}/delete" style="display:inline"
-              onsubmit="return confirm('Permanently delete application from ${H(p.username)}?')">
+              onsubmit="return confirm('Permanently delete application from ${H(p.username)}?')">${csrfField(csrfToken)}
           <button class="btn btn-ghost">Delete</button>
         </form>
       </div>
@@ -2656,18 +3817,18 @@ function renderPubList({ publishers, pending = [], flash }) {
         <button type="submit" class="btn btn-ghost">Invoice</button>
       </form>
       <form method="POST" action="/admin/publishers/${p.id}/regenerate-key" style="display:inline"
-            onsubmit="return confirm('Regenerate API key for ${H(p.username)}? The old key stops working immediately.')">
+            onsubmit="return confirm('Regenerate API key for ${H(p.username)}? The old key stops working immediately.')">${csrfField(csrfToken)}
         <button class="btn btn-ghost">↻ Key</button>
       </form>
       ${p.api_key ? `<form method="POST" action="/admin/publishers/${p.id}/revoke-key" style="display:inline"
-            onsubmit="return confirm('Revoke API key for ${H(p.username)}?')">
+            onsubmit="return confirm('Revoke API key for ${H(p.username)}?')">${csrfField(csrfToken)}
         <button class="btn btn-danger">Revoke Key</button>
       </form>` : ''}
-      <form method="POST" action="/admin/publishers/${p.id}/toggle" style="display:inline">
+      <form method="POST" action="/admin/publishers/${p.id}/toggle" style="display:inline">${csrfField(csrfToken)}
         <button class="btn ${p.status==='active'?'btn-warn':'btn-ghost'}">${p.status==='active'?'Pause':'Activate'}</button>
       </form>
       <form method="POST" action="/admin/publishers/${p.id}/delete" style="display:inline"
-            onsubmit="return confirm('Delete publisher ${H(p.username)}?')">
+            onsubmit="return confirm('Delete publisher ${H(p.username)}?')">${csrfField(csrfToken)}
         <button class="btn btn-danger">Delete</button>
       </form>
     </div></td>
@@ -2753,7 +3914,7 @@ ${flashHtml(flash)}
 // Invoice detail (printable)
 // ---------------------------------------------------------------------------
 
-function renderInvoice({ inv, pub, lines, flash }) {
+function renderInvoice({ inv, pub, lines, flash, csrfToken = '' }) {
   const MONTHS = ['','January','February','March','April','May','June',
                   'July','August','September','October','November','December'];
 
@@ -2806,18 +3967,18 @@ function renderInvoice({ inv, pub, lines, flash }) {
   const adminControls = `
 <div class="no-print" style="max-width:820px;margin:16px auto 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
   ${flashHtml(flash)}
-  <form method="POST" action="/admin/invoices/${H(inv.id)}/status" style="display:inline">
+  <form method="POST" action="/admin/invoices/${H(inv.id)}/status" style="display:inline">${csrfField(csrfToken)}
     <input type="hidden" name="status" value="${H(nextStatus[inv.status] || 'draft')}">
     <button class="btn btn-primary btn-lg">${H(nextLabel[inv.status] || 'Update Status')}</button>
   </form>
-  <form method="POST" action="/admin/publishers/${H(pub.id)}/invoice/${inv.year}/${inv.month}/regenerate" style="display:inline">
+  <form method="POST" action="/admin/publishers/${H(pub.id)}/invoice/${inv.year}/${inv.month}/regenerate" style="display:inline">${csrfField(csrfToken)}
     <button class="btn btn-ghost btn-lg">↻ Recalculate</button>
   </form>
   <button class="btn btn-ghost btn-lg" onclick="window.print()">Print / Save PDF</button>
   <a href="/admin/invoices" class="btn btn-ghost btn-lg">← All Invoices</a>
 </div>
 <div class="no-print" style="max-width:820px;margin:12px auto 0">
-  <form method="POST" action="/admin/publishers/${H(pub.id)}/invoice/${inv.year}/${inv.month}/notes" style="display:flex;gap:8px;align-items:flex-start">
+  <form method="POST" action="/admin/publishers/${H(pub.id)}/invoice/${inv.year}/${inv.month}/notes" style="display:flex;gap:8px;align-items:flex-start">${csrfField(csrfToken)}
     <textarea name="notes" rows="2" placeholder="Notes (payment terms, bank details, etc.) — visible on invoice"
               style="flex:1;padding:8px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:12px;resize:vertical">${H(inv.notes)}</textarea>
     <button type="submit" class="btn btn-ghost">Save Notes</button>
@@ -2875,7 +4036,7 @@ ${adminControls}
   return adminLayout(`Invoice ${invNum}`, body);
 }
 
-function renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, flash }) {
+function renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, flash, csrfToken = '' }) {
   const methods  = ['Wire Transfer', 'PayPal', 'USDT', 'Bank Transfer', 'Other'];
   const minPay   = pub.minimum_payout ?? 50;
   const balance  = approvedBalance - totalPaid;
@@ -2903,7 +4064,7 @@ ${flash ? `<div class="flash ${flash.type}">${H(flash.text)}</div>` : ''}
   <div class="sh"><h2>Record New Payment</h2></div>
   <div style="padding:20px 24px">
     <form method="POST" action="/admin/publishers/${H(pub.id)}/payments"
-          style="display:grid;grid-template-columns:130px 160px 1fr 1fr auto;gap:10px;align-items:end">
+          style="display:grid;grid-template-columns:130px 160px 1fr 1fr auto;gap:10px;align-items:end">${csrfField(csrfToken)}
       <div class="fg" style="margin:0">
         <label>Date *</label>
         <input type="date" name="paid_at" value="${new Date().toISOString().slice(0,10)}" required>
@@ -2942,18 +4103,173 @@ ${flash ? `<div class="flash ${flash.type}">${H(flash.text)}</div>` : ''}
   return adminLayout(`Payments — ${pub.username}`, body);
 }
 
-function renderPubForm({ title, action, pub = {}, error, flash }) {
+function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, error }) {
+  const smartUrl = `${BASE_URL}/go/${encodeURIComponent(pub.username)}`;
+  const ruleRows = rules.map(r => `<tr>
+    <td>${r.priority}</td>
+    <td><strong>${H(r.adv_name)}</strong> <span style="color:#8e8e93;font-size:11px">${H(r.adv_slug)}</span></td>
+    <td>${H(r.country)}</td>
+    <td>${H(r.device_type)}</td>
+    <td><form method="POST" action="/admin/publishers/${H(pub.id)}/smart-links/${H(r.id)}/delete" style="display:inline"
+          onsubmit="return confirm('Delete this rule?')">${csrfField(csrfToken)}
+          <button class="btn btn-danger">Delete</button></form></td>
+  </tr>`).join('');
+
+  const body = `${adminHeader('<a href="/admin/publishers" class="hbtn ghost">← Publishers</a>')}
+<main><div class="fw">
+  <h2>Smart Links — ${H(pub.username)}</h2>
+  ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
+  ${error ? `<div class="form-err">${H(error)}</div>` : ''}
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:8px">Smart link (geo/device routed):</p>
+  <div class="ubox" onclick="cp(this,'${H(smartUrl)}')" style="margin-bottom:20px">${H(smartUrl)}</div>
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Rules are evaluated by priority (lowest number first). <code>*</code> matches any country/device. Country accepts comma-separated ISO codes (e.g. <code>VN,TH</code>). If no rule matches, traffic falls back to the publisher's first active assigned advertiser.</p>
+  ${rules.length === 0 ? '<div class="empty" style="margin-bottom:14px">No rules yet — all traffic uses the fallback advertiser.</div>' : `
+  <table style="margin-bottom:16px"><thead><tr><th>Priority</th><th>Advertiser</th><th>Country</th><th>Device</th><th></th></tr></thead>
+    <tbody>${ruleRows}</tbody></table>`}
+  <form method="POST" action="/admin/publishers/${H(pub.id)}/smart-links"
+        style="display:grid;grid-template-columns:2fr 1.2fr 1fr .8fr auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px">${csrfField(csrfToken)}
+    <div class="fg" style="margin:0"><label>Advertiser</label>
+      <select name="advertiser_id" required>${advertisers.map(a => `<option value="${H(a.id)}">${H(a.name)}</option>`).join('')}</select></div>
+    <div class="fg" style="margin:0"><label>Country (ISO, comma, or *)</label><input type="text" name="country" value="*" placeholder="* or VN,TH"></div>
+    <div class="fg" style="margin:0"><label>Device</label>
+      <select name="device_type"><option value="*">Any</option><option value="mobile">Mobile</option><option value="desktop">Desktop</option><option value="tablet">Tablet</option></select></div>
+    <div class="fg" style="margin:0"><label>Priority</label><input type="number" name="priority" value="100" step="1"></div>
+    <button type="submit" class="btn btn-primary">Add Rule</button>
+  </form>
+  <div style="margin-top:20px"><a href="/admin/publishers/${H(pub.id)}/edit" class="btn btn-ghost">← Back to publisher</a></div>
+</div></main>
+<script>${CP_JS}</script>`;
+  return adminLayout(`Smart Links — ${pub.username}`, body);
+}
+
+function renderMarketplace({ campaigns, loggedIn, assignedIds, pendingIds, flash }) {
+  const payoutLabel = a => a.payout_type === 'percent' ? `${H(a.payout_amount)}% of loan amount` : `$${$(a.payout_amount)}`;
+  const cards = campaigns.map(a => {
+    const assigned = assignedIds.has(a.id);
+    const pending  = pendingIds.has(a.id);
+    const action = assigned
+      ? `<span class="btn btn-ghost" style="opacity:.7;cursor:default">✓ Already running</span>`
+      : pending
+        ? `<span class="btn btn-ghost" style="opacity:.7;cursor:default">Application pending</span>`
+        : `<form method="POST" action="/marketplace/apply" style="margin:0">
+             <input type="hidden" name="advertiser_id" value="${H(a.id)}">
+             <button type="submit" class="btn btn-primary">Apply${loggedIn ? '' : ' (log in)'}</button>
+           </form>`;
+    return `<div style="border:1px solid #e0e0e0;border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:8px;background:#fff">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+        <strong style="font-size:15px">${H(a.name)}</strong>
+        ${a.category ? `<span class="badge" style="background:#eef2ff;color:#3730a3">${H(a.category)}</span>` : ''}
+      </div>
+      <div style="font-size:18px;font-weight:700;color:#0F6E56">${payoutLabel(a)}</div>
+      ${a.description ? `<div style="font-size:13px;color:#444">${H(a.description)}</div>` : ''}
+      <div style="font-size:11px;color:#6e6e73">Countries: ${a.countries_allowed ? H(a.countries_allowed) : 'All'}</div>
+      <div style="margin-top:6px">${action}</div>
+    </div>`;
+  }).join('');
+
+  const body = `
+<main style="max-width:1000px;margin:0 auto;padding:24px 20px">
+  <h1 style="font-size:22px;margin-bottom:4px">Affiliate Marketplace</h1>
+  <p style="color:#6e6e73;font-size:13px;margin-bottom:20px">Browse available campaigns and apply to run them.${loggedIn ? '' : ' <a href="/publisher/login?next=%2Fmarketplace">Log in</a> to apply.'}</p>
+  ${flash ? `<div class="login-ok" style="margin-bottom:16px">${H(flash)}</div>` : ''}
+  ${campaigns.length === 0
+    ? '<div class="empty">No public campaigns available right now.</div>'
+    : `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px">${cards}</div>`}
+  <div style="margin-top:24px"><a href="${loggedIn ? '/publisher/dashboard' : '/publisher/login'}" class="btn btn-ghost">← ${loggedIn ? 'Dashboard' : 'Publisher login'}</a></div>
+</main>`;
+  return pubLayout('Marketplace', body);
+}
+
+function renderAdminMarketplace({ pending, csrfToken = '', flash }) {
+  const rows = pending.map(p => `<tr>
+    <td>${H((p.applied_at||'').slice(0,16))}</td>
+    <td><code>${H(p.username)}</code></td>
+    <td><strong>${H(p.adv_name)}</strong> <span style="color:#8e8e93;font-size:11px">${H(p.adv_slug)}</span></td>
+    <td><div class="act">
+      <form method="POST" action="/admin/marketplace/${H(p.id)}/approve" style="display:inline">${csrfField(csrfToken)}
+        <button class="btn btn-primary">Approve</button></form>
+      <form method="POST" action="/admin/marketplace/${H(p.id)}/reject" style="display:inline"
+            onsubmit="return confirm('Reject ${H(p.username)} → ${H(p.adv_name)}?')">${csrfField(csrfToken)}
+        <button class="btn btn-danger">Reject</button></form>
+    </div></td>
+  </tr>`).join('');
+
+  const body = `${adminHeader('<a href="/admin/publishers" class="hbtn ghost">← Publishers</a>')}
+<main>
+  <section>
+    <div class="sh"><h2>Marketplace Applications</h2><span class="meta">${pending.length} pending</span></div>
+    ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
+    ${pending.length === 0
+      ? '<div class="empty">No pending applications.</div>'
+      : `<table><thead><tr><th>Applied</th><th>Publisher</th><th>Campaign</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`}
+  </section>
+</main>`;
+  return adminLayout('Marketplace Applications', body);
+}
+
+function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
+  assignments = [], allAdvertisers = [], resetLink = null }) {
   const isEdit = action.includes('/update');
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(pub.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
   ).join('');
+
+  const assignedIds = new Set(assignments.map(a => a.advertiser_id));
+  const unassigned  = allAdvertisers.filter(a => !assignedIds.has(a.id));
+
+  const assignmentSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Advertiser Assignments</h2>
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">This publisher only sees assigned advertisers, and postbacks are only accepted for these pairs. Optional: override the payout (otherwise the goal/advertiser default applies), restrict to a date window, or cap conversions per calendar month — postbacks outside the window or over the cap are rejected.</p>
+    ${assignments.length === 0 ? '<div class="empty" style="margin-bottom:14px">No advertisers assigned yet.</div>' : `
+    <table style="margin-bottom:16px"><thead><tr>
+      <th>Advertiser</th><th>Payout Override</th><th>Valid From</th><th>Valid Until</th><th>Monthly Cap</th><th></th>
+    </tr></thead><tbody>
+    ${assignments.map(a => `<tr>
+      <td><strong>${H(a.name)}</strong> <span style="color:#8e8e93;font-size:11px">${H(a.slug)}</span></td>
+      <td>${a.payout_override != null ? '$'+$(a.payout_override) : '<span style="color:#8e8e93">default</span>'}</td>
+      <td>${H(a.valid_from || '—')}</td>
+      <td>${H(a.valid_until || '—')}</td>
+      <td>${a.monthly_cap != null ? N(a.monthly_cap) : '—'}</td>
+      <td><form method="POST" action="/admin/publishers/${H(pub.id)}/unassign" style="display:inline"
+            onsubmit="return confirm('Unassign ${H(a.name)} from ${H(pub.username)}?')">${csrfField(csrfToken)}
+            <input type="hidden" name="advertiser_id" value="${H(a.advertiser_id)}">
+            <button class="btn btn-danger">Unassign</button></form></td>
+    </tr>`).join('')}
+    </tbody></table>`}
+    ${unassigned.length === 0 ? '<p style="font-size:12px;color:#8e8e93">All advertisers are assigned.</p>' : `
+    <form method="POST" action="/admin/publishers/${H(pub.id)}/assign"
+          style="display:grid;grid-template-columns:1.5fr 1fr 1fr 1fr 1fr auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px">${csrfField(csrfToken)}
+      <div class="fg" style="margin:0"><label>Advertiser</label>
+        <select name="advertiser_id" required>${unassigned.map(a => `<option value="${H(a.id)}">${H(a.name)}</option>`).join('')}</select></div>
+      <div class="fg" style="margin:0"><label>Payout Override ($)</label>
+        <input type="number" name="payout_override" step="0.01" min="0" placeholder="default"></div>
+      <div class="fg" style="margin:0"><label>Valid From</label><input type="date" name="valid_from"></div>
+      <div class="fg" style="margin:0"><label>Valid Until</label><input type="date" name="valid_until"></div>
+      <div class="fg" style="margin:0"><label>Monthly Cap</label><input type="number" name="monthly_cap" min="0" placeholder="none"></div>
+      <button type="submit" class="btn btn-primary">Assign</button>
+    </form>`}
+  </div>`;
+
+  const resetSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Password Reset</h2>
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Set a new password using the field above, or generate a 24-hour self-service reset link to share with the publisher (useful when email isn't configured).</p>
+    ${resetLink ? `<div style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:12px 14px;margin-bottom:12px">
+      <div style="font-size:12px;font-weight:600;margin-bottom:6px">Active reset link — expires ${H(resetLink.expires)} UTC:</div>
+      <div class="ubox" onclick="cp(this,'${H(resetLink.url)}')" style="font-size:11px;word-break:break-all">${H(resetLink.url)}</div>
+    </div>` : ''}
+    <form method="POST" action="/admin/publishers/${H(pub.id)}/reset-link" style="display:inline">${csrfField(csrfToken)}
+      <button class="btn btn-ghost">Generate reset link</button>
+    </form>
+  </div>`;
 
   const body = `${adminHeader('<a href="/admin/publishers" class="hbtn ghost">← Publishers</a>')}
 <main><div class="fw">
   <h2>${H(title)}</h2>
   ${flash   ? `<div class="flash success">${H(flash.text)}</div>` : ''}
   ${error   ? `<div class="form-err">${H(error)}</div>` : ''}
-  <form method="POST" action="${H(action)}">
+  <form method="POST" action="${H(action)}">${csrfField(csrfToken)}
     ${isEdit
       ? `<div class="fg"><label>Username</label>
           <input type="text" value="${H(pub.username||'')}" disabled style="background:#f5f5f7;color:#6e6e73">
@@ -2986,16 +4302,16 @@ function renderPubForm({ title, action, pub = {}, error, flash }) {
           </div>
           <div style="display:flex;gap:8px">
             <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline"
-                  onsubmit="return confirm('Regenerate API key? The current key stops working immediately.')">
+                  onsubmit="return confirm('Regenerate API key? The current key stops working immediately.')">${csrfField(csrfToken)}
               <button class="btn btn-warn">↻ Regenerate Key</button>
             </form>
             <form method="POST" action="/admin/publishers/${H(pub.id)}/revoke-key" style="display:inline"
-                  onsubmit="return confirm('Revoke this API key? The publisher will lose API access until a new key is generated.')">
+                  onsubmit="return confirm('Revoke this API key? The publisher will lose API access until a new key is generated.')">${csrfField(csrfToken)}
               <button class="btn btn-danger">Revoke Key</button>
             </form>
           </div>`
         : `<div style="color:#c62828;font-size:13px;margin-bottom:8px">API key is revoked — publisher cannot use key auth.</div>
-           <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline">
+           <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline">${csrfField(csrfToken)}
              <button class="btn btn-primary">Generate New Key</button>
            </form>`}
       <small style="display:block;margin-top:8px">Key is masked by default. The publisher sees their key in their portal. Use <code>X-API-Key: kom_live_...</code> header for REST API access.</small>
@@ -3014,9 +4330,12 @@ function renderPubForm({ title, action, pub = {}, error, flash }) {
     <div class="form-act">
       <button type="submit" class="btn btn-primary btn-lg">${isEdit?'Save Changes':'Create Publisher'}</button>
       ${isEdit ? `<a href="/admin/publishers/${H(pub.id)}/payments" class="btn btn-ghost btn-lg">Payment History</a>` : ''}
+      ${isEdit ? `<a href="/admin/publishers/${H(pub.id)}/smart-links" class="btn btn-ghost btn-lg">Smart Links</a>` : ''}
       <a href="/admin/publishers" class="btn btn-ghost btn-lg">Cancel</a>
     </div>
   </form>
+  ${assignmentSection}
+  ${resetSection}
 </div></main>
 <script>
 ${CP_JS}
@@ -3160,7 +4479,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
         Use a Gmail App Password — generate one at
         <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color:#0071e3">myaccount.google.com/apppasswords</a>.
       </div>` : ''}
-      <form method="POST" action="/admin/settings/test-email" style="display:inline">
+      <form method="POST" action="/admin/settings/test-email" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-ghost" ${!gmailOk ? 'disabled' : ''}>Send Test Email</button>
       </form>
     </div>
@@ -3177,7 +4496,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
         Set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code> environment variables.<br>
         Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color:#0071e3">@BotFather</a>, then add it to your channel and get the chat ID.
       </div>` : ''}
-      <form method="POST" action="/admin/settings/test-telegram" style="display:inline">
+      <form method="POST" action="/admin/settings/test-telegram" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-ghost" ${!tgOk ? 'disabled' : ''}>Send Test Message</button>
       </form>
     </div>
@@ -3194,7 +4513,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
         Set <code>SLACK_WEBHOOK_URL</code> environment variable.<br>
         Create an Incoming Webhook at your Slack workspace app settings.
       </div>` : ''}
-      <form method="POST" action="/admin/settings/test-slack" style="display:inline">
+      <form method="POST" action="/admin/settings/test-slack" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-ghost" ${!slOk ? 'disabled' : ''}>Send Test Message</button>
       </form>
     </div>
@@ -3203,7 +4522,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
   <section>
     <div class="sh"><h2>Notification Preferences</h2></div>
     <div style="padding:0 20px">
-      <form method="POST" action="/admin/settings" id="settings-form">
+      <form method="POST" action="/admin/settings" id="settings-form">${csrfField(csrfToken)}
         ${toggle('email_notifications', emailOn,
           'Per-conversion email',
           `Send an email to ${ADMIN_EMAIL} whenever a new conversion is recorded`)}
@@ -3257,7 +4576,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
   return adminLayout('Settings', body);
 }
 
-function renderReconcilePage({ adv, runs, runResult }) {
+function renderReconcilePage({ adv, runs, runResult, csrfToken = '' }) {
   const resultHtml = runResult ? (() => {
     const { run, unmatched, rejected } = runResult;
     const matchRate = run.total_rows > 0 ? Math.round((run.matched / run.total_rows) * 100) : 0;
@@ -3321,12 +4640,13 @@ ${resultHtml}
   <div style="padding:20px 24px">
     <div style="background:#f5f5f7;border-radius:8px;padding:14px 16px;margin-bottom:20px;font-size:12px;line-height:1.6">
       <strong>Expected CSV format:</strong><br>
-      <code>click_id,status,reason,payout</code><br>
-      <code>abc-123-def,approved,,15.00</code><br>
-      <code>xyz-456-ghi,rejected,Duplicate application,</code><br><br>
-      <strong>Columns:</strong> <code>click_id</code> (required) · <code>status</code>: <code>approved</code> or <code>rejected</code> (required) · <code>reason</code> (optional) · <code>payout</code> override (optional)
+      <code>click_id,transaction_id,status,reason,payout</code><br>
+      <code>abc-123-def,,approved,,15.00</code><br>
+      <code>,TXN-789,approved,,20.00</code><br>
+      <code>xyz-456-ghi,,rejected,Duplicate application,</code><br><br>
+      <strong>Columns:</strong> <code>click_id</code> OR <code>transaction_id</code> (at least one required — matched by click_id first, then transaction_id) · <code>status</code>: <code>approved</code> or <code>rejected</code> (required) · <code>reason</code> (optional) · <code>payout</code> override (optional)
     </div>
-    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/reconcile" enctype="multipart/form-data">
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/reconcile" enctype="multipart/form-data">${csrfField(csrfToken)}
       <div class="fg" style="max-width:440px">
         <label>CSV File *</label>
         <input type="file" name="csv_file" accept=".csv,.txt" required
@@ -3415,6 +4735,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     conversions: ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2 4h12M2 8h8M2 12h10"/>`),
     payments:    ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M1 4.5h14a.5.5 0 0 1 .5.5v7a.5.5 0 0 1-.5.5H1a.5.5 0 0 1-.5-.5V5a.5.5 0 0 1 .5-.5z"/><path stroke="currentColor" stroke-width="1.4" d="M.5 7.5h15"/>`),
     api:         ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M5 5L2 8l3 3M11 5l3 3-3 3M8 3v10"/>`),
+    profile:     ic(`<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 14c0-2.8 2.5-4.5 5.5-4.5s5.5 1.7 5.5 4.5"/>`),
     docs:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3.5 1h9a.5.5 0 0 1 .5.5v13a.5.5 0 0 1-.5.5h-9A.5.5 0 0 1 3 14.5v-13A.5.5 0 0 1 3.5 1z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 5h5M5.5 8h5M5.5 11h3"/>`),
   };
   const navItem = (href, key, label, external = false) =>
@@ -3446,6 +4767,9 @@ function pubLayout(title, body, pub = null, activeTab = null) {
       ${navItem('/publisher/dashboard',   'dashboard',   'Dashboard')}
       ${navItem('/publisher/conversions', 'conversions', 'Conversions')}
       ${navItem('/publisher/payments',    'payments',    'Payments')}
+      ${navItem('/marketplace',           'marketplace', 'Browse Offers')}
+      <div class="pub-sb-group">ACCOUNT</div>
+      ${navItem('/publisher/profile',     'profile',     'Profile')}
       <div class="pub-sb-group">DEVELOPER</div>
       ${navItem('/publisher/api-access',  'api',         'API Access')}
       ${navItem('/docs',                  'docs',        'Docs', true)}
@@ -3521,7 +4845,7 @@ function renderPubRegister({ error = null, values = {} } = {}) {
 </div>`);
 }
 
-function renderPubLogin({ error, username, success } = {}) {
+function renderPubLogin({ error, username, success, next } = {}) {
   const sunSvg = `<svg width="18" height="18" viewBox="0 0 16 16" fill="#00e5c3"><circle cx="8" cy="8" r="3.5"/><path stroke="#00e5c3" stroke-width="1.3" stroke-linecap="round" d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.2 3.2l1 1M11.8 11.8l1 1M12.8 3.2l-1 1M4.2 11.8l-1 1"/></svg>`;
   return pubLayout('Login', `
 <div class="login-page">
@@ -3532,23 +4856,78 @@ function renderPubLogin({ error, username, success } = {}) {
     ${success ? `<div class="login-ok">${H(success)}</div>` : ''}
     ${error   ? `<div class="login-err">${H(error)}</div>`   : ''}
     <form method="POST" action="/publisher/login">
+      ${next ? `<input type="hidden" name="next" value="${H(next)}">` : ''}
       <div class="login-fg"><label>Username</label>
         <input type="text" name="username" value="${H(username||'')}" required autofocus autocomplete="username"></div>
       <div class="login-fg"><label>Password</label>
         <input type="password" name="password" required autocomplete="current-password"></div>
       <button type="submit" class="login-btn">Sign in</button>
     </form>
+    <div class="login-link"><a href="/publisher/forgot-password">Forgot password?</a></div>
     <div class="login-link">Don't have an account? <a href="/publisher/register">Apply to join →</a></div>
   </div>
 </div>`);
 }
 
+function renderForgotPassword({ error, success } = {}) {
+  return pubLayout('Forgot Password', `
+<div class="login-page">
+  <div class="login-card">
+    <div class="login-title">Reset your password</div>
+    <div class="login-sub">Enter your account email and we'll send a reset link.</div>
+    ${success ? `<div class="login-ok">${H(success)}</div>` : ''}
+    ${error   ? `<div class="login-err">${H(error)}</div>`   : ''}
+    ${success ? '' : `<form method="POST" action="/publisher/forgot-password">
+      <div class="login-fg"><label>Email</label>
+        <input type="email" name="email" required autofocus autocomplete="email"></div>
+      <button type="submit" class="login-btn">Send reset link</button>
+    </form>`}
+    <div class="login-link"><a href="/publisher/login">← Back to login</a></div>
+  </div>
+</div>`);
+}
+
+function renderResetPassword({ token, error, invalid } = {}) {
+  if (invalid) {
+    return pubLayout('Reset Password', `
+<div class="login-page">
+  <div class="login-card">
+    <div class="login-title">Link expired</div>
+    <div class="login-err">This password reset link is invalid or has expired. Reset links are valid for 24 hours.</div>
+    <div class="login-link"><a href="/publisher/forgot-password">Request a new link →</a></div>
+  </div>
+</div>`);
+  }
+  return pubLayout('Reset Password', `
+<div class="login-page">
+  <div class="login-card">
+    <div class="login-title">Choose a new password</div>
+    ${error ? `<div class="login-err">${H(error)}</div>` : ''}
+    <form method="POST" action="/publisher/reset-password" autocomplete="off">
+      <input type="hidden" name="token" value="${H(token)}">
+      <div class="login-fg"><label>New Password</label>
+        <input type="password" name="new_password" required minlength="8" autofocus autocomplete="new-password"></div>
+      <div class="login-fg"><label>Confirm New Password</label>
+        <input type="password" name="confirm_password" required minlength="8" autocomplete="new-password"></div>
+      <button type="submit" class="login-btn">Update password</button>
+    </form>
+    <div class="login-link"><a href="/publisher/login">← Back to login</a></div>
+  </div>
+</div>`);
+}
+
 function renderPubConversions({ pub, conversions }) {
+  // F17 — show loan_amount / revenue columns only when at least one row has them.
+  const showLoan    = conversions.some(c => c.loan_amount != null);
+  const showRevenue = conversions.some(c => c.revenue != null);
+  const fmtNum = v => v != null ? Number(v).toLocaleString('en-US') : '—';
   const rows = conversions.map(r => `<tr>
     <td style="white-space:nowrap;font-size:11px">${H(r.received_at.slice(0,10))}</td>
     <td>${H(r.adv_name||r.advertiser_slug)}</td>
     <td><code class="xs">${H(r.click_id)}</code></td>
     <td><span class="badge">${H(r.event)}</span></td>
+    ${showLoan    ? `<td>${fmtNum(r.loan_amount)}</td>` : ''}
+    ${showRevenue ? `<td>${fmtNum(r.revenue)}</td>` : ''}
     <td>${usdVnd(r.payout)}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
         ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
@@ -3559,7 +4938,7 @@ function renderPubConversions({ pub, conversions }) {
   <div class="sh"><h2>Conversion History</h2><span class="meta">${N(conversions.length)} conversions (last 500)</span></div>
   ${rows.length===0
     ? '<div class="empty">No conversions recorded yet.</div>'
-    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th><th>Payout</th><th>Status</th></tr></thead>
+    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th>${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Status</th></tr></thead>
         <tbody>${rows}</tbody></table>`}
 </section>
 </main>`;
@@ -3576,7 +4955,15 @@ function renderPubPayments({ pub, payments, totalPaid, approvedBal }) {
     <td style="font-size:11px;color:#6e6e73">${H(p.notes)}</td>
   </tr>`).join('');
 
+  // F17 — payment timeline: payouts are processed on the first of each month.
+  const now = new Date();
+  const nextPay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+  const nextPayStr = nextPay.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric', timeZone: 'UTC' });
+
   const body = `<main>
+<div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:10px;padding:12px 18px;margin-bottom:20px;font-size:13px;color:#3730a3">
+  📅 <strong>Expected next payment:</strong> ${nextPayStr} (first day of next month).
+</div>
 <div class="cards" style="margin-bottom:20px">
   <div class="card"><div class="lbl">Total Paid Out</div><div class="val blue">$${$(totalPaid)}</div></div>
   <div class="card"><div class="lbl">Approved Earnings</div><div class="val green">$${$(approvedBal)}</div></div>
@@ -3640,9 +5027,68 @@ document.addEventListener('DOMContentLoaded',function(){
   return pubLayout(`${pub.username} — API Access`, body, pub, 'api');
 }
 
+function renderPubProfile({ pub, csrfToken = '', flash, error }) {
+  const body = `
+<main>
+<section style="margin-bottom:20px">
+  <div class="sh"><h2>Account</h2></div>
+  <div style="padding:18px 22px;font-size:13px;color:#333">
+    <div style="margin-bottom:8px"><strong>Username:</strong> ${H(pub.username)}</div>
+    <div style="margin-bottom:8px"><strong>Email:</strong> ${H(pub.email || '—')}</div>
+    <div style="margin-bottom:8px"><strong>Company:</strong> ${H(pub.company || '—')}</div>
+    <div><strong>Member since:</strong> ${H((pub.created_at || '').slice(0,10) || '—')}</div>
+  </div>
+</section>
+<section>
+  <div class="sh"><h2>Change Password</h2></div>
+  <div style="padding:18px 22px;max-width:420px">
+    ${flash  ? `<div class="login-ok"  style="margin-bottom:14px">${H(flash)}</div>`  : ''}
+    ${error  ? `<div class="login-err" style="margin-bottom:14px">${H(error)}</div>` : ''}
+    <form method="POST" action="/publisher/change-password" autocomplete="off">${csrfField(csrfToken)}
+      <div class="fg" style="margin-bottom:12px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">Current Password</label>
+        <input type="password" name="current_password" required autocomplete="current-password"
+               style="width:100%;padding:9px 11px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+      </div>
+      <div class="fg" style="margin-bottom:12px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">New Password</label>
+        <input type="password" name="new_password" required minlength="8" autocomplete="new-password"
+               style="width:100%;padding:9px 11px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+        <small style="color:#6e6e73">At least 8 characters.</small>
+      </div>
+      <div class="fg" style="margin-bottom:16px">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:4px">Confirm New Password</label>
+        <input type="password" name="confirm_password" required minlength="8" autocomplete="new-password"
+               style="width:100%;padding:9px 11px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+      </div>
+      <button type="submit" class="btn btn-primary">Update Password</button>
+    </form>
+  </div>
+</section>
+</main>`;
+  return pubLayout(`${pub.username} — Profile`, body, pub, 'profile');
+}
+
 function renderPubDashboard({ pub, totalClicks, totalConversions,
   totalPayout, pendingPayout, monthlyPayout, monthlyPendingPayout,
-  advStats, recent, thisMonth, payments = [], totalPaid = 0 }) {
+  advStats, recent, thisMonth, payments = [], totalPaid = 0, subStats = [] }) {
+
+  // F17 — "Last updated" caption shown under each stats card (server time, no polling).
+  const updatedNote = `<div style="font-size:9px;color:#9ca3af;margin-top:5px">Updated ${H(new Date().toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }))}</div>`;
+
+  // F7 — Sub ID (sub1) performance breakdown
+  const subSection = subStats.length === 0 ? '' : `
+<section>
+  <div class="sh"><h2>Sub ID Breakdown</h2><span class="meta">By sub1 · top ${subStats.length}</span></div>
+  <table><thead><tr><th>Sub1</th><th>Clicks</th><th>Conversions</th><th>Payout</th><th>CVR</th></tr></thead>
+    <tbody>${subStats.map(s => `<tr>
+      <td><code class="xs">${H(s.sub1)}</code></td>
+      <td>${N(s.clicks)}</td>
+      <td>${N(s.conversions)}</td>
+      <td>${usdVnd(s.payout)}</td>
+      <td>${cvr(s.clicks, s.conversions)}</td>
+    </tr>`).join('')}</tbody></table>
+</section>`;
 
   const minPay  = pub.minimum_payout ?? 50;
   const balance = totalPayout - totalPaid;   // approved earnings minus paid out
@@ -3704,15 +5150,24 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
     <td>${cvr(a.clicks, a.conversions)}</td>
   </tr>`).join('');
 
-  const recentRows = recent.map(r => `<tr>
+  // F17 — for percentage-based (loan) conversions, show the payout calculation.
+  const fmtNum = v => Number(v).toLocaleString('en-US');
+  const recentRows = recent.map(r => {
+    const showCalc = r.loan_amount != null && r.loan_amount > 0 && r.payout > 0;
+    const pct = showCalc ? +(r.payout / r.loan_amount * 100).toFixed(4) : null;
+    const calc = showCalc
+      ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${fmtNum(r.loan_amount)} VND × ${pct}% = ${fmtNum(r.payout)} VND</div>`
+      : '';
+    return `<tr>
     <td>${H(r.received_at)}</td>
     <td>${H(r.adv_name||r.advertiser_slug)}</td>
     <td><code class="xs">${H(r.click_id)}</code></td>
     <td><span class="badge">${H(r.event)}</span></td>
-    <td>${usdVnd(r.payout)}</td>
+    <td>${usdVnd(r.payout)}${calc}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
         ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
 
   const paymentRows = payments.map(p => `<tr>
     <td>${H(p.paid_at)}</td>
@@ -3726,12 +5181,12 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
 ${checklist}
 
 <div class="cards">
-  <div class="card"><div class="lbl">Total Clicks</div><div class="val">${N(totalClicks)}</div></div>
-  <div class="card"><div class="lbl">Total Conversions</div><div class="val">${N(totalConversions)}</div></div>
-  <div class="card"><div class="lbl">Approved Earnings</div><div class="val blue">${usdVnd(totalPayout)}</div></div>
-  <div class="card"><div class="lbl">Pending Earnings</div><div class="val" style="color:#f57f17">${usdVnd(pendingPayout)}</div></div>
-  <div class="card"><div class="lbl">This Month Approved</div><div class="val blue">${usdVnd(monthlyPayout)}</div></div>
-  <div class="card"><div class="lbl">This Month Pending</div><div class="val" style="color:#f57f17">${usdVnd(monthlyPendingPayout)}</div></div>
+  <div class="card"><div class="lbl">Total Clicks</div><div class="val">${N(totalClicks)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">Total Conversions</div><div class="val">${N(totalConversions)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">Approved Earnings</div><div class="val blue">${usdVnd(totalPayout)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">Pending Earnings</div><div class="val" style="color:#f57f17">${usdVnd(pendingPayout)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">This Month Approved</div><div class="val blue">${usdVnd(monthlyPayout)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">This Month Pending</div><div class="val" style="color:#f57f17">${usdVnd(monthlyPendingPayout)}</div>${updatedNote}</div>
 </div>
 
 ${payoutBanner}
@@ -3743,6 +5198,8 @@ ${payoutBanner}
     : `<table><thead><tr><th>Advertiser</th><th>Your Tracking URL</th><th>Clicks</th><th>Conversions</th><th>Earnings</th><th>CVR</th></tr></thead>
         <tbody>${advRows}</tbody></table>`}
 </section>
+
+${subSection}
 
 <section>
   <div class="sh">
@@ -4409,6 +5866,16 @@ function renderDocs() {
       <div class="code-label">Adjust postback URL</div>
       <div class="code-block"><pre>${TRACK_DOMAIN}/postback/<span class="key">{advertiser}</span>?click_id=<span class="str">{click_id}</span>&amp;payout=<span class="str">{revenue}</span>&amp;event=<span class="str">{event_token}</span></pre></div>
 
+      <h3 class="sub-title" id="signed-postbacks">Signed Postbacks (HMAC, optional)</h3>
+      <p>An advertiser may be issued a <strong>postback secret</strong>. When a secret is configured, every postback for that advertiser must include a <code>sig</code> parameter or it is rejected with <code>403</code>. Advertisers without a secret accept unsigned postbacks (backward compatible).</p>
+      <p>The signature is a lowercase hex <strong>HMAC-SHA256</strong> of the concatenation <code>click_id + event + payout</code>, keyed by the shared secret:</p>
+      <div class="code-block"><pre>sig = HMAC_SHA256(secret, click_id + event + payout)   <span class="str"># hex digest</span></pre></div>
+      <div class="callout warn">
+        <strong>Base string:</strong> the three values are concatenated with no separator, in order. <code>event</code> defaults to <code>sale</code> and <code>payout</code> to an empty string when omitted — so always send explicit <code>event</code> and <code>payout</code> values when signing.
+      </div>
+      <div class="code-label">Signed postback URL</div>
+      <div class="code-block"><pre>${TRACK_DOMAIN}/postback/<span class="key">{advertiser}</span>?click_id=<span class="str">{click_id}</span>&amp;event=<span class="str">{event}</span>&amp;payout=<span class="str">{payout}</span>&amp;sig=<span class="str">{hmac_sha256_hex}</span></pre></div>
+
       <h3 class="sub-title" id="macros">Supported Macros</h3>
       <table>
         <thead><tr><th>Macro</th><th>Description</th><th>Notes</th></tr></thead>
@@ -4595,4 +6062,14 @@ app.listen(PORT, () => {
 
   sendTelegram('🔄 Komorebi tracker restarted — track.komorebimedia.com is up.')
     .catch(e => console.error('Startup Telegram error:', e.message));
+
+  // F19(D) — alert if critical secrets are unset or still at insecure defaults.
+  const weak = [];
+  if (!process.env.SESSION_SECRET) weak.push('SESSION_SECRET (unset — using insecure default)');
+  if (!process.env.ADMIN_PASS)     weak.push('ADMIN_PASS (unset)');
+  if (weak.length) {
+    const msg = `⚠️ Komorebi security warning — insecure config: ${weak.join('; ')}.`;
+    console.warn(msg);
+    sendTelegram(msg).catch(() => {});
+  }
 });

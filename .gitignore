@@ -1,6 +1,20 @@
-node_modules/
+# Database (SQLite + WAL/SHM sidecars) — never commit live data
+affiliate.db
+affiliate.db-wal
+affiliate.db-shm
 *.db
-*.db-shm
 *.db-wal
+*.db-shm
+
+# Logs
 *.log
+postback.log
+
+# Dependencies
+node_modules/
+
+# Secrets / local config
 .env
+
+# Scratch
+/tmp

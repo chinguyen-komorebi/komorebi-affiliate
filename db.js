@@ -19,10 +19,56 @@ db.exec(`
     name          TEXT NOT NULL,
     offer_url     TEXT NOT NULL DEFAULT '',
     payout_amount REAL NOT NULL DEFAULT 0,
+    payout_type   TEXT NOT NULL DEFAULT 'fixed',
+    click_lookback_window INTEGER NOT NULL DEFAULT 30,
+    monthly_conversion_cap INTEGER,
+    cap_reset_month TEXT,
+    cap_reset_at    TEXT,
+    cap_alert_month TEXT,
+    cap_alerted_80  INTEGER NOT NULL DEFAULT 0,
+    cap_alerted_100 INTEGER NOT NULL DEFAULT 0,
+    is_public        INTEGER NOT NULL DEFAULT 0,
+    category         TEXT,
+    description      TEXT,
+    countries_allowed TEXT,
+    postback_secret  TEXT,
+    mmp_type      TEXT NOT NULL DEFAULT 'none',
+    mmp_app_id    TEXT,
+    mmp_api_token TEXT,
     status        TEXT NOT NULL DEFAULT 'active',
     created_at    TEXT DEFAULT (datetime('now'))
   );
 `);
+
+// Migration: payout_type · click_lookback_window · advertiser-level conversion cap (F12)
+const advCols = db.prepare('PRAGMA table_info(advertisers)').all().map(c => c.name);
+if (!advCols.includes('payout_type')) {
+  db.exec("ALTER TABLE advertisers ADD COLUMN payout_type TEXT NOT NULL DEFAULT 'fixed'");
+}
+if (!advCols.includes('click_lookback_window')) {
+  db.exec('ALTER TABLE advertisers ADD COLUMN click_lookback_window INTEGER NOT NULL DEFAULT 30');
+}
+// F12 advertiser-level conversion cap:
+//   monthly_conversion_cap — hard ceiling on approved conversions per UTC month (null = unlimited)
+//   cap_reset_month — admin-set YYYY-MM marker; cap_reset_at — internal count-floor timestamp
+//   cap_alert_month / cap_alerted_80 / cap_alerted_100 — Telegram alert throttle state
+if (!advCols.includes('monthly_conversion_cap')) db.exec('ALTER TABLE advertisers ADD COLUMN monthly_conversion_cap INTEGER');
+if (!advCols.includes('cap_reset_month'))        db.exec('ALTER TABLE advertisers ADD COLUMN cap_reset_month TEXT');
+if (!advCols.includes('cap_reset_at'))           db.exec('ALTER TABLE advertisers ADD COLUMN cap_reset_at TEXT');
+if (!advCols.includes('cap_alert_month'))        db.exec('ALTER TABLE advertisers ADD COLUMN cap_alert_month TEXT');
+if (!advCols.includes('cap_alerted_80'))         db.exec('ALTER TABLE advertisers ADD COLUMN cap_alerted_80 INTEGER NOT NULL DEFAULT 0');
+if (!advCols.includes('cap_alerted_100'))        db.exec('ALTER TABLE advertisers ADD COLUMN cap_alerted_100 INTEGER NOT NULL DEFAULT 0');
+// F6 marketplace fields
+if (!advCols.includes('is_public'))         db.exec('ALTER TABLE advertisers ADD COLUMN is_public INTEGER NOT NULL DEFAULT 0');
+if (!advCols.includes('category'))          db.exec('ALTER TABLE advertisers ADD COLUMN category TEXT');
+if (!advCols.includes('description'))       db.exec('ALTER TABLE advertisers ADD COLUMN description TEXT');
+if (!advCols.includes('countries_allowed')) db.exec('ALTER TABLE advertisers ADD COLUMN countries_allowed TEXT');
+// F18 HMAC postback signature secret (optional/per-advertiser, backward-compatible)
+if (!advCols.includes('postback_secret'))   db.exec('ALTER TABLE advertisers ADD COLUMN postback_secret TEXT');
+// F20 MMP integration (AppsFlyer) — mmp_api_token stored AES-256-GCM-encrypted when MMP_ENCRYPTION_KEY is set
+if (!advCols.includes('mmp_type'))      db.exec("ALTER TABLE advertisers ADD COLUMN mmp_type TEXT NOT NULL DEFAULT 'none'");
+if (!advCols.includes('mmp_app_id'))    db.exec('ALTER TABLE advertisers ADD COLUMN mmp_app_id TEXT');
+if (!advCols.includes('mmp_api_token')) db.exec('ALTER TABLE advertisers ADD COLUMN mmp_api_token TEXT');
 
 // ---------------------------------------------------------------------------
 // Clicks  (advertiser_slug added via migration for existing dbs)
@@ -48,6 +94,21 @@ if (!clickCols.includes('device_type')) db.exec('ALTER TABLE clicks ADD COLUMN d
 if (!clickCols.includes('os'))          db.exec('ALTER TABLE clicks ADD COLUMN os TEXT');
 if (!clickCols.includes('browser'))     db.exec('ALTER TABLE clicks ADD COLUMN browser TEXT');
 
+// Tracking-pipeline columns (all nullable TEXT), added via migration:
+//   F7 sub-parameters · F8 enhanced tracking · F10 AppsFlyer/Adjust (raw + mapped)
+const CLICK_EXTRA_COLS = [
+  'sub1', 'sub2', 'sub3', 'sub4', 'sub5', 'subpub',                          // F7
+  'gclid', 'fbclid', 'referrer',                                            // F8
+  'af_siteid', 'af_campaign', 'af_adset', 'af_ad',                          // F10 raw (AppsFlyer)
+  'adjust_network', 'adjust_campaign', 'adjust_adgroup', 'adjust_creative', // F10 raw (Adjust)
+  'campaign', 'adgroup', 'creative', 'network',                             // F10 mapped (internal)
+];
+const clickColsNow = db.prepare('PRAGMA table_info(clicks)').all().map(c => c.name);
+for (const col of CLICK_EXTRA_COLS) {
+  if (!clickColsNow.includes(col)) db.exec(`ALTER TABLE clicks ADD COLUMN ${col} TEXT`);
+}
+db.exec('CREATE INDEX IF NOT EXISTS idx_clicks_sub1 ON clicks(sub1)');
+
 // ---------------------------------------------------------------------------
 // Conversions  (advertiser_slug added via migration for existing dbs)
 // ---------------------------------------------------------------------------
@@ -59,6 +120,8 @@ db.exec(`
     publisher       TEXT NOT NULL,
     event           TEXT NOT NULL DEFAULT 'sale',
     payout          REAL NOT NULL DEFAULT 0,
+    loan_amount     REAL,
+    revenue         REAL,
     received_at     TEXT DEFAULT (datetime('now')),
     raw_params      TEXT
   );
@@ -80,6 +143,15 @@ if (!convCols2.includes('reason')) {
 if (!convCols2.includes('reconciliation_run_id')) {
   db.exec('ALTER TABLE conversions ADD COLUMN reconciliation_run_id INTEGER');
 }
+// Migration: loan_amount (basis for percentage payout) + revenue (advertiser pays Komorebi)
+if (!convCols2.includes('loan_amount')) db.exec('ALTER TABLE conversions ADD COLUMN loan_amount REAL');
+if (!convCols2.includes('revenue'))     db.exec('ALTER TABLE conversions ADD COLUMN revenue REAL');
+// Migration: transaction_id (F9) — advertiser's own conversion id, for reconciliation
+if (!convCols2.includes('transaction_id')) db.exec('ALTER TABLE conversions ADD COLUMN transaction_id TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_transaction ON conversions(transaction_id)');
+// Migration: user_id (F15) — advertiser's end-user id, for duplicate-user detection
+if (!convCols2.includes('user_id')) db.exec('ALTER TABLE conversions ADD COLUMN user_id TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_user ON conversions(advertiser_slug, user_id)');
 
 // ---------------------------------------------------------------------------
 // Reconciliation
@@ -283,10 +355,150 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_invoices_status    ON invoices(status);
 `);
 
+// ---------------------------------------------------------------------------
+// Conversion goals  (multiple payable events per advertiser)
+// A postback's `event` is matched against goals.event_token to pick the payout.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS goals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_id INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    event_token   TEXT NOT NULL,
+    payout        REAL NOT NULL DEFAULT 0,
+    payout_type   TEXT NOT NULL DEFAULT 'fixed',
+    description   TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'active',
+    created_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(advertiser_id, event_token)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_goals_advertiser ON goals(advertiser_id);
+  CREATE INDEX IF NOT EXISTS idx_goals_token      ON goals(advertiser_id, event_token);
+`);
+
+// Migration: add payout_type to goals for databases created before percentage payouts
+const goalCols = db.prepare('PRAGMA table_info(goals)').all().map(c => c.name);
+if (!goalCols.includes('payout_type')) {
+  db.exec("ALTER TABLE goals ADD COLUMN payout_type TEXT NOT NULL DEFAULT 'fixed'");
+}
+
+// ---------------------------------------------------------------------------
+// Publisher ↔ Advertiser assignments  (junction)
+// Gates portal visibility and postback acceptance. payout_override (when set)
+// takes precedence over goal/advertiser payout. valid_from/valid_until define an
+// inclusive UTC date window and monthly_cap limits APPROVED conversions per
+// UTC month — all enforced at postback time (see assignmentBlock in server.js).
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS publisher_advertisers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher_id    INTEGER NOT NULL REFERENCES publishers(id)  ON DELETE CASCADE,
+    advertiser_id   INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    assigned_at     TEXT DEFAULT (datetime('now')),
+    payout_override REAL,
+    valid_from      TEXT,
+    valid_until     TEXT,
+    monthly_cap     INTEGER,
+    UNIQUE(publisher_id, advertiser_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pa_publisher  ON publisher_advertisers(publisher_id);
+  CREATE INDEX IF NOT EXISTS idx_pa_advertiser ON publisher_advertisers(advertiser_id);
+`);
+
+// ---------------------------------------------------------------------------
+// Password reset tokens  (publisher self-service + admin-surfaced)
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS password_resets (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher_id INTEGER NOT NULL REFERENCES publishers(id) ON DELETE CASCADE,
+    token        TEXT UNIQUE NOT NULL,
+    expires_at   TEXT NOT NULL,
+    used_at      TEXT,
+    created_at   TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pwreset_token ON password_resets(token);
+  CREATE INDEX IF NOT EXISTS idx_pwreset_pub   ON password_resets(publisher_id);
+`);
+
+// ---------------------------------------------------------------------------
+// Smart-link routing rules (F5) — per-publisher geo/device → advertiser rules
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS smart_link_rules (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher_id  INTEGER NOT NULL REFERENCES publishers(id)  ON DELETE CASCADE,
+    advertiser_id INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    country       TEXT NOT NULL DEFAULT '*',
+    device_type   TEXT NOT NULL DEFAULT '*',
+    priority      INTEGER NOT NULL DEFAULT 100,
+    created_at    TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_slr_publisher ON smart_link_rules(publisher_id, priority);
+`);
+
+// ---------------------------------------------------------------------------
+// Marketplace applications (F6) — publisher requests to run a public campaign
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS marketplace_applications (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher_id  INTEGER NOT NULL REFERENCES publishers(id)  ON DELETE CASCADE,
+    advertiser_id INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    applied_at    TEXT DEFAULT (datetime('now')),
+    decided_at    TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_mktapp_status ON marketplace_applications(status);
+  CREATE INDEX IF NOT EXISTS idx_mktapp_pub    ON marketplace_applications(publisher_id);
+`);
+
+// ---------------------------------------------------------------------------
+// MMP sync log (F20) — one row per manual AppsFlyer sync run
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS mmp_sync_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL,
+    synced_at       TEXT DEFAULT (datetime('now')),
+    events_pulled   INTEGER NOT NULL DEFAULT 0,
+    matched         INTEGER NOT NULL DEFAULT 0,
+    auto_approved   INTEGER NOT NULL DEFAULT 0,
+    auto_rejected   INTEGER NOT NULL DEFAULT 0,
+    errors          TEXT,
+    status          TEXT NOT NULL DEFAULT 'success'
+  );
+  CREATE INDEX IF NOT EXISTS idx_mmp_sync_adv ON mmp_sync_log(advertiser_slug, synced_at);
+`);
+
 // Seed a legacy advertiser so pre-migration rows have a valid foreign key target
 db.prepare(`
   INSERT OR IGNORE INTO advertisers (slug, name, offer_url, status)
   VALUES ('legacy', 'Legacy (Pre-migration)', '', 'paused')
 `).run();
+
+// One-time backfill: create publisher↔advertiser assignments for every pair
+// that already has click or conversion history, so enabling assignment-gated
+// postbacks does not drop live traffic from existing publishers. Guarded by a
+// settings flag so it only runs once (admins can freely unassign afterwards).
+const backfilled = db.prepare("SELECT value FROM settings WHERE key = 'assignments_backfilled'").get()?.value;
+if (backfilled !== 'done') {
+  db.exec(`
+    INSERT OR IGNORE INTO publisher_advertisers (publisher_id, advertiser_id)
+    SELECT DISTINCT p.id, a.id
+    FROM (
+      SELECT publisher, advertiser_slug FROM clicks
+      UNION
+      SELECT publisher, advertiser_slug FROM conversions
+    ) hist
+    JOIN publishers  p ON p.username = hist.publisher
+    JOIN advertisers a ON a.slug     = hist.advertiser_slug
+    WHERE a.slug != 'legacy'
+  `);
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('assignments_backfilled', 'done')").run();
+}
 
 module.exports = db;
