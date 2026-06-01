@@ -52,21 +52,21 @@ function parseCSV(buf) {
 
 const app = express();
 app.set('trust proxy', 1);
+
+// I1 — per-request CSP nonce. Generated BEFORE helmet so the CSP header's
+// scriptSrc nonce-<base64> matches the nonce we stamp onto every inline <script>
+// (done centrally in the res.send wrapper below). 'unsafe-inline' is removed from
+// scriptSrc: all inline event-handler attributes have been refactored to delegated
+// addEventListener in BEHAVIORS_JS, so no inline handlers remain to allow.
+app.use((req, res, next) => { res.locals.cspNonce = crypto.randomBytes(16).toString('base64'); next(); });
+
 app.use(helmet({
   contentSecurityPolicy: {
-    // TODO (I1, dedicated pass): drop 'unsafe-inline' from scriptSrc by moving to
-    // per-request CSP nonces. NON-TRIVIAL: nonces cover <script> elements only, NOT
-    // inline event-handler attributes. Removing 'unsafe-inline' (or adding any nonce,
-    // which makes the browser ignore 'unsafe-inline') will break the ~33 inline
-    // onclick/onsubmit/oninput/onchange handlers in these templates. So the pass must
-    // ALSO refactor every inline handler to delegated addEventListener inside a
-    // nonce'd <script>, then verify in a real browser (e2e is HTTP-only and cannot
-    // detect CSP/handler breakage). styleSrc keeps 'unsafe-inline' for now (lower risk).
     directives: {
       defaultSrc: ["'self'"],
-      styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"], // styleSrc keeps 'unsafe-inline' (lower risk)
       fontSrc:    ["'self'", "https://fonts.gstatic.com"],
-      scriptSrc:  ["'self'", "'unsafe-inline'"],
+      scriptSrc:  ["'self'", (req, res) => `'nonce-${res.locals.cspNonce}'`],
       imgSrc:     ["'self'", "data:"],
     },
   },
@@ -75,6 +75,26 @@ app.use(helmet({
 }));
 // F19(G) — Permissions-Policy (opt out of FLoC/Topics)
 app.use((req, res, next) => { res.setHeader('Permissions-Policy', 'interest-cohort=()'); next(); });
+
+// I1 — CSP nonce plumbing for HTML responses. Centralized here (rather than threaded
+// through ~30 template functions): for any full HTML page we (1) stamp the per-request
+// nonce onto every inline <script> so it matches the CSP header, and (2) inject the
+// global delegated-behaviors script (BEHAVIORS_JS) that replaces all former inline
+// on* event handlers. styleSrc still allows 'unsafe-inline', so inline style="" is fine.
+app.use((req, res, next) => {
+  const send = res.send.bind(res);
+  res.send = (body) => {
+    if (typeof body === 'string' && body.includes('</body>')) {
+      const n = res.locals.cspNonce;
+      body = body
+        .replace(/<script>/g, `<script nonce="${n}">`)
+        .replace('</body>', `<script nonce="${n}">${BEHAVIORS_JS}</script></body>`);
+    }
+    return send(body);
+  };
+  next();
+});
+
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
 // F19(F) — input hardening on POST bodies: strip null bytes, reject oversized fields.
@@ -388,13 +408,13 @@ function recordLoginSuccess(ip, map) {
 // Postback logger → postback.log  (NDJSON)
 // ---------------------------------------------------------------------------
 
-// NOTE: postback.log grows unbounded and contains raw request params (potential
-// PII such as user_id). Rotate it externally (e.g. logrotate: daily, rotate 14,
-// compress) and restrict file permissions. The DB conversions.raw_params column
-// is PII-masked (see logAudit/maskPII); this append-only debug log is not.
-const logStream = fs.createWriteStream(path.join(__dirname, 'postback.log'), { flags: 'a' });
+// NOTE: this append-only NDJSON debug log can grow unbounded, so rotate it
+// externally (see ops/komorebi-postback.logrotate: daily, rotate 14, compress).
+// Params are PII-masked (maskPII, same as the DB conversions.raw_params column)
+// and the file is created mode 0600 so only the process owner can read it.
+const logStream = fs.createWriteStream(path.join(__dirname, 'postback.log'), { flags: 'a', mode: 0o600 });
 function logPostback(req, result) {
-  logStream.write(JSON.stringify({ ts: new Date().toISOString(), ip: req.ip, params: req.query, result }) + '\n');
+  logStream.write(JSON.stringify({ ts: new Date().toISOString(), ip: req.ip, params: maskPII(req.query), result }) + '\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -3317,6 +3337,63 @@ document.addEventListener('submit', function(e){
   setTimeout(function(){ btn.classList.add('loading'); btn.disabled = true; }, 0);
 });`;
 
+// I1 — global delegated UI behaviors. Replaces every inline on* handler with
+// data-* attributes + delegated listeners, so 'unsafe-inline' can be dropped from
+// the script CSP. Injected on every HTML page by the res.send wrapper above.
+//   data-copy="text"            → click copies text to clipboard
+//   data-copy-from="elementId"  → click copies that element's value/text
+//   data-print                  → click triggers window.print()
+//   data-toggle-visibility="id" → click toggles that input's password/text type
+//   data-confirm="message"      → form submit asks confirm() first (cancel = block)
+//   data-invoice-jump="pubId"   → form submit redirects to the invoice for its period
+//   data-autosubmit             → checkbox change submits its form
+//   data-autoslug               → input fills #slug with a slugified value
+//   data-slugify                → input lowercases/strips itself to [a-z0-9_-]
+const BEHAVIORS_JS = `
+(function(){
+  function copyText(text, el){
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){
+        if(el){var o=el.style.background;el.style.background='#d4edda';setTimeout(function(){el.style.background=o;},700);}
+      }).catch(function(){window.prompt('Copy:',text);});
+    } else { window.prompt('Copy:',text); }
+  }
+  document.addEventListener('click',function(e){
+    var t=e.target;
+    var cp=t.closest('[data-copy]');
+    if(cp){ copyText(cp.getAttribute('data-copy'), cp); return; }
+    var cf=t.closest('[data-copy-from]');
+    if(cf){ var src=document.getElementById(cf.getAttribute('data-copy-from'));
+      if(src){ copyText(src.value!=null?src.value:src.textContent, src); } return; }
+    if(t.closest('[data-print]')){ window.print(); return; }
+    var tg=t.closest('[data-toggle-visibility]');
+    if(tg){ var inp=document.getElementById(tg.getAttribute('data-toggle-visibility'));
+      if(inp){ inp.type=inp.type==='password'?'text':'password';
+        tg.textContent=inp.type==='password'?'Show':'Hide'; } return; }
+  });
+  // Capture phase so a cancelled confirm preventDefaults before any submit-loading handler runs.
+  document.addEventListener('submit',function(e){
+    var f=e.target;
+    if(f.hasAttribute&&f.hasAttribute('data-confirm')){
+      if(!window.confirm(f.getAttribute('data-confirm'))){ e.preventDefault(); return; }
+    }
+    if(f.hasAttribute&&f.hasAttribute('data-invoice-jump')){
+      e.preventDefault();
+      var v=f.period&&f.period.value;
+      if(v){ var ym=v.split('-'); window.location.href='/admin/publishers/'+f.getAttribute('data-invoice-jump')+'/invoice/'+ym[0]+'/'+ym[1]; }
+    }
+  }, true);
+  document.addEventListener('change',function(e){
+    if(e.target.matches&&e.target.matches('[data-autosubmit]')&&e.target.form){ e.target.form.submit(); }
+  });
+  document.addEventListener('input',function(e){
+    var t=e.target; if(!t.matches) return;
+    if(t.matches('[data-autoslug]')){ var s=document.getElementById('slug');
+      if(s){ s.value=t.value.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,''); } }
+    if(t.matches('[data-slugify]')){ t.value=t.value.toLowerCase().replace(/[^a-z0-9_-]/g,''); }
+  });
+})();`;
+
 // ---------------------------------------------------------------------------
 // Admin HTML templates
 // ---------------------------------------------------------------------------
@@ -3420,7 +3497,7 @@ function adminLayout(title, body) {
   document.addEventListener('submit',function(e){
     if(e.target.tagName==='FORM') injectCsrf(e.target);
   },true);
-  // Cover programmatic form.submit() calls (e.g. onchange="this.form.submit()")
+  // Cover programmatic form.submit() calls (e.g. the data-autosubmit checkbox handler)
   var _origSubmit=HTMLFormElement.prototype.submit;
   HTMLFormElement.prototype.submit=function(){injectCsrf(this);_origSubmit.call(this);};
 })();
@@ -3489,7 +3566,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
       <td>
         <strong>${H(a.name)}</strong>
         ${isLegacy ? '' : `<div style="margin-top:5px">
-          <div class="ubox" onclick="cp(this,'${H(trackUrl)}')">/track/${H(a.slug)}?pub=PUBLISHER_NAME</div>
+          <div class="ubox" data-copy="${H(trackUrl)}">/track/${H(a.slug)}?pub=PUBLISHER_NAME</div>
         </div>`}
       </td>
       <td><span class="badge ${a.status}">${a.status}</span></td>
@@ -3504,7 +3581,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
         ? `<span style="${a.cap_used >= a.monthly_conversion_cap ? 'color:#c62828;font-weight:600' : (a.cap_used >= a.monthly_conversion_cap*0.8 ? 'color:#f57f17' : '')}">${N(a.cap_used)}/${N(a.monthly_conversion_cap)}</span>`
         : '<span style="color:#8e8e93">—</span>'}</td>
       <td>${cvr(a.clicks,a.conversions)}</td>
-      <td><div class="ubox" onclick="cp(this,'${H(postbkUrl)}')" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">/postback/${H(a.slug)}?click_id=…</div></td>
+      <td><div class="ubox" data-copy="${H(postbkUrl)}" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">/postback/${H(a.slug)}?click_id=…</div></td>
       <td><div class="act">
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
@@ -3512,7 +3589,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
           <button class="btn ${a.status==='active'?'btn-warn':'btn-ghost'}">${a.status==='active'?'Pause':'Activate'}</button></form>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/delete" style="display:inline"
-          onsubmit="return confirm('Delete ${H(a.name)}? Historical data is kept.')">${csrfField(csrfToken)}
+          data-confirm="Delete ${H(a.name)}? Historical data is kept.">${csrfField(csrfToken)}
           <button class="btn btn-danger">Delete</button></form>`}
         <a href="/admin/export.csv?advertiser=${H(a.slug)}" class="btn btn-ghost">CSV</a>
       </div></td>
@@ -3704,7 +3781,7 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
     return `<tr>
       <td>
         <strong>${H(a.name)}</strong>
-        ${isLegacy ? '' : `<div style="margin-top:5px"><div class="ubox" onclick="cp(this,'${H(trackUrl)}')">/track/${H(a.slug)}?pub=PUBLISHER_NAME</div></div>`}
+        ${isLegacy ? '' : `<div style="margin-top:5px"><div class="ubox" data-copy="${H(trackUrl)}">/track/${H(a.slug)}?pub=PUBLISHER_NAME</div></div>`}
       </td>
       <td><span class="badge ${a.status}">${a.status}</span></td>
       <td>${N(a.clicks)}</td>
@@ -3715,7 +3792,7 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
       </td>
       <td>${cvr(a.clicks, a.conversions)}</td>
       <td>
-        ${isLegacy ? '' : `<div class="ubox" onclick="cp(this,'${H(postbkUrl)}')" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">/postback/${H(a.slug)}?click_id=…</div>`}
+        ${isLegacy ? '' : `<div class="ubox" data-copy="${H(postbkUrl)}" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">/postback/${H(a.slug)}?click_id=…</div>`}
       </td>
       <td><div class="act">
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
@@ -3724,7 +3801,7 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
           <button class="btn ${a.status==='active'?'btn-warn':'btn-ghost'}">${a.status==='active'?'Pause':'Activate'}</button></form>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/delete" style="display:inline"
-          onsubmit="return confirm('Delete ${H(a.name)}? Historical data is kept.')">${csrfField(csrfToken)}
+          data-confirm="Delete ${H(a.name)}? Historical data is kept.">${csrfField(csrfToken)}
           <button class="btn btn-danger">Delete</button></form>`}
         <a href="/admin/export.csv?advertiser=${H(a.slug)}" class="btn btn-ghost">CSV</a>
       </div></td>
@@ -3775,7 +3852,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
     <strong>Matching requirement:</strong> our <code>click_id</code> must be passed as AppsFlyer's <code>customer_user_id</code> in your tracking link (the sync matches on AppsFlyer's <code>customer_user_id</code>, falling back to <code>appsflyer_id</code>). Attribution is read from <code>media_source</code> (organic ⇒ rejected).
   </div>
   <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp-sync/run" style="margin-bottom:18px"
-        onsubmit="return confirm('Run a manual AppsFlyer sync now?')">${csrfField(csrfToken)}
+        data-confirm="Run a manual AppsFlyer sync now?">${csrfField(csrfToken)}
     <button class="btn btn-primary"${adv.mmp_type==='appsflyer'?'':' disabled'}>Run Sync Now</button>
     ${adv.mmp_type==='appsflyer' ? '' : '<small style="margin-left:8px;color:#8e8e93">Set MMP Type to AppsFlyer first.</small>'}
   </form>
@@ -3808,7 +3885,7 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
       <td><span class="badge ${g.status==='active'?'active':'paused'}">${H(g.status)}</span></td>
       <td style="font-size:11px;color:#6e6e73">${H(g.description||'—')}</td>
       <td><form method="POST" action="/admin/advertisers/${H(adv.slug)}/goals/${H(g.id)}/delete" style="display:inline"
-            onsubmit="return confirm('Delete goal ${H(g.name)}?')">${csrfField(csrfToken)}
+            data-confirm="Delete goal ${H(g.name)}?">${csrfField(csrfToken)}
             <button class="btn btn-danger">Delete</button></form></td>
     </tr>`).join('')}
     </tbody></table>`}
@@ -3832,7 +3909,7 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
   <form method="POST" action="${H(action)}">${csrfField(csrfToken)}
     <div class="fg"><label>Advertiser Name *</label>
       <input type="text" name="name" value="${H(adv.name||'')}" required
-             oninput="${isEdit?'':'autoSlug(this)'}"></div>
+             ${isEdit?'':'data-autoslug'}></div>
     ${isEdit ? '' : `<div class="fg"><label>Slug (used in URLs) *</label>
       <input type="text" name="slug" id="slug" value="${H(adv.slug||'')}"
              pattern="[a-z0-9-]+" required placeholder="e.g. acbs, shb-finance">
@@ -3880,7 +3957,7 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
         <div style="display:flex;gap:8px;align-items:center">
           <input type="text" id="pbsecret" name="postback_secret" value="${H(adv.postback_secret||'')}"
                  placeholder="blank = no signature required" style="flex:1;font-family:monospace;font-size:12px">
-          <button type="button" class="btn btn-ghost" onclick="cp(document.getElementById('pbsecret'), document.getElementById('pbsecret').value)">Copy</button>
+          <button type="button" class="btn btn-ghost" data-copy-from="pbsecret">Copy</button>
         </div>
         <small>If set, postbacks must include <code>&amp;sig=HMAC_SHA256(secret, click_id+event+payout)</code> as a hex digest, or they are rejected (403). Leave blank to accept unsigned postbacks (backward compatible).</small></div>
     </fieldset>
@@ -3899,7 +3976,7 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
         <div style="display:flex;gap:8px;align-items:center">
           <input type="password" id="mmptoken" name="mmp_api_token" value=""
                  placeholder="${hasMmpToken ? '••••••• (saved) — leave blank to keep' : 'AppsFlyer API token'}" autocomplete="new-password" style="flex:1;font-family:monospace;font-size:12px">
-          <button type="button" class="btn btn-ghost" onclick="var i=document.getElementById('mmptoken');i.type=i.type==='password'?'text':'password';this.textContent=i.type==='password'?'Show':'Hide';">Show</button>
+          <button type="button" class="btn btn-ghost" data-toggle-visibility="mmptoken">Show</button>
         </div>
         <small>${hasMmpToken ? 'A token is saved. Enter a new value only to replace it; leave blank to keep the current one. ' : ''}Stored ${mmpKey() ? 'encrypted (AES-256-GCM)' : '<strong style="color:#c62828">in plaintext — set MMP_ENCRYPTION_KEY</strong>'}. Used to pull in-app events from AppsFlyer.</small></div>
       ${isEdit ? `<div style="display:flex;gap:8px;margin-top:6px">
@@ -3910,10 +3987,10 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
     </fieldset>
     ${isEdit && adv.slug ? `
     <div class="fg"><label>Tracking URL format</label>
-      <div class="ubox" onclick="cp(this,'${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME')">
+      <div class="ubox" data-copy="${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME">
         ${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME</div></div>
     <div class="fg"><label>Postback URL format</label>
-      <div class="ubox" onclick="cp(this,'${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&event=sale&loan_amount=AMOUNT&revenue=REVENUE')">
+      <div class="ubox" data-copy="${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&event=sale&loan_amount=AMOUNT&revenue=REVENUE">
         ${H(BASE_URL)}/postback/${H(adv.slug)}?click_id=CLICK_ID&amp;event=sale&amp;loan_amount=AMOUNT&amp;revenue=REVENUE</div></div>` : ''}
     <div class="form-act">
       <button type="submit" class="btn btn-primary btn-lg">Save Advertiser</button>
@@ -3949,11 +4026,11 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
           <button class="btn btn-primary">Approve</button>
         </form>
         <form method="POST" action="/admin/publishers/${p.id}/reject" style="display:inline"
-              onsubmit="return confirm('Reject application from ${H(p.username)}?')">${csrfField(csrfToken)}
+              data-confirm="Reject application from ${H(p.username)}?">${csrfField(csrfToken)}
           <button class="btn btn-danger">Reject</button>
         </form>
         <form method="POST" action="/admin/publishers/${p.id}/delete" style="display:inline"
-              onsubmit="return confirm('Permanently delete application from ${H(p.username)}?')">${csrfField(csrfToken)}
+              data-confirm="Permanently delete application from ${H(p.username)}?">${csrfField(csrfToken)}
           <button class="btn btn-ghost">Delete</button>
         </form>
       </div>
@@ -3981,23 +4058,23 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
       <a href="/admin/publishers/${p.id}/edit" class="btn btn-ghost">Edit</a>
       <a href="/admin/publishers/${p.id}/payments" class="btn btn-ghost">Payments</a>
       <a href="/admin/publishers/${p.id}/postback-log" class="btn btn-ghost">S2S Log</a>
-      <form onsubmit="event.preventDefault();const v=this.period.value;if(v){const[y,m]=v.split('-');location.href='/admin/publishers/${p.id}/invoice/'+y+'/'+m;}" style="display:inline-flex;gap:3px;vertical-align:middle">
+      <form data-invoice-jump="${p.id}" style="display:inline-flex;gap:3px;vertical-align:middle">
         <input type="month" name="period" value="${new Date().toISOString().slice(0,7)}" style="padding:4px 7px;border:1px solid #d2d2d7;border-radius:6px;font-size:11px;height:27px">
         <button type="submit" class="btn btn-ghost">Invoice</button>
       </form>
       <form method="POST" action="/admin/publishers/${p.id}/regenerate-key" style="display:inline"
-            onsubmit="return confirm('Regenerate API key for ${H(p.username)}? The old key stops working immediately.')">${csrfField(csrfToken)}
+            data-confirm="Regenerate API key for ${H(p.username)}? The old key stops working immediately.">${csrfField(csrfToken)}
         <button class="btn btn-ghost">↻ Key</button>
       </form>
       ${p.api_key_hash ? `<form method="POST" action="/admin/publishers/${p.id}/revoke-key" style="display:inline"
-            onsubmit="return confirm('Revoke API key for ${H(p.username)}?')">${csrfField(csrfToken)}
+            data-confirm="Revoke API key for ${H(p.username)}?">${csrfField(csrfToken)}
         <button class="btn btn-danger">Revoke Key</button>
       </form>` : ''}
       <form method="POST" action="/admin/publishers/${p.id}/toggle" style="display:inline">${csrfField(csrfToken)}
         <button class="btn ${p.status==='active'?'btn-warn':'btn-ghost'}">${p.status==='active'?'Pause':'Activate'}</button>
       </form>
       <form method="POST" action="/admin/publishers/${p.id}/delete" style="display:inline"
-            onsubmit="return confirm('Delete publisher ${H(p.username)}?')">${csrfField(csrfToken)}
+            data-confirm="Delete publisher ${H(p.username)}?">${csrfField(csrfToken)}
         <button class="btn btn-danger">Delete</button>
       </form>
     </div></td>
@@ -4142,7 +4219,7 @@ function renderInvoice({ inv, pub, lines, totalsByCurrency = [], flash, csrfToke
   <form method="POST" action="/admin/publishers/${H(pub.id)}/invoice/${inv.year}/${inv.month}/regenerate" style="display:inline">${csrfField(csrfToken)}
     <button class="btn btn-ghost btn-lg">↻ Recalculate</button>
   </form>
-  <button class="btn btn-ghost btn-lg" onclick="window.print()">Print / Save PDF</button>
+  <button class="btn btn-ghost btn-lg" data-print>Print / Save PDF</button>
   <a href="/admin/invoices" class="btn btn-ghost btn-lg">← All Invoices</a>
 </div>
 <div class="no-print" style="max-width:820px;margin:12px auto 0">
@@ -4279,7 +4356,7 @@ function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, erro
     <td>${H(r.country)}</td>
     <td>${H(r.device_type)}</td>
     <td><form method="POST" action="/admin/publishers/${H(pub.id)}/smart-links/${H(r.id)}/delete" style="display:inline"
-          onsubmit="return confirm('Delete this rule?')">${csrfField(csrfToken)}
+          data-confirm="Delete this rule?">${csrfField(csrfToken)}
           <button class="btn btn-danger">Delete</button></form></td>
   </tr>`).join('');
 
@@ -4289,7 +4366,7 @@ function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, erro
   ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
   ${error ? `<div class="form-err">${H(error)}</div>` : ''}
   <p style="font-size:12px;color:#6e6e73;margin-bottom:8px">Smart link (geo/device routed):</p>
-  <div class="ubox" onclick="cp(this,'${H(smartUrl)}')" style="margin-bottom:20px">${H(smartUrl)}</div>
+  <div class="ubox" data-copy="${H(smartUrl)}" style="margin-bottom:20px">${H(smartUrl)}</div>
   <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Rules are evaluated by priority (lowest number first). <code>*</code> matches any country/device. Country accepts comma-separated ISO codes (e.g. <code>VN,TH</code>). If no rule matches, traffic falls back to the publisher's first active assigned advertiser.</p>
   ${rules.length === 0 ? '<div class="empty" style="margin-bottom:14px">No rules yet — all traffic uses the fallback advertiser.</div>' : `
   <table style="margin-bottom:16px"><thead><tr><th>Priority</th><th>Advertiser</th><th>Country</th><th>Device</th><th></th></tr></thead>
@@ -4376,7 +4453,7 @@ function renderAdminMarketplace({ pending, csrfToken = '', flash }) {
       <form method="POST" action="/admin/marketplace/${H(p.id)}/approve" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-primary">Approve</button></form>
       <form method="POST" action="/admin/marketplace/${H(p.id)}/reject" style="display:inline"
-            onsubmit="return confirm('Reject ${H(p.username)} → ${H(p.adv_name)}?')">${csrfField(csrfToken)}
+            data-confirm="Reject ${H(p.username)} → ${H(p.adv_name)}?">${csrfField(csrfToken)}
         <button class="btn btn-danger">Reject</button></form>
     </div></td>
   </tr>`).join('');
@@ -4421,7 +4498,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <td>${H(a.valid_until || '—')}</td>
       <td>${a.monthly_cap != null ? N(a.monthly_cap) : '—'}</td>
       <td><form method="POST" action="/admin/publishers/${H(pub.id)}/unassign" style="display:inline"
-            onsubmit="return confirm('Unassign ${H(a.name)} from ${H(pub.username)}?')">${csrfField(csrfToken)}
+            data-confirm="Unassign ${H(a.name)} from ${H(pub.username)}?">${csrfField(csrfToken)}
             <input type="hidden" name="advertiser_id" value="${H(a.advertiser_id)}">
             <button class="btn btn-danger">Unassign</button></form></td>
     </tr>`).join('')}
@@ -4446,7 +4523,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
     <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Set a new password using the field above, or generate a 24-hour self-service reset link to share with the publisher (useful when email isn't configured).</p>
     ${resetLink ? `<div style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:12px 14px;margin-bottom:12px">
       <div style="font-size:12px;font-weight:600;margin-bottom:6px">Active reset link — expires ${H(resetLink.expires)} UTC:</div>
-      <div class="ubox" onclick="cp(this,'${H(resetLink.url)}')" style="font-size:11px;word-break:break-all">${H(resetLink.url)}</div>
+      <div class="ubox" data-copy="${H(resetLink.url)}" style="font-size:11px;word-break:break-all">${H(resetLink.url)}</div>
     </div>` : ''}
     <form method="POST" action="/admin/publishers/${H(pub.id)}/reset-link" style="display:inline">${csrfField(csrfToken)}
       <button class="btn btn-ghost">Generate reset link</button>
@@ -4487,7 +4564,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
             <div style="display:flex;gap:8px;align-items:center">
               <input type="text" id="newKeyInput" value="${H(newApiKey)}" readonly
                      style="font-family:monospace;font-size:12px;flex:1;background:#fff;color:#1d1d1f">
-              <button type="button" class="btn btn-ghost" onclick="cp(document.getElementById('newKeyInput'),'${H(newApiKey)}')">Copy</button>
+              <button type="button" class="btn btn-ghost" data-copy="${H(newApiKey)}">Copy</button>
             </div>
           </div>` : ''}
       ${pub.api_key_hash
@@ -4498,11 +4575,11 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
           </div>`}
           <div style="display:flex;gap:8px">
             <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline"
-                  onsubmit="return confirm('Regenerate API key? The current key stops working immediately.')">${csrfField(csrfToken)}
+                  data-confirm="Regenerate API key? The current key stops working immediately.">${csrfField(csrfToken)}
               <button class="btn btn-warn">↻ Regenerate Key</button>
             </form>
             <form method="POST" action="/admin/publishers/${H(pub.id)}/revoke-key" style="display:inline"
-                  onsubmit="return confirm('Revoke this API key? The publisher will lose API access until a new key is generated.')">${csrfField(csrfToken)}
+                  data-confirm="Revoke this API key? The publisher will lose API access until a new key is generated.">${csrfField(csrfToken)}
               <button class="btn btn-danger">Revoke Key</button>
             </form>
           </div>`
@@ -4519,7 +4596,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
           const url = `${BASE_URL}/track/${a.slug}?pub=${encodeURIComponent(pub.username||'')}`;
           return `<div style="margin-bottom:6px">
             <div style="font-size:10px;color:#6e6e73;margin-bottom:2px">${H(a.name)}</div>
-            <div class="ubox" onclick="cp(this,'${H(url)}')">${H(url)}</div>
+            <div class="ubox" data-copy="${H(url)}">${H(url)}</div>
           </div>`;
         }).join('')}
     </div>` : ''}
@@ -4634,7 +4711,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
   const toggle = (name, checked, label, hint) => `
     <label style="display:flex;align-items:center;gap:12px;cursor:pointer;padding:14px 0;border-bottom:1px solid #f0f0f0">
       <div style="position:relative;display:inline-block;width:42px;height:24px;flex-shrink:0">
-        <input type="checkbox" name="${name}" ${checked ? 'checked' : ''} onchange="this.form.submit()"
+        <input type="checkbox" name="${name}" ${checked ? 'checked' : ''} data-autosubmit
                style="opacity:0;width:0;height:0;position:absolute">
         <span style="position:absolute;inset:0;background:${checked ? '#0071e3' : '#d2d2d7'};border-radius:24px;transition:.2s"></span>
         <span style="position:absolute;top:3px;left:${checked ? '21px' : '3px'};width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
@@ -5000,7 +5077,7 @@ function renderPubRegister({ error = null, values = {} } = {}) {
         <div class="fg"><label>Username *</label>
           <input type="text" name="username" value="${H(values.username||'')}" required
                  pattern="[a-z0-9_-]+" placeholder="e.g. clickon" autocomplete="off"
-                 oninput="this.value=this.value.toLowerCase().replace(/[^a-z0-9_-]/g,'')"></div>
+                 data-slugify></div>
         <div class="fg"><label>Email *</label>
           <input type="email" name="email" value="${H(values.email||'')}" required placeholder="you@company.com"></div>
       </div>
@@ -5309,7 +5386,7 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
   // ── Rows ─────────────────────────────────────────────────────────────────
   const advRows = advStats.map(a => `<tr>
     <td><strong>${H(a.name)}</strong></td>
-    <td><div class="ubox" onclick="cp(this,'${H(a.trackingUrl)}')">${H(a.trackingUrl)}</div></td>
+    <td><div class="ubox" data-copy="${H(a.trackingUrl)}">${H(a.trackingUrl)}</div></td>
     <td>${N(a.clicks)}</td>
     <td>${N(a.approved_count)} ${a.pending_count > 0 ? `<span style="color:#f57f17;font-size:10px">+${a.pending_count} pending</span>` : ''}</td>
     <td>
