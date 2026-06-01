@@ -120,6 +120,7 @@ db.exec(`
     publisher       TEXT NOT NULL,
     event           TEXT NOT NULL DEFAULT 'sale',
     payout          REAL NOT NULL DEFAULT 0,
+    currency        TEXT NOT NULL DEFAULT 'USD',
     loan_amount     REAL,
     revenue         REAL,
     received_at     TEXT DEFAULT (datetime('now')),
@@ -146,6 +147,8 @@ if (!convCols2.includes('reconciliation_run_id')) {
 // Migration: loan_amount (basis for percentage payout) + revenue (advertiser pays Komorebi)
 if (!convCols2.includes('loan_amount')) db.exec('ALTER TABLE conversions ADD COLUMN loan_amount REAL');
 if (!convCols2.includes('revenue'))     db.exec('ALTER TABLE conversions ADD COLUMN revenue REAL');
+// QA2 — currency per conversion (USD default; VND for percent-of-loan payouts) so aggregates never mix currencies
+if (!convCols2.includes('currency'))    db.exec("ALTER TABLE conversions ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
 // Migration: transaction_id (F9) — advertiser's own conversion id, for reconciliation
 if (!convCols2.includes('transaction_id')) db.exec('ALTER TABLE conversions ADD COLUMN transaction_id TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_conv_transaction ON conversions(transaction_id)');
@@ -210,6 +213,7 @@ db.exec(`
     postback_url  TEXT NOT NULL DEFAULT '',
     api_key       TEXT UNIQUE,
     api_key_hash  TEXT,
+    api_key_suffix TEXT,
     status        TEXT NOT NULL DEFAULT 'active',
     created_at    TEXT DEFAULT (datetime('now'))
   );
@@ -230,23 +234,33 @@ if (!pubCols.includes('traffic_sources'))   db.exec("ALTER TABLE publishers ADD 
 if (!pubCols.includes('registration_note')) db.exec("ALTER TABLE publishers ADD COLUMN registration_note TEXT NOT NULL DEFAULT ''");
 if (!pubCols.includes('minimum_payout'))    db.exec('ALTER TABLE publishers ADD COLUMN minimum_payout REAL NOT NULL DEFAULT 50');
 if (!pubCols.includes('api_key_hash'))      db.exec('ALTER TABLE publishers ADD COLUMN api_key_hash TEXT');
+if (!pubCols.includes('api_key_suffix'))    db.exec('ALTER TABLE publishers ADD COLUMN api_key_suffix TEXT'); // M3 — last 8 chars for UI badge
 
 // Ensure index exists for api_key_hash on existing databases
 db.exec('CREATE INDEX IF NOT EXISTS idx_pub_api_key_hash ON publishers(api_key_hash)');
 
-// Backfill: generate API keys for any publisher that doesn't have one
-const needKey = db.prepare('SELECT id FROM publishers WHERE api_key IS NULL').all();
-const setKey  = db.prepare('UPDATE publishers SET api_key = ? WHERE id = ?');
-for (const p of needKey) {
-  setKey.run('kom_live_' + randomBytes(16).toString('hex'), p.id);
+// Backfill: hash + suffix for legacy rows that have a plaintext key but no hash (preserve the key).
+const needHash = db.prepare('SELECT id, api_key FROM publishers WHERE api_key IS NOT NULL AND api_key_hash IS NULL').all();
+const setHash  = db.prepare('UPDATE publishers SET api_key_hash = ?, api_key_suffix = ? WHERE id = ?');
+for (const p of needHash) {
+  setHash.run(createHash('sha256').update(p.api_key).digest('hex'), p.api_key.slice(-8), p.id);
 }
 
-// Backfill: compute api_key_hash for any publisher that has api_key but no hash yet
-const needHash = db.prepare('SELECT id, api_key FROM publishers WHERE api_key IS NOT NULL AND api_key_hash IS NULL').all();
-const setHash  = db.prepare('UPDATE publishers SET api_key_hash = ? WHERE id = ?');
-for (const p of needHash) {
-  setHash.run(createHash('sha256').update(p.api_key).digest('hex'), p.id);
+// Backfill: suffix for rows that still have a plaintext key + hash but no suffix yet.
+db.exec("UPDATE publishers SET api_key_suffix = substr(api_key, -8) WHERE api_key IS NOT NULL AND api_key_suffix IS NULL");
+
+// Issue a fresh hash-only key for any publisher with no key at all (never clobbers
+// a regenerated hash-only key, which has api_key NULL but api_key_hash present).
+const needKey = db.prepare('SELECT id FROM publishers WHERE api_key IS NULL AND api_key_hash IS NULL').all();
+const setKey  = db.prepare('UPDATE publishers SET api_key_hash = ?, api_key_suffix = ? WHERE id = ?');
+for (const p of needKey) {
+  const k = 'kom_live_' + randomBytes(16).toString('hex');
+  setKey.run(createHash('sha256').update(k).digest('hex'), k.slice(-8), p.id);
 }
+
+// M3 residual — purge any remaining plaintext API keys now that hash + suffix are
+// backfilled. Lookups are hash-only, so the plaintext column is no longer needed.
+db.exec('UPDATE publishers SET api_key = NULL WHERE api_key IS NOT NULL AND api_key_hash IS NOT NULL');
 
 // ---------------------------------------------------------------------------
 // Postback log  (S2S fire attempts)

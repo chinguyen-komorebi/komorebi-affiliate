@@ -54,6 +54,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({
   contentSecurityPolicy: {
+    // TODO (I1, future pass): drop 'unsafe-inline' from scriptSrc/styleSrc by moving
+    // inline scripts/styles to per-request CSP nonces (nonce-<base64>). Requires
+    // threading a nonce through every inline <script>/<style> in the templates.
     directives: {
       defaultSrc: ["'self'"],
       styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
@@ -107,6 +110,10 @@ let ADMIN_PASS   = process.env.ADMIN_PASS;
 const BASE_URL   = process.env.BASE_URL   || `http://localhost:${PORT}`;
 
 if (!process.env.SESSION_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('FATAL: SESSION_SECRET must be set in production.');
+    process.exit(1);
+  }
   console.warn('WARNING: SESSION_SECRET not set — using insecure default. Set it in production.');
 }
 
@@ -121,6 +128,10 @@ if (process.env.NODE_ENV === 'production' && !ADMIN_PASS) {
   console.error('FATAL: ADMIN_PASS must be set in production.');
   process.exit(1);
 }
+
+// M1 — hash the admin password once at startup; login compares in constant time
+// (timingSafeEqual via checkPassword), never a plaintext === comparison.
+let ADMIN_PASS_HASH = ADMIN_PASS ? hashPassword(ADMIN_PASS) : null; // rotated on admin password change
 
 // ---------------------------------------------------------------------------
 // F20 — MMP (AppsFlyer) config + token encryption (AES-256-GCM)
@@ -162,7 +173,14 @@ function decryptToken(stored) {
 }
 
 // Pull in-app events from the AppsFlyer Reports API v5 (CSV) for a date range.
-// Returns [{ click_id, status }]. Throws on missing creds / non-2xx.
+// Returns normalized [{ click_id, status }] where status ∈ {attributed, organic, fraud}.
+//
+// QA1 — real AppsFlyer raw in-app-events columns are: appsflyer_id, customer_user_id,
+// event_name, event_time, media_source, campaign (NOT click_id / status). We therefore:
+//   - take click_id from customer_user_id (the value the tracking link sets), then
+//     fall back to appsflyer_id, then to a literal click_id column;
+//   - derive attribution from media_source (organic → reject, anything else → approve),
+//     falling back to a literal status column (attributed/organic/fraud) for flexibility.
 async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
   const token = decryptToken(adv.mmp_api_token);
   if (!token) throw new Error('No API token configured');
@@ -173,7 +191,14 @@ async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
   if (!resp.ok) throw new Error(`AppsFlyer API HTTP ${resp.status}`);
   const rows = parseCSV(await resp.text()); // headers lowercased + underscored by parseCSV
   return rows
-    .map(r => ({ click_id: (r.click_id || r.clickid || '').trim(), status: (r.status || r.af_status || '').trim().toLowerCase() }))
+    .map(r => {
+      const click_id = (r.customer_user_id || r.appsflyer_id || r.click_id || r.clickid || '').trim();
+      const ms = (r.media_source != null ? String(r.media_source) : '').trim().toLowerCase();
+      let status;
+      if (ms) status = ms === 'organic' ? 'organic' : 'attributed';        // real export
+      else    status = (r.status || r.af_status || '').trim().toLowerCase(); // fallback format
+      return { click_id, status };
+    })
     .filter(r => r.click_id || r.status);
 }
 
@@ -358,6 +383,10 @@ function recordLoginSuccess(ip, map) {
 // Postback logger → postback.log  (NDJSON)
 // ---------------------------------------------------------------------------
 
+// NOTE: postback.log grows unbounded and contains raw request params (potential
+// PII such as user_id). Rotate it externally (e.g. logrotate: daily, rotate 14,
+// compress) and restrict file permissions. The DB conversions.raw_params column
+// is PII-masked (see logAudit/maskPII); this append-only debug log is not.
 const logStream = fs.createWriteStream(path.join(__dirname, 'postback.log'), { flags: 'a' });
 function logPostback(req, result) {
   logStream.write(JSON.stringify({ ts: new Date().toISOString(), ip: req.ip, params: req.query, result }) + '\n');
@@ -436,10 +465,10 @@ function requireApiKey(req, res, next) {
     return res.status(401).json({ error: 'Missing or invalid API key. Send X-API-Key: kom_live_...' });
   }
   const keyHash = hashApiKey(key);
-  // Hash lookup first; fallback to plaintext for keys not yet migrated
+  // M3 — hash-only lookup (no plaintext fallback; all keys have api_key_hash).
   const pub = db.prepare(
-    "SELECT * FROM publishers WHERE (api_key_hash = ? OR (api_key_hash IS NULL AND api_key = ?)) AND status = 'active'"
-  ).get(keyHash, key);
+    "SELECT * FROM publishers WHERE api_key_hash = ? AND status = 'active'"
+  ).get(keyHash);
   if (!pub) {
     return res.status(401).json({ error: 'API key not found or account is paused' });
   }
@@ -454,7 +483,8 @@ function maskValue(s) {
   out = out.replace(/kom_live_[A-Za-z0-9]+/g, 'kom_live_***');                       // never store full API keys
   out = out.replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g,
     (_m, a, d) => `${a}***@${d}`);                                                    // c***@domain
-  out = out.replace(/(?:\+?84|0)\d[\d\s-]{7,11}\d/g, (m) => {                          // VN phone → 0967***857
+  // VN phone, tolerant of spaces/dots/dashes between digits (e.g. "+84 967 123 857").
+  out = out.replace(/(?:\+?84|0)[\s.-]?\d(?:[\s.-]?\d){7,10}/g, (m) => {
     const d = m.replace(/\D/g, '');
     return (d.length >= 9 && d.length <= 12) ? d.slice(0, 4) + '***' + d.slice(-3) : m;
   });
@@ -537,22 +567,26 @@ async function fireWebhookConversion({ advertiserName, publisher, payout, event 
 async function fireWebhookDailySummary() {
   if (!webhookSumEnabled()) return;
   const yesterday = new Date(Date.now() + 8 * 3600_000 - 86_400_000).toISOString().slice(0, 10);
-  const totals = db.prepare(`
-    SELECT COUNT(*) as conversions,
+  // QA2 — group totals by currency (USD and VND shown separately, never summed).
+  const curRows = db.prepare(`
+    SELECT currency, COUNT(*) as conversions,
            COALESCE(SUM(payout), 0) as total_payout,
            COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END), 0) as approved_payout
-    FROM conversions WHERE date(received_at, '+8 hours') = ?
-  `).get(yesterday);
-  if (totals.conversions === 0) return;
+    FROM conversions WHERE date(received_at, '+8 hours') = ? GROUP BY currency
+  `).all(yesterday);
+  const conversions = curRows.reduce((s, r) => s + r.conversions, 0);
+  if (conversions === 0) return;
+  const totalStr    = curRows.map(r => fmtCur(r.total_payout, r.currency)).join(' · ');
+  const approvedStr = curRows.map(r => fmtCur(r.approved_payout, r.currency)).join(' · ');
   const byAdv = db.prepare(`
-    SELECT a.name, COUNT(*) as conversions, COALESCE(SUM(cv.payout),0) as payout
+    SELECT a.name, COUNT(*) as conversions, COALESCE(MAX(cv.currency),'USD') as currency, COALESCE(SUM(cv.payout),0) as payout
     FROM conversions cv JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE date(cv.received_at, '+8 hours') = ?
     GROUP BY cv.advertiser_slug ORDER BY payout DESC
   `).all(yesterday);
-  const advLines = byAdv.map(r => `• ${r.name}: ${r.conversions} conv — $${r.payout.toFixed(2)}`).join('\n');
+  const advLines = byAdv.map(r => `• ${r.name}: ${r.conversions} conv — ${fmtCur(r.payout, r.currency)}`).join('\n');
   const plain = `\u{1F4CA} Daily Summary ${yesterday} SGT\n` +
-    `Conversions: ${totals.conversions} | Total: $${totals.total_payout.toFixed(2)} | Approved: $${totals.approved_payout.toFixed(2)}\n` +
+    `Conversions: ${conversions} | Total: ${totalStr} | Approved: ${approvedStr}\n` +
     advLines;
   await Promise.allSettled([
     sendTelegram(plain),
@@ -561,14 +595,14 @@ async function fireWebhookDailySummary() {
         type: 'section',
         text: { type: 'mrkdwn', text: `\u{1F4CA} *Daily Summary — ${yesterday} SGT*` },
         fields: [
-          { type: 'mrkdwn', text: `*Conversions*\n${totals.conversions}` },
-          { type: 'mrkdwn', text: `*Total Payout*\n$${totals.total_payout.toFixed(2)}` },
-          { type: 'mrkdwn', text: `*Approved*\n$${totals.approved_payout.toFixed(2)}` },
+          { type: 'mrkdwn', text: `*Conversions*\n${conversions}` },
+          { type: 'mrkdwn', text: `*Total Payout*\n${totalStr}` },
+          { type: 'mrkdwn', text: `*Approved*\n${approvedStr}` },
         ],
       },
       ...(byAdv.length > 0 ? [{
         type: 'section',
-        text: { type: 'mrkdwn', text: byAdv.map(r => `• *${r.name}*: ${r.conversions} conv — $${r.payout.toFixed(2)}`).join('\n') },
+        text: { type: 'mrkdwn', text: byAdv.map(r => `• *${r.name}*: ${r.conversions} conv — ${fmtCur(r.payout, r.currency)}`).join('\n') },
       }] : []),
     ]),
   ]);
@@ -618,18 +652,21 @@ async function sendDailySummaryEmail() {
   // "Yesterday" in Singapore time (UTC+8) — DB stores UTC, offset by +8h for SGT date
   const yesterday = new Date(Date.now() + 8 * 3600_000 - 86_400_000).toISOString().slice(0, 10);
 
-  const totals = db.prepare(`
-    SELECT COUNT(*) as conversions,
+  // QA2 — totals grouped by currency (USD and VND shown separately, never summed).
+  const curRows = db.prepare(`
+    SELECT currency, COUNT(*) as conversions,
            COALESCE(SUM(payout), 0) as total_payout,
            COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END), 0) as approved_payout
-    FROM conversions
-    WHERE date(received_at, '+8 hours') = ?
-  `).get(yesterday);
+    FROM conversions WHERE date(received_at, '+8 hours') = ? GROUP BY currency
+  `).all(yesterday);
 
-  if (totals.conversions === 0) return; // nothing to report
+  const conversions = curRows.reduce((s, r) => s + r.conversions, 0);
+  if (conversions === 0) return; // nothing to report
+  const totalStr    = curRows.map(r => fmtCur(r.total_payout, r.currency)).join(' · ');
+  const approvedStr = curRows.map(r => fmtCur(r.approved_payout, r.currency)).join(' · ');
 
   const byAdv = db.prepare(`
-    SELECT a.name, COUNT(*) as conversions, COALESCE(SUM(cv.payout),0) as payout
+    SELECT a.name, COUNT(*) as conversions, COALESCE(MAX(cv.currency),'USD') as currency, COALESCE(SUM(cv.payout),0) as payout
     FROM conversions cv
     JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE date(cv.received_at, '+8 hours') = ?
@@ -637,45 +674,46 @@ async function sendDailySummaryEmail() {
   `).all(yesterday);
 
   const byPub = db.prepare(`
-    SELECT publisher, COUNT(*) as conversions, COALESCE(SUM(payout),0) as payout
+    SELECT publisher, COUNT(*) as conversions, COALESCE(MAX(currency),'USD') as currency, COALESCE(SUM(payout),0) as payout
     FROM conversions
     WHERE date(received_at, '+8 hours') = ?
     GROUP BY publisher ORDER BY payout DESC
   `).all(yesterday);
 
+  // Payout passed pre-formatted (string) so the table renders the currency as-is.
   const tableHtml = (rows, cols) => `
     <table style="border-collapse:collapse;width:100%;margin-bottom:20px">
       <thead><tr>${cols.map(c=>`<th style="padding:6px 12px;background:#f5f5f7;text-align:left;font-size:12px">${c}</th>`).join('')}</tr></thead>
-      <tbody>${rows.map(r=>`<tr>${Object.values(r).map(v=>`<td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;font-size:13px">${typeof v==='number'&&v%1!==0?'$'+v.toFixed(2):v}</td>`).join('')}</tr>`).join('')}</tbody>
+      <tbody>${rows.map(r=>`<tr>${Object.values(r).map(v=>`<td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;font-size:13px">${v}</td>`).join('')}</tr>`).join('')}</tbody>
     </table>`;
 
   await sendMail({
     subject: `[Komorebi] Daily Summary — ${yesterday} SGT`,
     text:
       `Daily Summary for ${yesterday} (Singapore time)\n\n` +
-      `Conversions : ${totals.conversions}\n` +
-      `Total Payout: $${totals.total_payout.toFixed(2)}\n` +
-      `Approved    : $${totals.approved_payout.toFixed(2)}\n\n` +
-      `By Advertiser:\n${byAdv.map(r=>`  ${r.name}: ${r.conversions} conv — $${r.payout.toFixed(2)}`).join('\n')}\n\n` +
-      `By Publisher:\n${byPub.map(r=>`  ${r.publisher}: ${r.conversions} conv — $${r.payout.toFixed(2)}`).join('\n')}\n`,
+      `Conversions : ${conversions}\n` +
+      `Total Payout: ${totalStr}\n` +
+      `Approved    : ${approvedStr}\n\n` +
+      `By Advertiser:\n${byAdv.map(r=>`  ${r.name}: ${r.conversions} conv — ${fmtCur(r.payout, r.currency)}`).join('\n')}\n\n` +
+      `By Publisher:\n${byPub.map(r=>`  ${r.publisher}: ${r.conversions} conv — ${fmtCur(r.payout, r.currency)}`).join('\n')}\n`,
     html: `
       <div style="font-family:sans-serif;max-width:600px">
         <h2 style="color:#1d1d1f;margin-bottom:4px">Daily Summary</h2>
         <p style="color:#6e6e73;font-size:13px;margin-bottom:20px">${yesterday} · Singapore Time</p>
         <div style="display:flex;gap:16px;margin-bottom:24px">
           ${[
-            ['Conversions', totals.conversions],
-            ['Total Payout', `$${totals.total_payout.toFixed(2)}`],
-            ['Approved', `$${totals.approved_payout.toFixed(2)}`],
+            ['Conversions', conversions],
+            ['Total Payout', totalStr],
+            ['Approved', approvedStr],
           ].map(([l,v])=>`<div style="background:#f5f5f7;border-radius:8px;padding:12px 16px;min-width:120px">
             <div style="font-size:11px;color:#6e6e73;font-weight:700;text-transform:uppercase;margin-bottom:4px">${l}</div>
             <div style="font-size:22px;font-weight:700">${v}</div>
           </div>`).join('')}
         </div>
         <h3 style="font-size:13px;margin-bottom:8px">By Advertiser</h3>
-        ${tableHtml(byAdv.map(r=>({Advertiser:r.name,Conversions:r.conversions,Payout:r.payout})),['Advertiser','Conversions','Payout'])}
+        ${tableHtml(byAdv.map(r=>({Advertiser:r.name,Conversions:r.conversions,Payout:fmtCur(r.payout,r.currency)})),['Advertiser','Conversions','Payout'])}
         <h3 style="font-size:13px;margin-bottom:8px">By Publisher</h3>
-        ${tableHtml(byPub.map(r=>({Publisher:r.publisher,Conversions:r.conversions,Payout:r.payout})),['Publisher','Conversions','Payout'])}
+        ${tableHtml(byPub.map(r=>({Publisher:r.publisher,Conversions:r.conversions,Payout:fmtCur(r.payout,r.currency)})),['Publisher','Conversions','Payout'])}
       </div>`,
   });
 }
@@ -1142,10 +1180,11 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   if (!adv) return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
 
   // F18(B) — optional per-advertiser HMAC signature. If a secret is set, require
-  // &sig=HMAC-SHA256(secret, click_id + event + payout). No secret → accept as before.
+  // &sig=HMAC-SHA256(secret, "click_id:event:payout"). No secret → accept as before.
+  // Advertiser must sign using the same format: click_id:event:payout
   if (adv.postback_secret) {
     const sig = String(req.query.sig || '').toLowerCase();
-    const base = `${click_id}${event}${payout ?? ''}`;
+    const base = [click_id, event, payout ?? ''].join(':');
     const expected = crypto.createHmac('sha256', adv.postback_secret).update(base).digest('hex');
     const valid = sig.length === expected.length &&
       crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
@@ -1204,6 +1243,15 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const goal = matchGoal(adv.id, event);
   let { amount, note } = computePayout(assignment, adv, goal, loanAmount);
 
+  // QA2 — currency for this conversion. Explicit ?currency= wins; otherwise a
+  // percent-of-loan payout with a large loan_amount (>1000) is treated as VND.
+  const payoutType = (assignment.payout_override == null)
+    ? (goal ? goal.payout_type : adv.payout_type) : 'fixed';
+  let currency = String(req.query.currency || '').trim().toUpperCase();
+  if (currency !== 'USD' && currency !== 'VND') {
+    currency = (payoutType === 'percent' && loanAmount != null && loanAmount > 1000) ? 'VND' : 'USD';
+  }
+
   // F15 — duplicate-user detection. If this user_id already converted for this advertiser
   // (any publisher, any prior event), record the row as a zero-payout duplicate (HTTP 200).
   // First conversion for the user_id+advertiser wins and keeps its payout.
@@ -1224,11 +1272,11 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   let result;
   try {
     db.prepare(
-      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?)`
-    ).run(click_id, slug, pub, event, amount, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(req.query));
+      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?)`
+    ).run(click_id, slug, pub, event, amount, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)));
     result = { status: duplicate ? 'duplicate' : 'ok', click_id, advertiser: slug, publisher: pub, event,
-               payout: amount, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId };
+               payout: amount, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId };
     if (note) result.note = note;
   } catch (err) {
     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err.message && err.message.includes('UNIQUE constraint'))) {
@@ -1286,7 +1334,6 @@ app.get('/health', (req, res) => {
   const h = res.getHeaders(); // headers already set by helmet + our middleware
   res.json({
     status: 'ok',
-    uptime: process.uptime(),
     // F19(D) — secrets configured? (booleans only, never values)
     secrets: {
       SESSION_SECRET:     !!process.env.SESSION_SECRET,
@@ -1432,6 +1479,7 @@ app.post('/publisher/register', (req, res) => {
   if (!password || password.length < 8) return fail('Password must be at least 8 characters.');
   if (password !== password2)            return fail('Passwords do not match.');
   if (!traffic)                          return fail('Please select at least one traffic source.');
+  if (website && !/^https?:\/\//i.test(website)) return fail('Website must start with http:// or https://.');
 
   if (db.prepare('SELECT id FROM publishers WHERE username = ?').get(uname)) {
     return fail(`Username "${uname}" is already taken — please choose another.`);
@@ -1570,21 +1618,25 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
     'SELECT COUNT(*) as n FROM conversions WHERE publisher = ?'
   ).get(pub.username).n;
 
-  const payoutRow = db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved,
+  // QA2 — earnings grouped by currency (never summed across currencies).
+  const earnRows = db.prepare(`
+    SELECT currency,
+           COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved,
            COALESCE(SUM(CASE WHEN status='pending'  THEN payout ELSE 0 END),0) as pending
-    FROM conversions WHERE publisher = ?
-  `).get(pub.username);
-  const totalPayout   = payoutRow.approved;
-  const pendingPayout = payoutRow.pending;
-
-  const monthlyRow = db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved,
+    FROM conversions WHERE publisher = ? GROUP BY currency
+  `).all(pub.username);
+  const monthRows = db.prepare(`
+    SELECT currency,
+           COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved,
            COALESCE(SUM(CASE WHEN status='pending'  THEN payout ELSE 0 END),0) as pending
-    FROM conversions WHERE publisher = ? AND strftime('%Y-%m',received_at) = ?
-  `).get(pub.username, thisMonth);
-  const monthlyPayout        = monthlyRow.approved;
-  const monthlyPendingPayout = monthlyRow.pending;
+    FROM conversions WHERE publisher = ? AND strftime('%Y-%m',received_at) = ? GROUP BY currency
+  `).all(pub.username, thisMonth);
+  const approvedByCurrency        = earnRows.map(r => ({ currency: r.currency, total: r.approved }));
+  const pendingByCurrency         = earnRows.map(r => ({ currency: r.currency, total: r.pending }));
+  const monthlyApprovedByCurrency = monthRows.map(r => ({ currency: r.currency, total: r.approved }));
+  const monthlyPendingByCurrency  = monthRows.map(r => ({ currency: r.currency, total: r.pending }));
+  // USD approved is the basis for the payout threshold (payments + minimum_payout are USD).
+  const totalPayout = (earnRows.find(r => r.currency === 'USD') || {}).approved || 0;
 
   // Only advertisers this publisher is assigned to and that are active.
   const advertisers = assignedAdvertisers(pub.id).filter(a => a.status === 'active');
@@ -1594,6 +1646,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
   ).all(pub.username);
   const advConv = db.prepare(`
     SELECT advertiser_slug, COUNT(*) as n,
+           COALESCE(MAX(currency),'USD') as currency,
            COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved_payout,
            COALESCE(SUM(CASE WHEN status='pending'  THEN payout ELSE 0 END),0) as pending_payout,
            SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) as approved_count,
@@ -1609,6 +1662,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
     ...a,
     clicks:         clickMap[a.slug] || 0,
     conversions:    convMap[a.slug]?.n || 0,
+    currency:       convMap[a.slug]?.currency || 'USD',
     approved_payout: convMap[a.slug]?.approved_payout || 0,
     pending_payout: convMap[a.slug]?.pending_payout || 0,
     approved_count: convMap[a.slug]?.approved_count || 0,
@@ -1619,7 +1673,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
 
   const recent = db.prepare(`
     SELECT cv.received_at, cv.advertiser_slug, cv.click_id, cv.event,
-           cv.payout, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
+           cv.payout, cv.currency, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
     FROM conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE cv.publisher = ?
@@ -1638,6 +1692,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
     SELECT c.sub1 AS sub1,
            COUNT(DISTINCT c.click_id) AS clicks,
            COUNT(cv.id)               AS conversions,
+           COALESCE(MAX(cv.currency),'USD') AS currency,
            COALESCE(SUM(cv.payout),0) AS payout
     FROM clicks c
     LEFT JOIN conversions cv ON cv.click_id = c.click_id
@@ -1648,7 +1703,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
   `).all(pub.username);
 
   res.send(renderPubDashboard({ pub, totalClicks, totalConversions,
-    totalPayout, pendingPayout, monthlyPayout, monthlyPendingPayout,
+    totalPayout, approvedByCurrency, pendingByCurrency, monthlyApprovedByCurrency, monthlyPendingByCurrency,
     advStats, recent, thisMonth, payments, totalPaid, subStats }));
 });
 
@@ -1656,7 +1711,7 @@ app.get('/publisher/conversions', requirePublisher, (req, res) => {
   const pub = req.publisher;
   const conversions = db.prepare(`
     SELECT cv.received_at, cv.advertiser_slug, cv.click_id, cv.event,
-           cv.payout, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
+           cv.payout, cv.currency, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
     FROM conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE cv.publisher = ?
@@ -1671,10 +1726,13 @@ app.get('/publisher/payments', requirePublisher, (req, res) => {
     'SELECT * FROM payments WHERE publisher_id = ? ORDER BY paid_at DESC'
   ).all(pub.id);
   const totalPaid    = payments.reduce((s, p) => s + p.amount_usd, 0);
-  const approvedBal  = db.prepare(
-    "SELECT COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as b FROM conversions WHERE publisher=?"
-  ).get(pub.username).b;
-  res.send(renderPubPayments({ pub, payments, totalPaid, approvedBal }));
+  // QA2 — approved balance grouped by currency (never summed across currencies).
+  const balRows = db.prepare(
+    "SELECT currency, COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as b FROM conversions WHERE publisher=? GROUP BY currency"
+  ).all(pub.username);
+  const approvedByCurrency = balRows.map(r => ({ currency: r.currency, total: r.b }));
+  const approvedBalUsd = (balRows.find(r => r.currency === 'USD') || {}).b || 0;
+  res.send(renderPubPayments({ pub, payments, totalPaid, approvedByCurrency, approvedBalUsd }));
 });
 
 app.get('/publisher/api-access', requirePublisher, (req, res) => {
@@ -1727,7 +1785,7 @@ app.get('/admin/login', (req, res) => {
 app.post('/admin/login', (req, res) => {
   if (checkLoginLockout(req, res, adminLoginAttempts)) return;
   const { username, password } = req.body;
-  if (username === ADMIN_USER && password === ADMIN_PASS) {
+  if (username === ADMIN_USER && ADMIN_PASS_HASH && checkPassword(password || '', ADMIN_PASS_HASH)) {
     req.session.regenerate(err => {
       if (err) return res.status(500).send('Session error');
       req.session.isAdmin = true;
@@ -1750,7 +1808,7 @@ app.post('/admin/logout', (req, res) => {
 
 // CSRF verification for all admin POST routes except /login and /logout
 app.post('/admin/*', (req, res, next) => {
-  if (req.path === '/login' || req.path === '/logout') return next();
+  if (req.path.endsWith('/login') || req.path.endsWith('/logout')) return next();
   // Multipart routes (e.g. /reconcile) parse their body via multer inside the
   // handler, so req.body._csrf isn't available yet here — those routes call
   // verifyCsrf themselves after the upload is parsed.
@@ -1769,25 +1827,26 @@ app.get('/admin', requireAdmin, (req, res) => {
   const totalConversions = db.prepare('SELECT COUNT(*) as n FROM conversions').get().n;
   const thisMonth        = new Date().toISOString().slice(0, 7);
 
-  const globalPayout = db.prepare(`
-    SELECT COALESCE(SUM(payout),0) as total,
+  // QA2 — global payout totals grouped by currency (never summed across currencies).
+  const globalRows = db.prepare(`
+    SELECT currency,
            COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved,
            COALESCE(SUM(CASE WHEN status='pending'  THEN payout ELSE 0 END),0) as pending
-    FROM conversions
-  `).get();
-  const totalPayout    = globalPayout.total;
-  const approvedPayout = globalPayout.approved;
-  const pendingPayout  = globalPayout.pending;
-
-  const monthlyPayout = db.prepare(
-    "SELECT COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as s FROM conversions WHERE strftime('%Y-%m',received_at)=?"
-  ).get(thisMonth).s;
+    FROM conversions GROUP BY currency
+  `).all();
+  const monthRows = db.prepare(
+    "SELECT currency, COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as s FROM conversions WHERE strftime('%Y-%m',received_at)=? GROUP BY currency"
+  ).all(thisMonth);
+  const approvedByCurrency = globalRows.map(r => ({ currency: r.currency, total: r.approved }));
+  const pendingByCurrency  = globalRows.map(r => ({ currency: r.currency, total: r.pending }));
+  const monthlyByCurrency  = monthRows.map(r => ({ currency: r.currency, total: r.s }));
 
   const advertisers = db.prepare('SELECT * FROM advertisers ORDER BY name').all();
 
   const advClicks = db.prepare('SELECT advertiser_slug, COUNT(*) as n FROM clicks GROUP BY advertiser_slug').all();
   const advConv   = db.prepare(`
     SELECT advertiser_slug, COUNT(*) as n,
+           COALESCE(MAX(currency),'USD') as currency,
            COALESCE(SUM(payout),0) as payout,
            COALESCE(SUM(revenue),0) as revenue,
            COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as approved_payout,
@@ -1802,6 +1861,7 @@ app.get('/admin', requireAdmin, (req, res) => {
     ...a,
     clicks:          clickMap[a.slug] || 0,
     conversions:     convMap[a.slug]?.n || 0,
+    currency:        convMap[a.slug]?.currency || 'USD',
     payout:          convMap[a.slug]?.payout || 0,
     revenue:         convMap[a.slug]?.revenue || 0,
     approved_payout: convMap[a.slug]?.approved_payout || 0,
@@ -1813,6 +1873,7 @@ app.get('/admin', requireAdmin, (req, res) => {
     SELECT c.advertiser_slug, c.publisher,
            COUNT(DISTINCT c.click_id) as clicks,
            COUNT(cv.id) as conversions,
+           COALESCE(MAX(cv.currency),'USD') as currency,
            COALESCE(SUM(cv.payout),0) as payout,
            COALESCE(SUM(cv.revenue),0) as revenue
     FROM clicks c
@@ -1849,8 +1910,8 @@ app.get('/admin', requireAdmin, (req, res) => {
     FROM conversions
   `).get();
 
-  res.send(renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
-    approvedPayout, pendingPayout, monthlyPayout,
+  res.send(renderAdminDashboard({ totalClicks, totalConversions,
+    approvedByCurrency, pendingByCurrency, monthlyByCurrency,
     thisMonth, advStats, pubStats, recent, flash, publisherCount,
     topCountries, deviceSplit, osSplit, globalConvStatus, csrfToken: req.session.csrfToken }));
 });
@@ -1925,10 +1986,11 @@ app.get('/admin/advertisers/:slug/edit', requireAdmin, (req, res) => {
   const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
   const capUsed = adv.monthly_conversion_cap != null ? advertiserApprovedCount(adv) : null;
-  // Decrypt the MMP token for the (masked) form field.
-  adv.mmp_api_token = decryptToken(adv.mmp_api_token);
+  // H2 — never send the decrypted token to the client. Pass only a "stored?" flag.
+  const hasMmpToken = !!adv.mmp_api_token;
+  adv.mmp_api_token = null;
   res.send(renderAdvForm({ title: `Edit — ${adv.name}`, action: `/admin/advertisers/${adv.slug}/update`,
-    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed }));
+    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed, hasMmpToken }));
 });
 
 // ---------------------------------------------------------------------------
@@ -2037,10 +2099,13 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const postbackSecret = (req.body.postback_secret || '').trim() || null;
   const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
-  const mmpToken = encryptToken((req.body.mmp_api_token || '').trim() || null);
+  const mmpTokenRaw = (req.body.mmp_api_token || '').trim();
   const { slug } = req.params;
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  // H2 — only overwrite the encrypted token when a new non-empty value is submitted;
+  // a blank field keeps the existing stored (encrypted) value.
+  const mmpToken = mmpTokenRaw ? encryptToken(mmpTokenRaw) : adv.mmp_api_token;
   if (!name) return res.send(renderAdvForm({ title: 'Edit Advertiser',
     action: `/admin/advertisers/${slug}/update`, adv: { slug, ...req.body }, error: 'Name is required.', csrfToken: req.session.csrfToken }));
 
@@ -2131,11 +2196,13 @@ app.post('/admin/publishers', requireAdmin, (req, res) => {
   const pbUrl  = (postback_url || '').trim();
   const apiKey = generateApiKey();
   try {
-    db.prepare('INSERT INTO publishers (username, password_hash, postback_url, api_key, api_key_hash, status) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(uname, hashPassword(password), pbUrl, apiKey, hashApiKey(apiKey), status || 'active');
+    // M3 — store hash + suffix only (no plaintext); the key is shown once on the edit page.
+    const info = db.prepare('INSERT INTO publishers (username, password_hash, postback_url, api_key_hash, api_key_suffix, status) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(uname, hashPassword(password), pbUrl, hashApiKey(apiKey), apiKey.slice(-8), status || 'active');
     logAudit('publisher.created', 'publisher', uname,
       { username: uname, status: status || 'active', s2s_url: pbUrl || null }, req);
-    res.redirect(`/admin/publishers?msg=Publisher+%22${encodeURIComponent(uname)}%22+created`);
+    req.session.newApiKey = apiKey; // shown once on the edit page
+    res.redirect(`/admin/publishers/${info.lastInsertRowid}/edit?msg=Publisher+%22${encodeURIComponent(uname)}%22+created+%E2%80%94+copy+the+API+key+now`);
   } catch {
     res.send(renderPubForm({ title: 'New Publisher', action: '/admin/publishers',
       pub: req.body, error: `Username "${uname}" is already taken.`, csrfToken: req.session.csrfToken }));
@@ -2161,9 +2228,12 @@ app.get('/admin/publishers/:id/edit', requireAdmin, (req, res) => {
   const resetLink = tokenRow
     ? { url: `${BASE_URL}/publisher/reset-password?token=${tokenRow.token}`, expires: tokenRow.expires_at }
     : null;
+  // M2 — show a just-(re)generated API key once, then clear it from the session.
+  const newApiKey = req.session.newApiKey || null;
+  delete req.session.newApiKey;
   res.send(renderPubForm({ title: `Edit — ${pub.username}`,
     action: `/admin/publishers/${pub.id}/update`, pub, flash, csrfToken: req.session.csrfToken,
-    assignments, allAdvertisers, resetLink }));
+    assignments, allAdvertisers, resetLink, newApiKey }));
 });
 
 // ---------------------------------------------------------------------------
@@ -2274,6 +2344,19 @@ app.get('/admin/marketplace', requireAdmin, (req, res) => {
     WHERE ma.status = 'pending'
     ORDER BY ma.applied_at ASC
   `).all();
+
+  // Per-advertiser aggregate stats (admin-only — these are business-sensitive) to
+  // help decide approve/reject: active publishers, total paid, approval rate.
+  const activePubsStmt = db.prepare('SELECT COUNT(DISTINCT publisher_id) AS n FROM publisher_advertisers WHERE advertiser_id = ?');
+  const paidStmt       = db.prepare("SELECT COALESCE(SUM(payout),0) AS s FROM conversions WHERE advertiser_slug = ? AND status = 'approved'");
+  const convCountStmt  = db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS approved FROM conversions WHERE advertiser_slug = ?");
+  for (const row of pending) {
+    row.active_publishers = activePubsStmt.get(row.adv_id).n;
+    row.total_paid = paidStmt.get(row.adv_slug).s;
+    const cc = convCountStmt.get(row.adv_slug);
+    row.approval_rate = cc.total > 0 ? (cc.approved / cc.total) * 100 : null;
+  }
+
   const flash = req.query.msg || null;
   res.send(renderAdminMarketplace({ pending, csrfToken: req.session.csrfToken, flash }));
 });
@@ -2348,20 +2431,23 @@ app.post('/admin/publishers/:id/toggle', requireAdmin, (req, res) => {
 
 // Regenerate API key
 app.post('/admin/publishers/:id/regenerate-key', requireAdmin, (req, res) => {
-  const pub = db.prepare('SELECT id, username, api_key FROM publishers WHERE id = ?').get(req.params.id);
+  const pub = db.prepare('SELECT id, username, api_key_suffix FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
   const newKey = generateApiKey();
-  db.prepare('UPDATE publishers SET api_key = ?, api_key_hash = ? WHERE id = ?').run(newKey, hashApiKey(newKey), pub.id);
-  logAudit('api_key.regenerated', 'publisher', pub.username,
-    { old_key_suffix: (pub.api_key || '').slice(-8) }, req);
-  res.redirect(`/admin/publishers/${pub.id}/edit?msg=API+key+regenerated+%E2%80%94+copy+now%3A+${encodeURIComponent(newKey)}`);
+  // M3 — store hash + suffix only; never retain the plaintext key.
+  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = ?, api_key_suffix = ? WHERE id = ?')
+    .run(hashApiKey(newKey), newKey.slice(-8), pub.id);
+  // M2 — surface the new key once via the session (not the redirect URL).
+  req.session.newApiKey = newKey;
+  logAudit('api_key.regenerated', 'publisher', pub.username, { old_key_suffix: pub.api_key_suffix || null }, req);
+  res.redirect(`/admin/publishers/${pub.id}/edit?msg=API+key+regenerated`);
 });
 
 // Revoke API key (sets to NULL — publisher can no longer use key auth)
 app.post('/admin/publishers/:id/revoke-key', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
-  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = NULL WHERE id = ?').run(pub.id);
+  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = NULL, api_key_suffix = NULL WHERE id = ?').run(pub.id);
   logAudit('api_key.revoked', 'publisher', pub.username, {}, req);
   res.redirect(`/admin/publishers/${pub.id}/edit?msg=API+key+revoked`);
 });
@@ -2375,10 +2461,12 @@ app.get('/admin/publishers/:id/payments', requireAdmin, (req, res) => {
     SELECT * FROM payments WHERE publisher_id = ? ORDER BY paid_at DESC
   `).all(pub.id);
   const totalPaid = payments.reduce((s, p) => s + p.amount_usd, 0);
-  const approvedBalance = db.prepare(
-    "SELECT COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as bal FROM conversions WHERE publisher=?"
-  ).get(pub.username).bal;
-  res.send(renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, flash, csrfToken: req.session.csrfToken }));
+  const balRows = db.prepare(
+    "SELECT currency, COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) as bal FROM conversions WHERE publisher=? GROUP BY currency"
+  ).all(pub.username);
+  const approvedByCurrency = balRows.map(r => ({ currency: r.currency, total: r.bal }));
+  const approvedBalance = (balRows.find(r => r.currency === 'USD') || {}).bal || 0; // USD-only for the balance math
+  res.send(renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, approvedByCurrency, flash, csrfToken: req.session.csrfToken }));
 });
 
 app.post('/admin/publishers/:id/payments', requireAdmin, (req, res) => {
@@ -2450,7 +2538,7 @@ function invoiceLines(username, year, month) {
   const from = `${year}-${pad}-01`;
   const to   = `${year}-${pad}-31`;
   return db.prepare(`
-    SELECT cv.id, cv.click_id, cv.advertiser_slug, cv.event, cv.payout,
+    SELECT cv.id, cv.click_id, cv.advertiser_slug, cv.event, cv.payout, cv.currency,
            cv.received_at, a.name as adv_name
     FROM   conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
@@ -2459,6 +2547,13 @@ function invoiceLines(username, year, month) {
       AND  date(cv.received_at) BETWEEN ? AND ?
     ORDER  BY cv.received_at
   `).all(username, from, to);
+}
+
+// QA2 — sum invoice lines per currency (never mixed). Returns [{currency, total}].
+function invoiceTotalsByCurrency(lines) {
+  const m = new Map();
+  for (const l of lines) { const c = l.currency || 'USD'; m.set(c, (m.get(c) || 0) + l.payout); }
+  return [...m.entries()].map(([currency, total]) => ({ currency, total }));
 }
 
 function upsertInvoice(pubId, pubName, year, month, total) {
@@ -2494,13 +2589,14 @@ app.get('/admin/publishers/:id/invoice/:year/:month', requireAdmin, (req, res) =
   if (!year || month < 1 || month > 12) return res.redirect('/admin/publishers?msg=Invalid+period&ok=0');
 
   const lines = invoiceLines(pub.username, year, month);
-  const total = lines.reduce((s, r) => s + r.payout, 0);
+  const totalsByCurrency = invoiceTotalsByCurrency(lines);
+  const totalUsd = (totalsByCurrency.find(t => t.currency === 'USD') || {}).total || 0;
 
-  const inv   = upsertInvoice(pub.id, pub.username, year, month, total);
+  const inv   = upsertInvoice(pub.id, pub.username, year, month, totalUsd); // stored total is USD-only (never mixed)
   const flash = req.query.msg
     ? { type: req.query.ok === '0' ? 'error' : 'success', text: req.query.msg } : null;
 
-  res.send(renderInvoice({ inv, pub, lines, flash, csrfToken: req.session.csrfToken }));
+  res.send(renderInvoice({ inv, pub, lines, totalsByCurrency, flash, csrfToken: req.session.csrfToken }));
 });
 
 // Regenerate (recalculate total from live approved conversions)
@@ -2513,8 +2609,8 @@ app.post('/admin/publishers/:id/invoice/:year/:month/regenerate', requireAdmin, 
   if (!year || month < 1 || month > 12) return res.redirect('/admin/publishers?msg=Invalid+period&ok=0');
 
   const lines = invoiceLines(pub.username, year, month);
-  const total = lines.reduce((s, r) => s + r.payout, 0);
-  upsertInvoice(pub.id, pub.username, year, month, total);
+  const totalUsd = (invoiceTotalsByCurrency(lines).find(t => t.currency === 'USD') || {}).total || 0;
+  upsertInvoice(pub.id, pub.username, year, month, totalUsd);
   logAudit('invoice.regenerated', 'invoice', `${pub.username}/${year}/${month}`, { total }, req);
   res.redirect(`/admin/publishers/${pub.id}/invoice/${year}/${month}?msg=Invoice+regenerated`);
 });
@@ -2621,7 +2717,8 @@ function updateEnvFile(key, value) {
 app.post('/admin/settings/password', requireAdmin, (req, res) => {
   const { current_password, new_password, confirm_password } = req.body;
 
-  if (!current_password || current_password !== ADMIN_PASS) {
+  // M1 — verify current password in constant time against the rotating hash.
+  if (!ADMIN_PASS_HASH || !checkPassword(current_password || '', ADMIN_PASS_HASH)) {
     return res.redirect('/admin/settings?msg=Current+password+is+incorrect&ok=0');
   }
   if (!new_password || new_password.length < 8) {
@@ -2632,6 +2729,7 @@ app.post('/admin/settings/password', requireAdmin, (req, res) => {
   }
 
   ADMIN_PASS             = new_password;
+  ADMIN_PASS_HASH        = hashPassword(new_password); // M1 — rotate the in-memory login hash
   process.env.ADMIN_PASS = new_password;
 
   try {
@@ -2918,7 +3016,7 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
   const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
 
   const rows = db.prepare(
-    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,status,reason FROM conversions ${where} ORDER BY received_at`
+    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,currency,status,reason FROM conversions ${where} ORDER BY received_at`
   ).all(...params);
 
   const parts = [advertiser, month].filter(Boolean);
@@ -2928,8 +3026,8 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   res.send([
-    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,status,reason',
-    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.status, r.reason].map(q).join(',')),
+    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,currency,status,reason',
+    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.currency, r.status, r.reason].map(q).join(',')),
   ].join('\r\n'));
 });
 
@@ -2949,6 +3047,16 @@ const cvr = (cl, co) => cl > 0 ? ((co / cl) * 100).toFixed(1) + '%' : '—';
 const VND_RATE = 25700;
 const vnd  = usd => Math.round(Number(usd) * VND_RATE).toLocaleString('en-US') + ' ₫';
 const usdVnd = (usd, style = '') => `$${$(usd)}<span style="font-size:11px;color:#6e6e73;margin-left:4px">(${vnd(usd)})</span>`;
+// QA2 — format a native amount in its own currency (never converts/mixes currencies).
+const fmtCur = (amt, currency = 'USD') => currency === 'VND'
+  ? `${Math.round(Number(amt || 0)).toLocaleString('en-US')} ₫`
+  : `$${$(amt || 0)}`;
+// Render an array of {currency,total} rows as separate labelled amounts (e.g. "$10.00 · 1,375,000 ₫").
+const fmtByCurrency = (rows) => {
+  const nz = (rows || []).filter(r => Number(r.total) !== 0);
+  if (nz.length === 0) return fmtCur(0, 'USD');
+  return nz.map(r => fmtCur(r.total, r.currency)).join(' <span style="color:#9ca3af">·</span> ');
+};
 
 const ADMIN_CSS = `
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -3078,7 +3186,7 @@ const PUB_CSS = `
   .pub-sb-group{font-size:9px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:rgba(255,255,255,.25);padding:16px 14px 5px}
   .pub-nav-a{display:flex;align-items:center;gap:8px;padding:7px 14px;color:#8b949e;font-size:13px;border-left:2px solid transparent;transition:background .1s}
   .pub-nav-a:hover{background:rgba(255,255,255,.05);color:#c9d1d9}
-  .pub-nav-a.active{background:rgba(0,229,195,.1);color:#00e5c3;border-left-color:#00e5c3;font-weight:500}
+  .pub-nav-a.active{background:rgba(0,229,195,.15);color:#ffffff;border-left-color:#00e5c3;font-weight:500}
   .pub-nav-a svg{opacity:.6;flex-shrink:0;width:14px;height:14px}
   .pub-nav-a.active svg{opacity:1}
   .pub-sb-foot{margin-top:auto;padding:12px 14px;border-top:1px solid rgba(255,255,255,.07)}
@@ -3094,6 +3202,9 @@ const PUB_CSS = `
   .card .val{font-size:22px;font-weight:600;color:#111827;line-height:1.1}
   .card .val.blue,.card .val.green{color:#0a7c5c}
   .card .val.amber{color:#92651a}
+  .card.hero{background:linear-gradient(135deg,#f0fdf4 0%,#ecfdf5 100%);border:2px solid #6ee7b7;box-shadow:0 4px 12px rgba(15,110,86,.1);padding:18px 20px}
+  .card.hero .lbl{color:#0a7c5c;font-weight:600}
+  .card.hero .val{color:#0a7c5c;font-size:28px}
   section{background:#fff;border:1px solid #e2e6ea;border-radius:8px;margin-bottom:10px;overflow:hidden}
   .sh{padding:10px 16px;border-bottom:1px solid #f3f4f6;display:flex;align-items:center;justify-content:space-between;gap:8px}
   .sh h2{font-size:13px;font-weight:600;color:#111827}
@@ -3118,6 +3229,28 @@ const PUB_CSS = `
   .btn-primary{background:#00e5c3;color:#0d1117;border-color:#00e5c3}
   .btn-primary:hover{background:#00c9aa}
   .empty{padding:32px;text-align:center;color:#9ca3af;font-size:13px}
+  /* Button loading / disabled states */
+  .btn[disabled]{opacity:.6;cursor:not-allowed;pointer-events:none}
+  .btn.loading::after{content:' ⏳';display:inline-block;animation:spin 1s linear infinite}
+  @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+  /* Marketplace campaign cards */
+  .campaign-card{background:#fff;border:1px solid #e2e6ea;border-radius:8px;padding:16px;transition:all .2s}
+  .campaign-card:hover{border-color:#00e5c3;box-shadow:0 4px 12px rgba(0,229,195,.15);transform:translateY(-2px)}
+  .campaign-payout{font-size:18px;font-weight:700;color:#0a7c5c}
+  .campaign-badge{background:rgba(0,229,195,.12);color:#0a7c5c;font-size:10px;font-weight:600;padding:3px 7px;border-radius:4px}
+  .campaign-desc{font-size:12px;color:#6b7280;margin:12px 0;padding:12px 0;border-top:1px solid #f3f4f6;border-bottom:1px solid #f3f4f6}
+  .campaign-apply{width:100%;background:#00e5c3;color:#0d1117;padding:10px;border:none;border-radius:6px;font-weight:600;cursor:pointer;font-family:inherit}
+  .campaign-apply[disabled]{opacity:.6;cursor:default;background:#e2e6ea;color:#6b7280}
+  /* Toast notifications */
+  @keyframes slideIn{from{opacity:0;transform:translateY(-20px)}to{opacity:1;transform:translateY(0)}}
+  .toast{position:fixed;top:20px;right:20px;background:#fff;border-radius:8px;padding:16px 20px;box-shadow:0 8px 24px rgba(0,0,0,.12);display:flex;align-items:center;gap:12px;z-index:50;animation:slideIn .3s ease-out;border-left:4px solid #10b981}
+  .toast.success{border-left-color:#10b981}
+  .toast.error{border-left-color:#ef4444}
+  .toast-icon{font-size:20px;flex-shrink:0}
+  .toast.success .toast-icon{color:#10b981}
+  .toast.error .toast-icon{color:#ef4444}
+  .toast-title{font-size:13px;font-weight:600;color:#111827}
+  .toast-message{font-size:12px;color:#6b7280;margin-top:2px}
   .ubox{background:#f9fafb;border:1px solid #e2e6ea;border-radius:5px;padding:6px 38px 6px 10px;font-size:11px;word-break:break-all;color:#374151;font-family:monospace;cursor:pointer;position:relative;max-width:420px}
   .ubox:hover{background:#f3f4f6}
   .ubox::after{content:'Copy';position:absolute;top:5px;right:8px;font-size:10px;color:#9ca3af;font-family:'Inter',sans-serif}
@@ -3154,6 +3287,29 @@ function cp(el,url){
     .catch(()=>prompt('Copy:',url));
 }`;
 
+// Publisher-portal client JS: toast notifications + CTA button loading state.
+const PORTAL_JS = `
+function showToast(message, type, duration){
+  type = type || 'success'; duration = duration || 3000;
+  var icon = type === 'success' ? '\\u2713' : '\\u2715';
+  var t = document.createElement('div');
+  t.className = 'toast ' + type;
+  t.innerHTML = '<div class="toast-icon">' + icon + '</div>'
+    + '<div class="toast-content"><div class="toast-title">' + (type === 'success' ? 'Success!' : 'Error')
+    + '</div><div class="toast-message"></div></div>';
+  t.querySelector('.toast-message').textContent = message;
+  document.body.appendChild(t);
+  setTimeout(function(){ t.remove(); }, duration);
+}
+// Show a loading state on a CTA submit button once its form submits (and wasn't cancelled).
+document.addEventListener('submit', function(e){
+  if (e.defaultPrevented || e.target.tagName !== 'FORM') return;
+  var btn = e.target.querySelector('button[type="submit"], button:not([type])');
+  if (!btn || btn.disabled) return;
+  // Defer so the form serializes (and the button value is sent) before we disable it.
+  setTimeout(function(){ btn.classList.add('loading'); btn.disabled = true; }, 0);
+});`;
+
 // ---------------------------------------------------------------------------
 // Admin HTML templates
 // ---------------------------------------------------------------------------
@@ -3185,7 +3341,7 @@ function adminSidebar() {
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
   ${nav('/admin/settings',    'Settings',    'settings',    '/admin/settings')}
   <div class="adm-sb-foot">
-    <a href="/health" target="_blank"
+    <a href="/health" target="_blank" rel="noopener noreferrer"
        style="display:flex;align-items:center;gap:7px;color:rgba(255,255,255,.35);font-size:11px">
       <span id="hlt" style="width:6px;height:6px;border-radius:50%;background:#3fb950;flex-shrink:0;transition:background .4s"></span>
       System healthy
@@ -3313,8 +3469,8 @@ function renderAdminLogin(errorMsg) {
 </body></html>`;
 }
 
-function renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
-  approvedPayout, pendingPayout, monthlyPayout,
+function renderAdminDashboard({ totalClicks, totalConversions,
+  approvedByCurrency = [], pendingByCurrency = [], monthlyByCurrency = [],
   thisMonth, advStats, pubStats, recent, flash, publisherCount,
   topCountries = [], deviceSplit = [], osSplit = [], globalConvStatus = {}, csrfToken = '' }) {
 
@@ -3332,11 +3488,11 @@ function renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
       <td><span class="badge ${a.status}">${a.status}</span></td>
       <td>${N(a.clicks)}</td><td>${N(a.conversions)}</td>
       <td>
-        <div>$${$(a.approved_payout)} <span style="font-size:10px;color:#2e7d32">approved</span></div>
+        <div>${fmtCur(a.approved_payout, a.currency)} <span style="font-size:10px;color:#2e7d32">approved</span></div>
         ${a.pending_count > 0 ? `<div style="font-size:11px;color:#f57f17">${N(a.pending_count)} pending</div>` : ''}
       </td>
-      <td>$${$(a.revenue)}</td>
-      <td>$${$(a.revenue - a.payout)}<div style="font-size:10px;color:#6e6e73">${a.revenue>0?(((a.revenue-a.payout)/a.revenue*100).toFixed(1)+'%'):'—'}</div></td>
+      <td>${fmtCur(a.revenue, a.currency)}</td>
+      <td>${fmtCur(a.revenue - a.payout, a.currency)}<div style="font-size:10px;color:#6e6e73">${a.revenue>0?(((a.revenue-a.payout)/a.revenue*100).toFixed(1)+'%'):'—'}</div></td>
       <td>${a.monthly_conversion_cap != null
         ? `<span style="${a.cap_used >= a.monthly_conversion_cap ? 'color:#c62828;font-weight:600' : (a.cap_used >= a.monthly_conversion_cap*0.8 ? 'color:#f57f17' : '')}">${N(a.cap_used)}/${N(a.monthly_conversion_cap)}</span>`
         : '<span style="color:#8e8e93">—</span>'}</td>
@@ -3362,9 +3518,9 @@ function renderAdminDashboard({ totalClicks, totalConversions, totalPayout,
       <td>${H(adv?.name||r.advertiser_slug)}</td>
       <td><code>${H(r.publisher)}</code></td>
       <td>${N(r.clicks)}</td><td>${N(r.conversions)}</td>
-      <td>$${$(r.payout)}</td>
-      <td>$${$(r.revenue)}</td>
-      <td>$${$(r.revenue - r.payout)}<div style="font-size:10px;color:#6e6e73">${r.revenue>0?(((r.revenue-r.payout)/r.revenue*100).toFixed(1)+'%'):'—'}</div></td>
+      <td>${fmtCur(r.payout, r.currency)}</td>
+      <td>${fmtCur(r.revenue, r.currency)}</td>
+      <td>${fmtCur(r.revenue - r.payout, r.currency)}<div style="font-size:10px;color:#6e6e73">${r.revenue>0?(((r.revenue-r.payout)/r.revenue*100).toFixed(1)+'%'):'—'}</div></td>
       <td>${cvr(r.clicks,r.conversions)}</td>
       <td><a href="/admin/export.csv?advertiser=${H(r.advertiser_slug)}&month=${thisMonth}" class="btn btn-ghost">CSV</a></td>
     </tr>`;
@@ -3400,9 +3556,9 @@ ${flashHtml(flash)}
 <div class="cards">
   <div class="card"><div class="lbl">Total Clicks</div><div class="val">${N(totalClicks)}</div></div>
   <div class="card"><div class="lbl">Total Conversions</div><div class="val">${N(totalConversions)}</div></div>
-  <div class="card"><div class="lbl">Approved Payout</div><div class="val green">$${$(approvedPayout)}</div></div>
-  <div class="card"><div class="lbl">Pending Payout</div><div class="val" style="color:#f57f17">$${$(pendingPayout)}</div></div>
-  <div class="card"><div class="lbl">Approved This Month</div><div class="val green">$${$(monthlyPayout)}</div></div>
+  <div class="card"><div class="lbl">Approved Payout</div><div class="val green" style="font-size:18px">${fmtByCurrency(approvedByCurrency)}</div></div>
+  <div class="card"><div class="lbl">Pending Payout</div><div class="val" style="color:#f57f17;font-size:18px">${fmtByCurrency(pendingByCurrency)}</div></div>
+  <div class="card"><div class="lbl">Approved This Month</div><div class="val green" style="font-size:18px">${fmtByCurrency(monthlyByCurrency)}</div></div>
   <div class="card"><div class="lbl">Active Publishers</div><div class="val"><a href="/admin/publishers" style="text-decoration:none">${N(publisherCount)}</a></div></div>
 </div>
 
@@ -3607,7 +3763,10 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   <h2>MMP Sync — ${H(adv.name)}</h2>
   ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
   ${error ? `<div class="form-err">${H(error)}</div>` : ''}
-  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events and auto-approves attributed / auto-rejects organic+fraud conversions matched by <code>click_id</code>. Manual trigger only.</p>
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events and auto-approves non-organic (attributed) / auto-rejects organic conversions matched by <code>click_id</code>. Manual trigger only.</p>
+  <div class="callout" style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#92651a">
+    <strong>Matching requirement:</strong> our <code>click_id</code> must be passed as AppsFlyer's <code>customer_user_id</code> in your tracking link (the sync matches on AppsFlyer's <code>customer_user_id</code>, falling back to <code>appsflyer_id</code>). Attribution is read from <code>media_source</code> (organic ⇒ rejected).
+  </div>
   <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp-sync/run" style="margin-bottom:18px"
         onsubmit="return confirm('Run a manual AppsFlyer sync now?')">${csrfField(csrfToken)}
     <button class="btn btn-primary"${adv.mmp_type==='appsflyer'?'':' disabled'}>Run Sync Now</button>
@@ -3621,7 +3780,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   return adminLayout(`MMP Sync — ${adv.name}`, body);
 }
 
-function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], flash, capUsed = null }) {
+function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], flash, capUsed = null, hasMmpToken = false }) {
   const isEdit = action.includes('/update');
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(adv.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
@@ -3731,11 +3890,11 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
       </div>
       <div class="fg"><label>API Token</label>
         <div style="display:flex;gap:8px;align-items:center">
-          <input type="password" id="mmptoken" name="mmp_api_token" value="${H(adv.mmp_api_token||'')}"
-                 placeholder="AppsFlyer API token" autocomplete="new-password" style="flex:1;font-family:monospace;font-size:12px">
+          <input type="password" id="mmptoken" name="mmp_api_token" value=""
+                 placeholder="${hasMmpToken ? '••••••• (saved) — leave blank to keep' : 'AppsFlyer API token'}" autocomplete="new-password" style="flex:1;font-family:monospace;font-size:12px">
           <button type="button" class="btn btn-ghost" onclick="var i=document.getElementById('mmptoken');i.type=i.type==='password'?'text':'password';this.textContent=i.type==='password'?'Show':'Hide';">Show</button>
         </div>
-        <small>Stored ${mmpKey() ? 'encrypted (AES-256-GCM)' : '<strong style="color:#c62828">in plaintext — set MMP_ENCRYPTION_KEY</strong>'}. Used to pull in-app events from AppsFlyer.</small></div>
+        <small>${hasMmpToken ? 'A token is saved. Enter a new value only to replace it; leave blank to keep the current one. ' : ''}Stored ${mmpKey() ? 'encrypted (AES-256-GCM)' : '<strong style="color:#c62828">in plaintext — set MMP_ENCRYPTION_KEY</strong>'}. Used to pull in-app events from AppsFlyer.</small></div>
       ${isEdit ? `<div style="display:flex;gap:8px;margin-top:6px">
         <button type="submit" formaction="/admin/advertisers/${H(adv.slug)}/mmp-test" formmethod="POST" class="btn btn-ghost">Test Connection</button>
         <a href="/admin/advertisers/${H(adv.slug)}/mmp-sync" class="btn btn-ghost">Sync Dashboard →</a>
@@ -3770,7 +3929,9 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
       <strong>${H(p.username)}</strong>
       ${p.email    ? `<div style="font-size:11px;color:#6e6e73;margin-top:2px">${H(p.email)}</div>` : ''}
       ${p.company  ? `<div style="font-size:11px;color:#8e8e93">${H(p.company)}</div>` : ''}
-      ${p.website  ? `<div style="font-size:11px"><a href="${H(p.website)}" target="_blank" style="color:#0071e3">${H(p.website.replace(/^https?:\/\//,''))}</a></div>` : ''}
+      ${p.website  ? `<div style="font-size:11px">${/^https?:\/\//i.test(p.website)
+        ? `<a href="${H(p.website)}" target="_blank" rel="noopener noreferrer" style="color:#0071e3">${H(p.website.replace(/^https?:\/\//,''))}</a>`
+        : H(p.website)}</div>` : ''}
       ${p.traffic_sources ? `<div style="margin-top:4px">${p.traffic_sources.split(',').map(s => `<span style="background:#f5f5f7;border:1px solid #e0e0e0;border-radius:4px;padding:1px 6px;font-size:10px;margin-right:3px">${H(s)}</span>`).join('')}</div>` : ''}
     </td>
     <td><span class="badge pending">Pending</span></td>
@@ -3793,8 +3954,9 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
   </tr>`).join('');
 
   const rows = publishers.map(p => {
-    const keyBadge = p.api_key
-      ? `<code style="font-size:10px;color:#2e7d32">…${p.api_key.slice(-8)}</code>`
+    const keySuffix = p.api_key_suffix || (p.api_key ? p.api_key.slice(-8) : null);
+    const keyBadge = p.api_key_hash
+      ? `<code style="font-size:10px;color:#2e7d32">…${H(keySuffix || '')}</code>`
       : `<span style="font-size:10px;color:#c62828">revoked</span>`;
     return `<tr>
     <td>
@@ -3820,7 +3982,7 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
             onsubmit="return confirm('Regenerate API key for ${H(p.username)}? The old key stops working immediately.')">${csrfField(csrfToken)}
         <button class="btn btn-ghost">↻ Key</button>
       </form>
-      ${p.api_key ? `<form method="POST" action="/admin/publishers/${p.id}/revoke-key" style="display:inline"
+      ${p.api_key_hash ? `<form method="POST" action="/admin/publishers/${p.id}/revoke-key" style="display:inline"
             onsubmit="return confirm('Revoke API key for ${H(p.username)}?')">${csrfField(csrfToken)}
         <button class="btn btn-danger">Revoke Key</button>
       </form>` : ''}
@@ -3886,7 +4048,7 @@ function renderInvoiceList({ invoices, flash }) {
     <td><code style="font-size:11px">${invNum(inv)}</code></td>
     <td><strong>${H(inv.publisher_name)}</strong></td>
     <td>${MONTHS[inv.month]} ${inv.year}</td>
-    <td>$${$(inv.total_amount)}</td>
+    <td>$${$(inv.total_amount)} <span style="font-size:10px;color:#9ca3af">USD</span></td>
     <td>${statusBadge(inv.status)}</td>
     <td style="font-size:11px;color:#8e8e93">${H(inv.created_at.slice(0,10))}</td>
     <td>
@@ -3914,13 +4076,12 @@ ${flashHtml(flash)}
 // Invoice detail (printable)
 // ---------------------------------------------------------------------------
 
-function renderInvoice({ inv, pub, lines, flash, csrfToken = '' }) {
+function renderInvoice({ inv, pub, lines, totalsByCurrency = [], flash, csrfToken = '' }) {
   const MONTHS = ['','January','February','March','April','May','June',
                   'July','August','September','October','November','December'];
 
   const invNum  = `INV-${inv.year}${String(inv.month).padStart(2,'0')}-${String(inv.id).padStart(4,'0')}`;
   const period  = `${MONTHS[inv.month]} ${inv.year}`;
-  const total   = lines.reduce((s, r) => s + r.payout, 0);
 
   const statusColor = { draft: '#f57f17', sent: '#1565c0', paid: '#2e7d32' };
   const statusLabel = { draft: 'DRAFT', sent: 'SENT', paid: 'PAID' };
@@ -3932,7 +4093,7 @@ function renderInvoice({ inv, pub, lines, flash, csrfToken = '' }) {
     <td>${H(l.adv_name || l.advertiser_slug)}</td>
     <td style="font-size:11px"><span style="background:#e3f2fd;color:#1565c0;padding:2px 6px;border-radius:10px;font-size:10px;font-weight:700;text-transform:uppercase">${H(l.event)}</span></td>
     <td style="font-family:monospace;font-size:11px;color:#6e6e73">${H(l.click_id)}</td>
-    <td style="text-align:right;font-weight:600">$${$(l.payout)}</td>
+    <td style="text-align:right;font-weight:600">${fmtCur(l.payout, l.currency)}</td>
   </tr>`).join('');
 
   const INVOICE_CSS = `
@@ -4026,7 +4187,7 @@ ${adminControls}
       </table>
       <div class="inv-total-row">
         <span class="inv-total-label">Total Due</span>
-        <span class="inv-total-val">$${$(total)}</span>
+        <span class="inv-total-val">${(totalsByCurrency.length ? totalsByCurrency : [{currency:'USD',total:0}]).map(t => fmtCur(t.total, t.currency)).join(' &nbsp;·&nbsp; ')}</span>
       </div>`}
 
   ${inv.notes ? `<div class="inv-notes">${H(inv.notes)}</div>` : ''}
@@ -4036,7 +4197,7 @@ ${adminControls}
   return adminLayout(`Invoice ${invNum}`, body);
 }
 
-function renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, flash, csrfToken = '' }) {
+function renderPaymentsPage({ pub, payments, totalPaid, approvedBalance, approvedByCurrency = [], flash, csrfToken = '' }) {
   const methods  = ['Wire Transfer', 'PayPal', 'USDT', 'Bank Transfer', 'Other'];
   const minPay   = pub.minimum_payout ?? 50;
   const balance  = approvedBalance - totalPaid;
@@ -4054,8 +4215,8 @@ ${flash ? `<div class="flash ${flash.type}">${H(flash.text)}</div>` : ''}
 
 <div class="cards" style="margin-bottom:20px">
   <div class="card"><div class="lbl">Publisher</div><div class="val" style="font-size:18px">${H(pub.username)}</div></div>
-  <div class="card"><div class="lbl">Approved Earnings</div><div class="val green">$${$(approvedBalance)}</div></div>
-  <div class="card"><div class="lbl">Total Paid Out</div><div class="val">$${$(totalPaid)}</div></div>
+  <div class="card"><div class="lbl">Approved Earnings</div><div class="val green" style="font-size:18px">${fmtByCurrency(approvedByCurrency)}</div></div>
+  <div class="card"><div class="lbl">Total Paid Out (USD)</div><div class="val">$${$(totalPaid)}</div></div>
   <div class="card"><div class="lbl">Outstanding Balance</div><div class="val ${balance>0?'green':''}" style="${balance<0?'color:#c62828':''}">$${$(balance)}</div></div>
   <div class="card"><div class="lbl">Minimum Payout</div><div class="val" style="font-size:18px">$${$(minPay)}</div></div>
 </div>
@@ -4143,27 +4304,31 @@ function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, erro
 }
 
 function renderMarketplace({ campaigns, loggedIn, assignedIds, pendingIds, flash }) {
-  const payoutLabel = a => a.payout_type === 'percent' ? `${H(a.payout_amount)}% of loan amount` : `$${$(a.payout_amount)}`;
   const cards = campaigns.map(a => {
     const assigned = assignedIds.has(a.id);
     const pending  = pendingIds.has(a.id);
+    const payoutBig  = a.payout_type === 'percent' ? `${H(a.payout_amount)}%` : `$${$(a.payout_amount)}`;
+    const payoutUnit = a.payout_type === 'percent' ? 'of loan amount' : 'per conversion';
     const action = assigned
-      ? `<span class="btn btn-ghost" style="opacity:.7;cursor:default">✓ Already running</span>`
+      ? `<button class="campaign-apply" disabled>✓ Already running</button>`
       : pending
-        ? `<span class="btn btn-ghost" style="opacity:.7;cursor:default">Application pending</span>`
+        ? `<button class="campaign-apply" disabled>Application pending</button>`
         : `<form method="POST" action="/marketplace/apply" style="margin:0">
              <input type="hidden" name="advertiser_id" value="${H(a.id)}">
-             <button type="submit" class="btn btn-primary">Apply${loggedIn ? '' : ' (log in)'}</button>
+             <button type="submit" class="campaign-apply">Apply to Campaign${loggedIn ? '' : ' — log in'}</button>
            </form>`;
-    return `<div style="border:1px solid #e0e0e0;border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:8px;background:#fff">
+    return `<div class="campaign-card">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-        <strong style="font-size:15px">${H(a.name)}</strong>
-        ${a.category ? `<span class="badge" style="background:#eef2ff;color:#3730a3">${H(a.category)}</span>` : ''}
+        <div>
+          <div style="font-size:14px;font-weight:600">${H(a.name)}</div>
+          <div class="campaign-payout" style="margin-top:4px">${payoutBig}</div>
+          <div style="font-size:10px;color:#9ca3af">${payoutUnit}</div>
+        </div>
+        <div class="campaign-badge">${H(a.category || 'CPA')}</div>
       </div>
-      <div style="font-size:18px;font-weight:700;color:#0F6E56">${payoutLabel(a)}</div>
-      ${a.description ? `<div style="font-size:13px;color:#444">${H(a.description)}</div>` : ''}
-      <div style="font-size:11px;color:#6e6e73">Countries: ${a.countries_allowed ? H(a.countries_allowed) : 'All'}</div>
-      <div style="margin-top:6px">${action}</div>
+      ${a.description ? `<div class="campaign-desc">${H(a.description)}</div>` : '<div style="margin:12px 0"></div>'}
+      <div style="font-size:11px;color:#6b7280;margin-bottom:12px">Countries: ${a.countries_allowed ? H(a.countries_allowed) : 'All'}</div>
+      ${action}
     </div>`;
   }).join('');
 
@@ -4171,12 +4336,24 @@ function renderMarketplace({ campaigns, loggedIn, assignedIds, pendingIds, flash
 <main style="max-width:1000px;margin:0 auto;padding:24px 20px">
   <h1 style="font-size:22px;margin-bottom:4px">Affiliate Marketplace</h1>
   <p style="color:#6e6e73;font-size:13px;margin-bottom:20px">Browse available campaigns and apply to run them.${loggedIn ? '' : ' <a href="/publisher/login?next=%2Fmarketplace">Log in</a> to apply.'}</p>
-  ${flash ? `<div class="login-ok" style="margin-bottom:16px">${H(flash)}</div>` : ''}
+  ${flash ? `<div class="login-ok mp-flash" style="margin-bottom:16px">${H(flash)}</div>` : ''}
   ${campaigns.length === 0
     ? '<div class="empty">No public campaigns available right now.</div>'
     : `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px">${cards}</div>`}
   <div style="margin-top:24px"><a href="${loggedIn ? '/publisher/dashboard' : '/publisher/login'}" class="btn btn-ghost">← ${loggedIn ? 'Dashboard' : 'Publisher login'}</a></div>
-</main>`;
+</main>
+<script>document.addEventListener('DOMContentLoaded',function(){
+  // Stash a toast message when an Apply form is submitted; shown after the redirect.
+  document.querySelectorAll('form[action="/marketplace/apply"]').forEach(function(f){
+    f.addEventListener('submit',function(){ try{ localStorage.setItem('mp_toast','Application submitted — pending review'); }catch(e){} });
+  });
+  // Consume any stashed toast on load (and hide the duplicate server banner).
+  try {
+    var m = localStorage.getItem('mp_toast');
+    if (m) { localStorage.removeItem('mp_toast'); showToast(m,'success');
+      var fl = document.querySelector('.mp-flash'); if (fl) fl.style.display='none'; }
+  } catch(e){}
+});</script>`;
   return pubLayout('Marketplace', body);
 }
 
@@ -4185,6 +4362,9 @@ function renderAdminMarketplace({ pending, csrfToken = '', flash }) {
     <td>${H((p.applied_at||'').slice(0,16))}</td>
     <td><code>${H(p.username)}</code></td>
     <td><strong>${H(p.adv_name)}</strong> <span style="color:#8e8e93;font-size:11px">${H(p.adv_slug)}</span></td>
+    <td>${N(p.active_publishers || 0)}</td>
+    <td>$${$(p.total_paid || 0)}</td>
+    <td>${p.approval_rate == null ? '—%' : p.approval_rate.toFixed(1) + '%'}</td>
     <td><div class="act">
       <form method="POST" action="/admin/marketplace/${H(p.id)}/approve" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-primary">Approve</button></form>
@@ -4199,17 +4379,19 @@ function renderAdminMarketplace({ pending, csrfToken = '', flash }) {
   <section>
     <div class="sh"><h2>Marketplace Applications</h2><span class="meta">${pending.length} pending</span></div>
     ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
+    <p style="font-size:11px;color:#8e8e93;margin:0 0 10px">Per-advertiser stats (active publishers / total approved payout / approval rate) are aggregate figures shown to help your decision.</p>
     ${pending.length === 0
       ? '<div class="empty">No pending applications.</div>'
-      : `<table><thead><tr><th>Applied</th><th>Publisher</th><th>Campaign</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`}
+      : `<table><thead><tr><th>Applied</th><th>Publisher</th><th>Campaign</th><th>Active Pubs</th><th>Total Paid</th><th>Approval</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`}
   </section>
 </main>`;
   return adminLayout('Marketplace Applications', body);
 }
 
 function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
-  assignments = [], allAdvertisers = [], resetLink = null }) {
+  assignments = [], allAdvertisers = [], resetLink = null, newApiKey = null }) {
   const isEdit = action.includes('/update');
+  const keySuffix = pub.api_key_suffix || (pub.api_key ? pub.api_key.slice(-8) : null);
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(pub.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
   ).join('');
@@ -4293,13 +4475,20 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <small>Macros: <code>{click_id}</code> <code>{payout}</code> <code>{event}</code> <code>{advertiser}</code> — fired on every conversion. Up to 3 attempts with 5-min retry on failure.</small>
     </div>
     ${isEdit ? `<div class="fg"><label>API Key</label>
-      ${pub.api_key
-        ? `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
-            <input type="text" id="apiKeyInput" value="${H(pub.api_key)}" readonly
-                   style="font-family:monospace;font-size:12px;flex:1;background:#f5f5f7;color:#1d1d1f">
-            <button type="button" class="btn btn-ghost" onclick="toggleKey()">Show</button>
-            <button type="button" class="btn btn-ghost" onclick="cp(document.getElementById('apiKeyInput'),'${H(pub.api_key)}')">Copy</button>
-          </div>
+      ${newApiKey ? `<div style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:8px">
+            <div style="font-size:11px;font-weight:600;margin-bottom:6px">New API key — copy it now; it will not be shown again.</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input type="text" id="newKeyInput" value="${H(newApiKey)}" readonly
+                     style="font-family:monospace;font-size:12px;flex:1;background:#fff;color:#1d1d1f">
+              <button type="button" class="btn btn-ghost" onclick="cp(document.getElementById('newKeyInput'),'${H(newApiKey)}')">Copy</button>
+            </div>
+          </div>` : ''}
+      ${pub.api_key_hash
+        ? `${newApiKey ? '' : `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+            <input type="text" value="••••••••••• (saved)" readonly disabled
+                   style="font-family:monospace;font-size:12px;flex:1;background:#f5f5f7;color:#6e6e73">
+            ${keySuffix ? `<code style="font-size:11px;color:#2e7d32">…${H(keySuffix)}</code>` : ''}
+          </div>`}
           <div style="display:flex;gap:8px">
             <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline"
                   onsubmit="return confirm('Regenerate API key? The current key stops working immediately.')">${csrfField(csrfToken)}
@@ -4314,7 +4503,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
            <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline">${csrfField(csrfToken)}
              <button class="btn btn-primary">Generate New Key</button>
            </form>`}
-      <small style="display:block;margin-top:8px">Key is masked by default. The publisher sees their key in their portal. Use <code>X-API-Key: kom_live_...</code> header for REST API access.</small>
+      <small style="display:block;margin-top:8px">The full key is shown only once, at generation. Only the last 8 characters are stored for reference. Use <code>X-API-Key: kom_live_...</code> for REST API access.</small>
     </div>` : ''}
     ${isEdit ? `<div class="fg"><label>Their Tracking URLs</label>
       <small style="display:block;margin-bottom:8px">One link per active advertiser — pre-filled with their username.</small>
@@ -4337,20 +4526,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
   ${assignmentSection}
   ${resetSection}
 </div></main>
-<script>
-${CP_JS}
-function toggleKey(){
-  const inp=document.getElementById('apiKeyInput');
-  if(!inp)return;
-  const btn=inp.nextElementSibling;
-  if(inp.type==='password'){inp.type='text';btn.textContent='Hide';}
-  else{inp.type='password';btn.textContent='Show';}
-}
-document.addEventListener('DOMContentLoaded',()=>{
-  const inp=document.getElementById('apiKeyInput');
-  if(inp)inp.type='password';
-});
-</script>`;
+<script>${CP_JS}</script>`;
 
   return adminLayout(title, body);
 }
@@ -4477,7 +4653,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
       ${!gmailOk ? `<div style="background:#fff8e1;border-radius:8px;padding:12px 14px;font-size:12px;color:#f57f17;margin-bottom:12px">
         Set <code>GMAIL_USER</code> and <code>GMAIL_PASS</code> environment variables to enable email.<br>
         Use a Gmail App Password — generate one at
-        <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color:#0071e3">myaccount.google.com/apppasswords</a>.
+        <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer" style="color:#0071e3">myaccount.google.com/apppasswords</a>.
       </div>` : ''}
       <form method="POST" action="/admin/settings/test-email" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-ghost" ${!gmailOk ? 'disabled' : ''}>Send Test Email</button>
@@ -4494,7 +4670,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
       </div>
       ${!tgOk ? `<div style="background:#fff8e1;border-radius:8px;padding:12px 14px;font-size:12px;color:#f57f17;margin-bottom:12px">
         Set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code> environment variables.<br>
-        Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color:#0071e3">@BotFather</a>, then add it to your channel and get the chat ID.
+        Create a bot via <a href="https://t.me/BotFather" target="_blank" rel="noopener noreferrer" style="color:#0071e3">@BotFather</a>, then add it to your channel and get the chat ID.
       </div>` : ''}
       <form method="POST" action="/admin/settings/test-telegram" style="display:inline">${csrfField(csrfToken)}
         <button class="btn btn-ghost" ${!tgOk ? 'disabled' : ''}>Send Test Message</button>
@@ -4725,7 +4901,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     return `<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${H(title)} — Komorebi</title>${fonts}<style>${PUB_CSS}</style></head>
-<body>${body}</body></html>`;
+<body>${body}<script>${PORTAL_JS}</script></body></html>`;
   }
 
   const initials = (pub.username || '??').slice(0, 2).toUpperCase();
@@ -4739,7 +4915,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     docs:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3.5 1h9a.5.5 0 0 1 .5.5v13a.5.5 0 0 1-.5.5h-9A.5.5 0 0 1 3 14.5v-13A.5.5 0 0 1 3.5 1z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 5h5M5.5 8h5M5.5 11h3"/>`),
   };
   const navItem = (href, key, label, external = false) =>
-    `<a href="${href}" class="pub-nav-a${activeTab===key?' active':''}"${external?' target="_blank"':''}>${PICONS[key]||''}<span>${label}</span>${external?'<svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" style="margin-left:auto;opacity:.35"><path d="M6 3h7v7l-2-2-4 4-2-2 4-4L6 3z"/></svg>':''}</a>`;
+    `<a href="${href}" class="pub-nav-a${activeTab===key?' active':''}"${external?' target="_blank" rel="noopener noreferrer"':''}>${PICONS[key]||''}<span>${label}</span>${external?'<svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" style="margin-left:auto;opacity:.35"><path d="M6 3h7v7l-2-2-4 4-2-2 4-4L6 3z"/></svg>':''}</a>`;
 
   return `<!DOCTYPE html><html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -4788,7 +4964,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     </div>
   </div>
 </div>
-<script>${CP_JS}</script>
+<script>${CP_JS}${PORTAL_JS}</script>
 </body></html>`;
 }
 
@@ -4928,7 +5104,7 @@ function renderPubConversions({ pub, conversions }) {
     <td><span class="badge">${H(r.event)}</span></td>
     ${showLoan    ? `<td>${fmtNum(r.loan_amount)}</td>` : ''}
     ${showRevenue ? `<td>${fmtNum(r.revenue)}</td>` : ''}
-    <td>${usdVnd(r.payout)}</td>
+    <td>${fmtCur(r.payout, r.currency)}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
         ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
   </tr>`).join('');
@@ -4945,9 +5121,9 @@ function renderPubConversions({ pub, conversions }) {
   return pubLayout(`${pub.username} — Conversions`, body, pub, 'conversions');
 }
 
-function renderPubPayments({ pub, payments, totalPaid, approvedBal }) {
+function renderPubPayments({ pub, payments, totalPaid, approvedByCurrency = [], approvedBalUsd = 0 }) {
   const minPay  = pub.minimum_payout ?? 50;
-  const balance = approvedBal - totalPaid;
+  const balance = approvedBalUsd - totalPaid; // USD-only (payments + threshold are USD)
   const rows    = payments.map(p => `<tr>
     <td>${H(p.paid_at)}</td>
     <td><strong style="color:#0F6E56">${usdVnd(p.amount_usd)}</strong></td>
@@ -4965,9 +5141,9 @@ function renderPubPayments({ pub, payments, totalPaid, approvedBal }) {
   📅 <strong>Expected next payment:</strong> ${nextPayStr} (first day of next month).
 </div>
 <div class="cards" style="margin-bottom:20px">
-  <div class="card"><div class="lbl">Total Paid Out</div><div class="val blue">$${$(totalPaid)}</div></div>
-  <div class="card"><div class="lbl">Approved Earnings</div><div class="val green">$${$(approvedBal)}</div></div>
-  <div class="card"><div class="lbl">Outstanding Balance</div><div class="val ${balance>0?'green':''}" style="${balance<0?'color:#c62828':''}">$${$(balance)}</div></div>
+  <div class="card"><div class="lbl">Total Paid Out (USD)</div><div class="val blue">$${$(totalPaid)}</div></div>
+  <div class="card"><div class="lbl">Approved Earnings</div><div class="val green" style="font-size:18px">${fmtByCurrency(approvedByCurrency)}</div></div>
+  <div class="card"><div class="lbl">Outstanding Balance (USD)</div><div class="val ${balance>0?'green':''}" style="${balance<0?'color:#c62828':''}">$${$(balance)}</div></div>
   <div class="card"><div class="lbl">Minimum Payout</div><div class="val" style="font-size:18px">$${$(minPay)}</div></div>
 </div>
 <div style="background:${balance>=minPay?'#e8f5ef':'#f5f5f7'};border:1px solid ${balance>=minPay?'#0F6E56':'#e0e0e0'};border-radius:10px;padding:13px 18px;margin-bottom:20px;font-size:13px">
@@ -4987,43 +5163,28 @@ function renderPubPayments({ pub, payments, totalPaid, approvedBal }) {
 }
 
 function renderPubApiAccess({ pub }) {
+  const suffix = pub.api_key_suffix || (pub.api_key ? pub.api_key.slice(-8) : null);
   const body = `
 <main>
 <section>
   <div class="sh"><h2>API Access</h2></div>
   <div style="padding:20px 22px">
-    ${pub.api_key ? `
+    ${pub.api_key_hash ? `
     <p style="font-size:13px;color:#6e6e73;margin-bottom:14px">Use your API key with the <code>X-API-Key</code> header to fetch your stats programmatically. See <a href="/docs#rest-api" style="color:#0F6E56">documentation</a> for details.</p>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px">
-      <input type="text" id="pubApiKey" value="${H(pub.api_key)}" readonly
-             style="font-family:monospace;font-size:12px;flex:1;background:#f5f5f7;border:1px solid #d2d2d7;border-radius:7px;padding:8px 11px">
-      <button class="btn btn-ghost" onclick="togglePubKey()">Show</button>
-      <button class="btn btn-ghost" onclick="cp(document.getElementById('pubApiKey'),'${H(pub.api_key)}')">Copy</button>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <input type="text" value="••••••••••• (saved)" readonly disabled
+             style="font-family:monospace;font-size:12px;flex:1;background:#f5f5f7;border:1px solid #d2d2d7;border-radius:7px;padding:8px 11px;color:#6e6e73">
+      ${suffix ? `<code style="font-size:11px;color:#0F6E56">…${H(suffix)}</code>` : ''}
     </div>
-    <div class="ubox" onclick="cp(this,'curl -H \\'X-API-Key: ${H(pub.api_key)}\\' ${H(BASE_URL)}/api/v1/stats')"
-         style="font-size:11px;color:#555;margin-bottom:20px">
-      curl -H "X-API-Key: ${H(pub.api_key.slice(0,18))}…" ${H(BASE_URL)}/api/v1/stats
-    </div>
+    <p style="font-size:11px;color:#9ca3af;margin-bottom:18px">For security, your full key is shown only once — at the moment it is (re)generated. If you've lost it, ask your account manager to regenerate it.</p>
+    <div style="background:#f5f5f7;border-radius:5px;padding:8px 11px;font-size:11px;color:#555;font-family:monospace;margin-bottom:20px">curl -H "X-API-Key: kom_live_…" ${H(BASE_URL)}/api/v1/stats</div>
     <h3 style="font-size:13px;font-weight:600;margin-bottom:10px">Example Response</h3>
     <pre style="background:#f5f5f7;border-radius:8px;padding:14px;font-size:11px;overflow-x:auto;color:#333">GET /api/v1/stats → { publisher, status, stats: { clicks, conversions, earnings }, by_advertiser }</pre>
     ` : `<div style="color:#c62828;font-size:13px">Your API key has been revoked. Contact your account manager to issue a new one.</div>`}
   </div>
 </section>
 </main>
-<script>
-${CP_JS}
-function togglePubKey(){
-  var inp=document.getElementById('pubApiKey');
-  if(!inp)return;
-  var btn=inp.nextElementSibling;
-  if(inp.type==='password'){inp.type='text';btn.textContent='Hide';}
-  else{inp.type='password';btn.textContent='Show';}
-}
-document.addEventListener('DOMContentLoaded',function(){
-  var inp=document.getElementById('pubApiKey');
-  if(inp)inp.type='password';
-});
-</script>`;
+<script>${CP_JS}</script>`;
   return pubLayout(`${pub.username} — API Access`, body, pub, 'api');
 }
 
@@ -5065,12 +5226,13 @@ function renderPubProfile({ pub, csrfToken = '', flash, error }) {
     </form>
   </div>
 </section>
-</main>`;
+</main>
+${flash ? `<script>document.addEventListener('DOMContentLoaded',function(){showToast(${JSON.stringify(flash)},'success');});</script>` : ''}`;
   return pubLayout(`${pub.username} — Profile`, body, pub, 'profile');
 }
 
 function renderPubDashboard({ pub, totalClicks, totalConversions,
-  totalPayout, pendingPayout, monthlyPayout, monthlyPendingPayout,
+  totalPayout, approvedByCurrency = [], pendingByCurrency = [], monthlyApprovedByCurrency = [], monthlyPendingByCurrency = [],
   advStats, recent, thisMonth, payments = [], totalPaid = 0, subStats = [] }) {
 
   // F17 — "Last updated" caption shown under each stats card (server time, no polling).
@@ -5085,7 +5247,7 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
       <td><code class="xs">${H(s.sub1)}</code></td>
       <td>${N(s.clicks)}</td>
       <td>${N(s.conversions)}</td>
-      <td>${usdVnd(s.payout)}</td>
+      <td>${fmtCur(s.payout, s.currency)}</td>
       <td>${cvr(s.clicks, s.conversions)}</td>
     </tr>`).join('')}</tbody></table>
 </section>`;
@@ -5130,7 +5292,7 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
     </div>
     <div style="font-size:13px;color:#1d1d1f">
       Minimum payout: <strong>$${$(minPay)}</strong> &nbsp;·&nbsp;
-      Approved balance: <strong style="color:#0F6E56">${usdVnd(balance)}</strong>
+      Approved USD balance: <strong style="color:#0F6E56">$${$(balance)}</strong>
       ${totalPaid > 0 ? `&nbsp;·&nbsp; Total paid out: <strong>$${$(totalPaid)}</strong>` : ''}
     </div>
   </div>
@@ -5144,8 +5306,8 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
     <td>${N(a.clicks)}</td>
     <td>${N(a.approved_count)} ${a.pending_count > 0 ? `<span style="color:#f57f17;font-size:10px">+${a.pending_count} pending</span>` : ''}</td>
     <td>
-      <span style="color:#0F6E56;font-weight:600">${usdVnd(a.approved_payout)}</span>
-      ${a.pending_payout > 0 ? `<div style="font-size:10px;color:#f57f17">${usdVnd(a.pending_payout)} pending</div>` : ''}
+      <span style="color:#0F6E56;font-weight:600">${fmtCur(a.approved_payout, a.currency)}</span>
+      ${a.pending_payout > 0 ? `<div style="font-size:10px;color:#f57f17">${fmtCur(a.pending_payout, a.currency)} pending</div>` : ''}
     </td>
     <td>${cvr(a.clicks, a.conversions)}</td>
   </tr>`).join('');
@@ -5163,7 +5325,7 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
     <td>${H(r.adv_name||r.advertiser_slug)}</td>
     <td><code class="xs">${H(r.click_id)}</code></td>
     <td><span class="badge">${H(r.event)}</span></td>
-    <td>${usdVnd(r.payout)}${calc}</td>
+    <td>${fmtCur(r.payout, r.currency)}${calc}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
         ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
   </tr>`;
@@ -5183,10 +5345,15 @@ ${checklist}
 <div class="cards">
   <div class="card"><div class="lbl">Total Clicks</div><div class="val">${N(totalClicks)}</div>${updatedNote}</div>
   <div class="card"><div class="lbl">Total Conversions</div><div class="val">${N(totalConversions)}</div>${updatedNote}</div>
-  <div class="card"><div class="lbl">Approved Earnings</div><div class="val blue">${usdVnd(totalPayout)}</div>${updatedNote}</div>
-  <div class="card"><div class="lbl">Pending Earnings</div><div class="val" style="color:#f57f17">${usdVnd(pendingPayout)}</div>${updatedNote}</div>
-  <div class="card"><div class="lbl">This Month Approved</div><div class="val blue">${usdVnd(monthlyPayout)}</div>${updatedNote}</div>
-  <div class="card"><div class="lbl">This Month Pending</div><div class="val" style="color:#f57f17">${usdVnd(monthlyPendingPayout)}</div>${updatedNote}</div>
+  <div class="card hero">
+    <div class="lbl">Your Approved Balance</div>
+    <div class="val" style="font-size:20px">${fmtByCurrency(approvedByCurrency)}</div>
+    <div style="font-size:11px;color:#0a7c5c;margin-top:8px">USD payout when balance ≥ $${$(minPay)}</div>
+    ${updatedNote}
+  </div>
+  <div class="card"><div class="lbl">Pending Earnings</div><div class="val" style="color:#f57f17;font-size:18px">${fmtByCurrency(pendingByCurrency)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">This Month Approved</div><div class="val blue" style="font-size:18px">${fmtByCurrency(monthlyApprovedByCurrency)}</div>${updatedNote}</div>
+  <div class="card"><div class="lbl">This Month Pending</div><div class="val" style="color:#f57f17;font-size:18px">${fmtByCurrency(monthlyPendingByCurrency)}</div>${updatedNote}</div>
 </div>
 
 ${payoutBanner}
@@ -5868,10 +6035,10 @@ function renderDocs() {
 
       <h3 class="sub-title" id="signed-postbacks">Signed Postbacks (HMAC, optional)</h3>
       <p>An advertiser may be issued a <strong>postback secret</strong>. When a secret is configured, every postback for that advertiser must include a <code>sig</code> parameter or it is rejected with <code>403</code>. Advertisers without a secret accept unsigned postbacks (backward compatible).</p>
-      <p>The signature is a lowercase hex <strong>HMAC-SHA256</strong> of the concatenation <code>click_id + event + payout</code>, keyed by the shared secret:</p>
-      <div class="code-block"><pre>sig = HMAC_SHA256(secret, click_id + event + payout)   <span class="str"># hex digest</span></pre></div>
+      <p>The signature is a lowercase hex <strong>HMAC-SHA256</strong> of the values joined by colons — <code>click_id:event:payout</code> — keyed by the shared secret:</p>
+      <div class="code-block"><pre>sig = HMAC_SHA256(secret, click_id + ":" + event + ":" + payout)   <span class="str"># hex digest</span></pre></div>
       <div class="callout warn">
-        <strong>Base string:</strong> the three values are concatenated with no separator, in order. <code>event</code> defaults to <code>sale</code> and <code>payout</code> to an empty string when omitted — so always send explicit <code>event</code> and <code>payout</code> values when signing.
+        <strong>Base string:</strong> the three values are joined with a colon (<code>:</code>) separator, in order. <code>event</code> defaults to <code>sale</code> and <code>payout</code> to an empty string when omitted — so always send explicit <code>event</code> and <code>payout</code> values when signing.
       </div>
       <div class="code-label">Signed postback URL</div>
       <div class="code-block"><pre>${TRACK_DOMAIN}/postback/<span class="key">{advertiser}</span>?click_id=<span class="str">{click_id}</span>&amp;event=<span class="str">{event}</span>&amp;payout=<span class="str">{payout}</span>&amp;sig=<span class="str">{hmac_sha256_hex}</span></pre></div>

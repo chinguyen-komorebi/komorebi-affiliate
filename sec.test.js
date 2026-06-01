@@ -81,7 +81,7 @@ async function track(slug, pub) {
   ok('B postback without sig → 403', noSig.status === 403);
   const badSig = await fetch(`${BASE}/postback/secadv?click_id=${cB}&event=sale&payout=5&sig=deadbeef`, { redirect: 'manual' });
   ok('B postback with bad sig → 403', badSig.status === 403);
-  const goodSig = crypto.createHmac('sha256', SECRET).update(`${cB}sale5`).digest('hex');
+  const goodSig = crypto.createHmac('sha256', SECRET).update(`${cB}:sale:5`).digest('hex');
   const okRes = await fetch(`${BASE}/postback/secadv?click_id=${cB}&event=sale&payout=5&sig=${goodSig}`, { redirect: 'manual' });
   ok('B postback with valid sig → 200', okRes.status === 200);
   // backward compatible: no secret → unsigned accepted

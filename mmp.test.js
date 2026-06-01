@@ -66,9 +66,10 @@ async function track(slug, pub) {
   // ---- encryption at rest ----
   const stored = db.prepare("SELECT mmp_api_token FROM advertisers WHERE slug='mmpadv'").get().mmp_api_token;
   ok('encrypted token at rest (enc:v1 prefix, not plaintext)', stored.startsWith('enc:v1:') && !stored.includes('VALID-TOKEN'), stored.slice(0, 16));
-  // decrypt-for-display: edit page shows the real token in the field
+  // H2: edit page must NOT contain the decrypted token; field is empty with a "(saved)" placeholder.
   const editHtml = await txt(await admin.req('GET', '/admin/advertisers/mmpadv/edit'));
-  ok('edit page decrypts token for masked field', editHtml.includes('id="mmptoken" name="mmp_api_token" value="VALID-TOKEN"'));
+  ok('H2 edit page does not leak token (empty field + (saved) placeholder)',
+    !editHtml.includes('VALID-TOKEN') && /id="mmptoken" name="mmp_api_token" value=""/.test(editHtml) && editHtml.includes('(saved) — leave blank to keep'));
 
   // ---- test connection ----
   const testRes = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-test', {}, '/admin/advertisers/mmpadv/edit');
@@ -114,6 +115,19 @@ async function track(slug, pub) {
   const runRes2 = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
   const log2 = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
   ok('re-sync matches but approves/rejects 0 (already decided)', log2.matched === 3 && log2.auto_approved === 0 && log2.auto_rejected === 0);
+
+  // ---- QA1: REAL AppsFlyer raw export columns (customer_user_id + media_source) ----
+  const cR1 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cR1}&event=sale`, { redirect: 'manual' });
+  const cR2 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cR2}&event=sale`, { redirect: 'manual' });
+  mock.csv = `appsflyer_id,customer_user_id,event_name,event_time,media_source,campaign\n`
+    + `af-aaa,${cR1},af_purchase,2026-06-01 10:00:00,komorebi_partner,camp_x\n`
+    + `af-bbb,${cR2},af_purchase,2026-06-01 11:00:00,organic,\n`;
+  await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
+  ok('QA1 real export: non-organic media_source → approved', db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR1).status === 'approved');
+  ok('QA1 real export: organic media_source → rejected', db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR2).reason === 'mmp_rejected');
+  const rlog = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
+  ok('QA1 real export: matched 2, approved 1, rejected 1', rlog.events_pulled === 2 && rlog.matched === 2 && rlog.auto_approved === 1 && rlog.auto_rejected === 1,
+    JSON.stringify({ p: rlog.events_pulled, m: rlog.matched, a: rlog.auto_approved, r: rlog.auto_rejected }));
 
   // ---- sync failure path (bad token → mock 401) ----
   await adminPost(admin, '/admin/advertisers/mmpadv/update',
