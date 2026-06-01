@@ -54,9 +54,14 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({
   contentSecurityPolicy: {
-    // TODO (I1, future pass): drop 'unsafe-inline' from scriptSrc/styleSrc by moving
-    // inline scripts/styles to per-request CSP nonces (nonce-<base64>). Requires
-    // threading a nonce through every inline <script>/<style> in the templates.
+    // TODO (I1, dedicated pass): drop 'unsafe-inline' from scriptSrc by moving to
+    // per-request CSP nonces. NON-TRIVIAL: nonces cover <script> elements only, NOT
+    // inline event-handler attributes. Removing 'unsafe-inline' (or adding any nonce,
+    // which makes the browser ignore 'unsafe-inline') will break the ~33 inline
+    // onclick/onsubmit/oninput/onchange handlers in these templates. So the pass must
+    // ALSO refactor every inline handler to delegated addEventListener inside a
+    // nonce'd <script>, then verify in a real browser (e2e is HTTP-only and cannot
+    // detect CSP/handler breakage). styleSrc keeps 'unsafe-inline' for now (lower risk).
     directives: {
       defaultSrc: ["'self'"],
       styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
@@ -579,10 +584,10 @@ async function fireWebhookDailySummary() {
   const totalStr    = curRows.map(r => fmtCur(r.total_payout, r.currency)).join(' · ');
   const approvedStr = curRows.map(r => fmtCur(r.approved_payout, r.currency)).join(' · ');
   const byAdv = db.prepare(`
-    SELECT a.name, COUNT(*) as conversions, COALESCE(MAX(cv.currency),'USD') as currency, COALESCE(SUM(cv.payout),0) as payout
+    SELECT a.name, COUNT(*) as conversions, cv.currency, COALESCE(SUM(cv.payout),0) as payout
     FROM conversions cv JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE date(cv.received_at, '+8 hours') = ?
-    GROUP BY cv.advertiser_slug ORDER BY payout DESC
+    GROUP BY cv.advertiser_slug, cv.currency ORDER BY payout DESC
   `).all(yesterday);
   const advLines = byAdv.map(r => `• ${r.name}: ${r.conversions} conv — ${fmtCur(r.payout, r.currency)}`).join('\n');
   const plain = `\u{1F4CA} Daily Summary ${yesterday} SGT\n` +
@@ -666,18 +671,20 @@ async function sendDailySummaryEmail() {
   const approvedStr = curRows.map(r => fmtCur(r.approved_payout, r.currency)).join(' · ');
 
   const byAdv = db.prepare(`
-    SELECT a.name, COUNT(*) as conversions, COALESCE(MAX(cv.currency),'USD') as currency, COALESCE(SUM(cv.payout),0) as payout
+    SELECT a.name, COUNT(*) as conversions, cv.currency, COALESCE(SUM(cv.payout),0) as payout
     FROM conversions cv
     JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE date(cv.received_at, '+8 hours') = ?
-    GROUP BY cv.advertiser_slug ORDER BY payout DESC
+    GROUP BY cv.advertiser_slug, cv.currency ORDER BY payout DESC
   `).all(yesterday);
 
+  // QA2 — per-currency rows per publisher (a publisher running USD + VND advertisers
+  // appears as separate rows; payouts are never summed across currencies).
   const byPub = db.prepare(`
-    SELECT publisher, COUNT(*) as conversions, COALESCE(MAX(currency),'USD') as currency, COALESCE(SUM(payout),0) as payout
+    SELECT publisher, COUNT(*) as conversions, currency, COALESCE(SUM(payout),0) as payout
     FROM conversions
     WHERE date(received_at, '+8 hours') = ?
-    GROUP BY publisher ORDER BY payout DESC
+    GROUP BY publisher, currency ORDER BY payout DESC
   `).all(yesterday);
 
   // Payout passed pre-formatted (string) so the table renders the currency as-is.
