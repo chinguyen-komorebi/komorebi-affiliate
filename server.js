@@ -3090,6 +3090,46 @@ const fmtByCurrency = (rows) => {
   return nz.map(r => fmtCur(r.total, r.currency)).join(' <span style="color:#9ca3af">·</span> ');
 };
 
+// Mobile off-canvas nav (QA fix): below 640px the fixed sidebar would otherwise
+// fill the viewport and push content off-screen. The hamburger toggles a
+// slide-in sidebar with a backdrop. Shared by the admin panel and publisher
+// portal — pass the layout's own sidebar/topbar selectors.
+function navResponsiveCss(sidebarSel, topbarSel) {
+  return `
+  .nav-burger{display:none;background:transparent;border:none;color:#c9d1d9;font-size:20px;line-height:1;cursor:pointer;padding:3px 8px;margin-right:2px;border-radius:5px;font-family:inherit}
+  .nav-burger:hover{background:rgba(255,255,255,.08);color:#fff}
+  .nav-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:35}
+  @media (max-width:640px){
+    ${topbarSel}{z-index:50}
+    .nav-burger{display:inline-flex;align-items:center}
+    ${sidebarSel}{position:fixed;top:50px;left:0;width:240px;max-width:82vw;height:calc(100vh - 50px);transform:translateX(-100%);transition:transform .25s ease;z-index:40;box-shadow:2px 0 14px rgba(0,0,0,.35)}
+    ${sidebarSel}.open{transform:translateX(0)}
+    .nav-backdrop.open{display:block}
+    body.nav-open{overflow:hidden}
+  }`;
+}
+
+// Generic toggle wiring keyed off data-attributes so it serves both layouts.
+const NAV_TOGGLE_JS = `
+(function(){
+  var burger=document.querySelector('[data-nav-toggle]');
+  var sidebar=document.querySelector('[data-nav-sidebar]');
+  var backdrop=document.querySelector('[data-nav-backdrop]');
+  if(!burger||!sidebar) return;
+  function setOpen(open){
+    sidebar.classList.toggle('open',open);
+    if(backdrop) backdrop.classList.toggle('open',open);
+    document.body.classList.toggle('nav-open',open);
+    burger.setAttribute('aria-expanded',open?'true':'false');
+  }
+  burger.addEventListener('click',function(){setOpen(!sidebar.classList.contains('open'));});
+  if(backdrop) backdrop.addEventListener('click',function(){setOpen(false);});
+  sidebar.addEventListener('click',function(e){ if(e.target.closest('a')) setOpen(false); });
+  window.addEventListener('resize',function(){ if(window.innerWidth>640) setOpen(false); });
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape') setOpen(false); });
+})();
+`;
+
 const ADMIN_CSS = `
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%}
@@ -3195,6 +3235,7 @@ const ADMIN_CSS = `
   .ubox{background:#f9fafb;border:1px solid #e2e6ea;border-radius:5px;padding:6px 38px 6px 10px;font-size:11px;word-break:break-all;color:#374151;font-family:monospace;cursor:pointer;position:relative}
   .ubox:hover{background:#f3f4f6}
   .ubox::after{content:'Copy';position:absolute;top:5px;right:8px;font-size:10px;color:#9ca3af;font-family:'Inter',sans-serif}
+  ${navResponsiveCss('.adm-sidebar', '.adm-topbar')}
 `;
 
 const PUB_CSS = `
@@ -3310,6 +3351,7 @@ const PUB_CSS = `
   .register-wrap{background:#0d1117;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
   .register-card{background:#fff;border-radius:12px;padding:36px;width:100%;max-width:540px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
   .register-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  ${navResponsiveCss('.pub-sidebar', '.pub-topbar')}
 `;
 
 const CP_JS = `
@@ -3418,7 +3460,7 @@ function adminSidebar() {
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
-  return `<aside class="adm-sidebar">
+  return `<aside class="adm-sidebar" id="adm-sidebar" data-nav-sidebar>
   <div class="adm-sb-group">OVERVIEW</div>
   ${nav('/admin',             'Dashboard',   'dashboard',   '/admin')}
   ${nav('/admin/analytics',   'Analytics',   'analytics',   '/admin/analytics')}
@@ -3449,6 +3491,7 @@ function adminLayout(title, body) {
 <div class="adm-shell">
   <header class="adm-topbar">
     <div class="adm-brand">
+      <button class="nav-burger" type="button" data-nav-toggle aria-label="Toggle menu" aria-controls="adm-sidebar" aria-expanded="false">☰</button>
       <div class="adm-logo-mark">${SUN_ICON}</div>
       <div>
         <div class="adm-brand-name">KOMOREBI</div>
@@ -3466,6 +3509,7 @@ function adminLayout(title, body) {
   </header>
   <div class="adm-body">
     ${adminSidebar()}
+    <div class="nav-backdrop" data-nav-backdrop></div>
     <div class="adm-content">
       ${body}
     </div>
@@ -3506,6 +3550,7 @@ function adminLayout(title, body) {
   var _origSubmit=HTMLFormElement.prototype.submit;
   HTMLFormElement.prototype.submit=function(){injectCsrf(this);_origSubmit.call(this);};
 })();
+${NAV_TOGGLE_JS}
 </script>
 </body></html>`;
 }
@@ -5016,6 +5061,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
 <div class="pub-shell">
   <header class="pub-topbar">
     <div class="pub-brand">
+      <button class="nav-burger" type="button" data-nav-toggle aria-label="Toggle menu" aria-controls="pub-sidebar" aria-expanded="false">☰</button>
       <div class="pub-logo-mark">${SUN_ICON}</div>
       <div>
         <div class="pub-brand-name">KOMOREBI</div>
@@ -5030,7 +5076,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     </div>
   </header>
   <div class="pub-body">
-    <aside class="pub-sidebar">
+    <aside class="pub-sidebar" id="pub-sidebar" data-nav-sidebar>
       <div class="pub-sb-group">OVERVIEW</div>
       ${navItem('/publisher/dashboard',   'dashboard',   'Dashboard')}
       ${navItem('/publisher/conversions', 'conversions', 'Conversions')}
@@ -5051,12 +5097,13 @@ function pubLayout(title, body, pub = null, activeTab = null) {
         </div>
       </div>
     </aside>
+    <div class="nav-backdrop" data-nav-backdrop></div>
     <div class="pub-content">
       ${body}
     </div>
   </div>
 </div>
-<script>${CP_JS}${PORTAL_JS}</script>
+<script>${CP_JS}${PORTAL_JS}${NAV_TOGGLE_JS}</script>
 </body></html>`;
 }
 
