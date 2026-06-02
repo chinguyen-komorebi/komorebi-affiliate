@@ -56,7 +56,8 @@ async function track(slug, pub) {
   // create advertiser with AppsFlyer creds + publisher + assignment
   await adminPost(admin, '/admin/advertisers',
     { name: 'MMPAdv', slug: 'mmpadv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed',
-      click_lookback_window: 30, mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'VALID-TOKEN', status: 'active' },
+      click_lookback_window: 30, mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'VALID-TOKEN',
+      mmp_partner_name: 'Komorebi', status: 'active' },
     '/admin/advertisers/new');
   await adminPost(admin, '/admin/publishers', { username: 'mmppub', password: 'mmppubpass1', status: 'active' }, '/admin/publishers/new');
   const advId = db.prepare("SELECT id FROM advertisers WHERE slug='mmpadv'").get().id;
@@ -77,15 +78,20 @@ async function track(slug, pub) {
   // invalid token → 401 from mock
   await adminPost(admin, '/admin/advertisers/mmpadv/update',
     { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,
-      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'BAD-TOKEN', status: 'active' },
+      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'BAD-TOKEN', mmp_partner_name: 'Komorebi', status: 'active' },
     '/admin/advertisers/mmpadv/edit');
   const testBad = await adminPost(admin, '/admin/advertisers/mmpadv/mmp-test', {}, '/admin/advertisers/mmpadv/edit');
   ok('mmp-test invalid creds → ok=0', (testBad.headers.get('location') || '').includes('ok=0'));
   // restore valid token
   await adminPost(admin, '/admin/advertisers/mmpadv/update',
     { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,
-      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'VALID-TOKEN', status: 'active' },
+      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'VALID-TOKEN', mmp_partner_name: 'Komorebi', status: 'active' },
     '/admin/advertisers/mmpadv/edit');
+  // partner/agency name round-trips through the form and persists in the DB
+  ok('mmp_partner_name saved + persists across updates',
+    db.prepare("SELECT mmp_partner_name FROM advertisers WHERE slug='mmpadv'").get().mmp_partner_name === 'Komorebi');
+  const editHtml2 = await txt(await admin.req('GET', '/admin/advertisers/mmpadv/edit'));
+  ok('edit page renders saved Partner / Agency Name', /name="mmp_partner_name" value="Komorebi"/.test(editHtml2));
 
   // ---- create pending conversions, then sync ----
   const cA = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cA}&event=sale`, { redirect: 'manual' });
@@ -116,46 +122,59 @@ async function track(slug, pub) {
   const log2 = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
   ok('re-sync matches but approves/rejects 0 (already decided)', log2.matched === 3 && log2.auto_approved === 0 && log2.auto_rejected === 0);
 
-  // ---- QA1: REAL AppsFlyer raw export columns (customer_user_id + media_source) ----
+  // ---- QA1: REAL AppsFlyer raw export columns (customer_user_id + media_source + partner) ----
+  // Non-organic only auto-approves when the Partner column == the advertiser's
+  // mmp_partner_name ('Komorebi'); a different/blank partner is flagged 'mmp_not_komorebi'.
   const cR1 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cR1}&event=sale`, { redirect: 'manual' });
   const cR2 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cR2}&event=sale`, { redirect: 'manual' });
-  mock.csv = `appsflyer_id,customer_user_id,event_name,event_time,media_source,campaign\n`
-    + `af-aaa,${cR1},af_purchase,2026-06-01 10:00:00,komorebi_partner,camp_x\n`
-    + `af-bbb,${cR2},af_purchase,2026-06-01 11:00:00,organic,\n`;
+  const cR3 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cR3}&event=sale`, { redirect: 'manual' });
+  mock.csv = `appsflyer_id,customer_user_id,event_name,event_time,media_source,campaign,partner\n`
+    + `af-aaa,${cR1},af_purchase,2026-06-01 10:00:00,facebook,camp_x,Komorebi\n`
+    + `af-bbb,${cR2},af_purchase,2026-06-01 11:00:00,organic,,\n`
+    + `af-ccc,${cR3},af_purchase,2026-06-01 12:00:00,facebook,camp_z,Facebook\n`;
   await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
-  ok('QA1 real export: non-organic media_source → approved', db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR1).status === 'approved');
-  ok('QA1 real export: organic media_source → rejected', db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR2).reason === 'mmp_rejected');
+  const qR1 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR1);
+  const qR2 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR2);
+  const qR3 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cR3);
+  ok('QA1 non-organic + partner matches Komorebi → approved', qR1.status === 'approved' && qR1.reason === 'mmp_attributed', JSON.stringify(qR1));
+  ok('QA1 organic → rejected', qR2.status === 'rejected' && qR2.reason === 'mmp_rejected', JSON.stringify(qR2));
+  ok('QA1 non-organic + partner is NOT Komorebi → flagged mmp_not_komorebi', qR3.status === 'pending' && qR3.reason === 'mmp_not_komorebi', JSON.stringify(qR3));
   const rlog = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
-  ok('QA1 real export: matched 2, approved 1, rejected 1', rlog.events_pulled === 2 && rlog.matched === 2 && rlog.auto_approved === 1 && rlog.auto_rejected === 1,
-    JSON.stringify({ p: rlog.events_pulled, m: rlog.matched, a: rlog.auto_approved, r: rlog.auto_rejected }));
+  ok('QA1 sync log: pulled=3 matched=3 approved=1 rejected=1 flagged=1', rlog.events_pulled === 3 && rlog.matched === 3 && rlog.auto_approved === 1 && rlog.auto_rejected === 1 && rlog.flagged === 1,
+    JSON.stringify({ p: rlog.events_pulled, m: rlog.matched, a: rlog.auto_approved, r: rlog.auto_rejected, f: rlog.flagged }));
 
-  // ---- QA2: ACTUAL AppsFlyer export header casing — Title Case with spaces ----
-  // The real export ships "Customer User ID","Media Source",… (not customer_user_id).
-  // parseCSV normalizes headers, so the same attribution must hold. Also covers the
-  // "restricted" media_source → flagged-for-manual-review (left pending) policy.
+  // ---- QA2: ACTUAL AppsFlyer export header casing — Title Case with spaces, incl. "Partner" ----
+  // The real export ships "Customer User ID","Media Source","Partner",… (not snake_case).
+  // parseCSV normalizes headers, so the same attribution must hold. Covers all four
+  // outcomes: approved (partner match), rejected (organic), and the two flag reasons
+  // (restricted, and non-organic with no/other partner → mmp_not_komorebi).
   const cT1 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cT1}&event=sale`, { redirect: 'manual' });
   const cT2 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cT2}&event=sale`, { redirect: 'manual' });
   const cT3 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cT3}&event=sale`, { redirect: 'manual' });
-  mock.csv = `AppsFlyer ID,Customer User ID,Event Name,Event Time,Media Source,Campaign,Adset,Ad,Site ID\n`
-    + `af-t1,${cT1},af_purchase,2026-06-01 10:00:00,komorebi_partner,camp_x,set_a,ad_1,site_9\n`
-    + `af-t2,${cT2},af_purchase,2026-06-01 11:00:00,organic,,,,\n`
-    + `af-t3,${cT3},af_purchase,2026-06-01 12:00:00,restricted,,,,\n`;
+  const cT4 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cT4}&event=sale`, { redirect: 'manual' });
+  mock.csv = `AppsFlyer ID,Customer User ID,Event Name,Event Time,Media Source,Campaign,Adset,Ad,Site ID,Partner\n`
+    + `af-t1,${cT1},af_purchase,2026-06-01 10:00:00,facebook,camp_x,set_a,ad_1,site_9,Komorebi\n`
+    + `af-t2,${cT2},af_purchase,2026-06-01 11:00:00,organic,,,,,\n`
+    + `af-t3,${cT3},af_purchase,2026-06-01 12:00:00,restricted,,,,,\n`
+    + `af-t4,${cT4},af_purchase,2026-06-01 13:00:00,googleads,,,,,\n`;
   await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
   const tA = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cT1);
   const tO = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cT2);
   const tR = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cT3);
-  ok('QA2 Title Case headers: non-organic Media Source → approved', tA.status === 'approved' && tA.reason === 'mmp_attributed', JSON.stringify(tA));
-  ok('QA2 Title Case headers: organic Media Source → rejected', tO.status === 'rejected' && tO.reason === 'mmp_rejected', JSON.stringify(tO));
-  ok('QA2 restricted Media Source → left pending + flagged for review', tR.status === 'pending' && tR.reason === 'mmp_restricted', JSON.stringify(tR));
+  const tN = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cT4);
+  ok('QA2 Title Case + partner match → approved', tA.status === 'approved' && tA.reason === 'mmp_attributed', JSON.stringify(tA));
+  ok('QA2 Title Case organic → rejected', tO.status === 'rejected' && tO.reason === 'mmp_rejected', JSON.stringify(tO));
+  ok('QA2 restricted Media Source → flagged mmp_restricted', tR.status === 'pending' && tR.reason === 'mmp_restricted', JSON.stringify(tR));
+  ok('QA2 non-organic + no/other partner → flagged mmp_not_komorebi', tN.status === 'pending' && tN.reason === 'mmp_not_komorebi', JSON.stringify(tN));
   const tlog = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
-  ok('QA2 sync log: pulled=3 matched=3 approved=1 rejected=1 flagged=1',
-    tlog.events_pulled === 3 && tlog.matched === 3 && tlog.auto_approved === 1 && tlog.auto_rejected === 1 && tlog.flagged === 1,
+  ok('QA2 sync log: pulled=4 matched=4 approved=1 rejected=1 flagged=2',
+    tlog.events_pulled === 4 && tlog.matched === 4 && tlog.auto_approved === 1 && tlog.auto_rejected === 1 && tlog.flagged === 2,
     JSON.stringify({ p: tlog.events_pulled, m: tlog.matched, a: tlog.auto_approved, r: tlog.auto_rejected, f: tlog.flagged }));
 
   // ---- sync failure path (bad token → mock 401) ----
   await adminPost(admin, '/admin/advertisers/mmpadv/update',
     { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,
-      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'BAD-TOKEN', status: 'active' },
+      mmp_type: 'appsflyer', mmp_app_id: 'app1', mmp_api_token: 'BAD-TOKEN', mmp_partner_name: 'Komorebi', status: 'active' },
     '/admin/advertisers/mmpadv/edit');
   await adminPost(admin, '/admin/advertisers/mmpadv/mmp-sync/run', {}, '/admin/advertisers/mmpadv/mmp-sync');
   const failLog = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();

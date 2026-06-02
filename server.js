@@ -204,10 +204,14 @@ function decryptToken(stored) {
 // event_name, event_time, media_source, campaign (NOT click_id / status). We therefore:
 //   - take click_id from customer_user_id (the value the tracking link sets), then
 //     fall back to appsflyer_id, then to a literal click_id column;
-//   - derive attribution from media_source: organic → reject; "restricted" (attributed
-//     to a privacy-restricted SRN such as Facebook/Google, i.e. NOT our affiliate) →
-//     flag for manual review (left pending); anything else → approve. Falls back to a
-//     literal status column (attributed/organic/fraud) for the non-real-export format.
+//   - derive attribution from media_source + the "Partner" (agency) column:
+//       organic                                   → reject;
+//       "restricted" (privacy-restricted SRN)      → flag for review (pending);
+//       non-organic AND Partner == mmp_partner_name → approve (our affiliate link);
+//       non-organic AND Partner != our name/blank  → flag for review ('mmp_not_komorebi').
+//     A blank media_source falls back to a literal status column (attributed/organic/
+//     fraud) for the non-real-export format. A blank mmp_partner_name means nothing
+//     non-organic auto-approves — every such row is flagged — which is the safe default.
 async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
   const token = decryptToken(adv.mmp_api_token);
   if (!token) throw new Error('No API token configured');
@@ -217,13 +221,22 @@ async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
   const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}`, accept: 'text/csv' }, signal: AbortSignal.timeout(30_000) });
   if (!resp.ok) throw new Error(`AppsFlyer API HTTP ${resp.status}`);
   const rows = parseCSV(await resp.text()); // headers lowercased + underscored by parseCSV
+  const wantPartner = (adv.mmp_partner_name || '').trim().toLowerCase();
   return rows
     .map(r => {
       const click_id = (r.customer_user_id || r.appsflyer_id || r.click_id || r.clickid || '').trim();
       const ms = (r.media_source != null ? String(r.media_source) : '').trim().toLowerCase();
       let status;
-      if (ms) status = ms === 'organic' ? 'organic' : (ms === 'restricted' ? 'restricted' : 'attributed'); // real export
-      else    status = (r.status || r.af_status || '').trim().toLowerCase(); // fallback format
+      if (ms) {                                                  // real export
+        if (ms === 'organic')         status = 'organic';
+        else if (ms === 'restricted') status = 'restricted';
+        else {
+          // Non-organic: only OUR affiliate when the Partner (agency) column matches the
+          // configured name. Otherwise it's another network's attribution — flag, don't pay.
+          const partner = (r.partner != null ? String(r.partner) : '').trim().toLowerCase();
+          status = (wantPartner && partner === wantPartner) ? 'attributed' : 'not_komorebi';
+        }
+      } else  status = (r.status || r.af_status || '').trim().toLowerCase(); // fallback format
       return { click_id, status };
     })
     .filter(r => r.click_id || r.status);
@@ -273,7 +286,10 @@ async function runMmpSync(adv) {
     else if (s === 'organic' || s === 'fraud' || s === 'rejected')        { setStatus.run('rejected', 'mmp_rejected', conv.id); rejected++; }
     // "restricted" = attributed to a privacy-restricted SRN, not our affiliate. Leave the
     // conversion pending (tagged so an admin can review) rather than auto-deciding it.
-    else if (s === 'restricted') { setStatus.run('pending', 'mmp_restricted', conv.id); flagged++; }
+    else if (s === 'restricted')   { setStatus.run('pending', 'mmp_restricted', conv.id); flagged++; }
+    // Non-organic but attributed to a partner that isn't us (or no partner set): not our
+    // attribution, so don't auto-pay — flag pending for a human to confirm/deny.
+    else if (s === 'not_komorebi') { setStatus.run('pending', 'mmp_not_komorebi', conv.id); flagged++; }
   }
 
   db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, flagged, errors, status) VALUES (?,?,?,?,?,?,?,?)')
@@ -1994,14 +2010,15 @@ app.post('/admin/advertisers', requireAdmin, (req, res) => {
   const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
   const mmpToken = encryptToken((req.body.mmp_api_token || '').trim() || null);
+  const mmpPartnerName = (req.body.mmp_partner_name || '').trim() || null;
   const s = slug || slugify(name);
   if (!name || !s) return res.send(renderAdvForm({ title: 'New Advertiser', action: '/admin/advertisers',
     adv: req.body, error: 'Name and slug are required.', csrfToken: req.session.csrfToken }));
   if (!/^[a-z0-9-]+$/.test(s)) return res.send(renderAdvForm({ title: 'New Advertiser',
     action: '/admin/advertisers', adv: req.body, error: 'Slug must be lowercase letters, numbers, and hyphens.', csrfToken: req.session.csrfToken }));
   try {
-    db.prepare('INSERT INTO advertisers (slug, name, offer_url, payout_amount, payout_type, click_lookback_window, monthly_conversion_cap, is_public, category, description, countries_allowed, postback_secret, mmp_type, mmp_app_id, mmp_api_token, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(s, name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap, isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, status || 'active');
+    db.prepare('INSERT INTO advertisers (slug, name, offer_url, payout_amount, payout_type, click_lookback_window, monthly_conversion_cap, is_public, category, description, countries_allowed, postback_secret, mmp_type, mmp_app_id, mmp_api_token, mmp_partner_name, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(s, name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap, isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, mmpPartnerName, status || 'active');
     logAudit('advertiser.created', 'advertiser', s,
       { name: name.trim(), slug: s, offer_url: offer_url || '', payout_type: payoutType, click_lookback_window: lookback, monthly_conversion_cap: cap, status: status || 'active' }, req);
     res.redirect(`/admin?msg=Advertiser+%22${encodeURIComponent(name)}%22+created`);
@@ -2132,6 +2149,7 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
   const mmpTokenRaw = (req.body.mmp_api_token || '').trim();
+  const mmpPartnerName = (req.body.mmp_partner_name || '').trim() || null;
   const { slug } = req.params;
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
@@ -2149,17 +2167,17 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   if (isReset) {
     db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
         monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
-        mmp_type=?, mmp_app_id=?, mmp_api_token=?,
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, mmp_partner_name=?,
         status='active', cap_reset_month=?, cap_reset_at=datetime('now'),
         cap_alert_month=strftime('%Y-%m','now'), cap_alerted_80=0, cap_alerted_100=0 WHERE slug=?`)
       .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
-        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, submittedReset, slug);
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, mmpPartnerName, submittedReset, slug);
   } else {
     db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
         monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
-        mmp_type=?, mmp_app_id=?, mmp_api_token=?, status=? WHERE slug=?`)
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, mmp_partner_name=?, status=? WHERE slug=?`)
       .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
-        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, status || 'active', slug);
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, mmpPartnerName, status || 'active', slug);
   }
   logAudit('advertiser.updated', 'advertiser', slug,
     { name: name.trim(), offer_url: offer_url || '', payout_amount: parseFloat(payout_amount) || 0, payout_type: payoutType,
@@ -3853,7 +3871,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   <h2>MMP Sync — ${H(adv.name)}</h2>
   ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
   ${error ? `<div class="form-err">${H(error)}</div>` : ''}
-  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events and auto-approves non-organic (attributed) / auto-rejects organic conversions matched by <code>click_id</code>. Events with <code>media_source = restricted</code> (attributed to a privacy-restricted network, not your affiliate) are left <strong>pending and flagged</strong> for manual review. Manual trigger only.</p>
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events matched by <code>click_id</code>. Auto-rejects <code>organic</code>; auto-approves non-organic events <strong>only when the <code>Partner</code> column matches this advertiser's Partner / Agency Name</strong> (set in the advertiser's MMP credentials). Events that are <code>restricted</code>, or non-organic but attributed to a different partner (<code>mmp_not_komorebi</code>), are left <strong>pending and flagged</strong> for manual review. Manual trigger only.</p>
   <div class="callout" style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#92651a">
     <strong>Matching requirement:</strong> our <code>click_id</code> must be passed as AppsFlyer's <code>customer_user_id</code> in your tracking link (the sync matches on AppsFlyer's <code>customer_user_id</code>, falling back to <code>appsflyer_id</code>). Attribution is read from <code>media_source</code> (organic ⇒ rejected).
   </div>
@@ -3985,6 +4003,9 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
           <button type="button" class="btn btn-ghost" data-toggle-visibility="mmptoken">Show</button>
         </div>
         <small>${hasMmpToken ? 'A token is saved. Enter a new value only to replace it; leave blank to keep the current one. ' : ''}Stored ${mmpKey() ? 'encrypted (AES-256-GCM)' : '<strong style="color:#c62828">in plaintext — set MMP_ENCRYPTION_KEY</strong>'}. Used to pull in-app events from AppsFlyer.</small></div>
+      <div class="fg"><label>Partner / Agency Name</label>
+        <input type="text" name="mmp_partner_name" value="${H(adv.mmp_partner_name||'')}" placeholder="e.g. Komorebi">
+        <small>The exact string AppsFlyer puts in the <code>Partner</code> column for conversions attributed to Komorebi (case-insensitive). On sync, non-organic events only auto-approve when the Partner matches this; others are flagged for manual review (<code>mmp_not_komorebi</code>). <strong>Leave blank to flag all non-organic events</strong> rather than auto-approving them.</small></div>
       ${isEdit ? `<div style="display:flex;gap:8px;margin-top:6px">
         <button type="submit" formaction="/admin/advertisers/${H(adv.slug)}/mmp-test" formmethod="POST" class="btn btn-ghost">Test Connection</button>
         <a href="/admin/advertisers/${H(adv.slug)}/mmp-sync" class="btn btn-ghost">Sync Dashboard →</a>

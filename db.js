@@ -69,6 +69,10 @@ if (!advCols.includes('postback_secret'))   db.exec('ALTER TABLE advertisers ADD
 if (!advCols.includes('mmp_type'))      db.exec("ALTER TABLE advertisers ADD COLUMN mmp_type TEXT NOT NULL DEFAULT 'none'");
 if (!advCols.includes('mmp_app_id'))    db.exec('ALTER TABLE advertisers ADD COLUMN mmp_app_id TEXT');
 if (!advCols.includes('mmp_api_token')) db.exec('ALTER TABLE advertisers ADD COLUMN mmp_api_token TEXT');
+// Partner/agency name AppsFlyer uses to identify Komorebi as the attributing agency
+// (CSV "Partner" column). Non-organic events only auto-approve when this matches; a
+// blank value means nothing auto-approves (everything non-organic is flagged for review).
+if (!advCols.includes('mmp_partner_name')) db.exec('ALTER TABLE advertisers ADD COLUMN mmp_partner_name TEXT');
 
 // ---------------------------------------------------------------------------
 // Clicks  (advertiser_slug added via migration for existing dbs)
