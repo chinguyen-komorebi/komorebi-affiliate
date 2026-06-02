@@ -212,15 +212,11 @@ function decryptToken(stored) {
 //     A blank media_source falls back to a literal status column (attributed/organic/
 //     fraud) for the non-real-export format. A blank mmp_partner_name means nothing
 //     non-organic auto-approves — every such row is flagged — which is the safe default.
-async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
-  const token = decryptToken(adv.mmp_api_token);
-  if (!token) throw new Error('No API token configured');
-  if (!adv.mmp_app_id) throw new Error('No app ID configured');
-  const url = `${MMP_APPSFLYER_BASE}/api/raw-data/export/app/${encodeURIComponent(adv.mmp_app_id)}/in_app_events_report/v5`
-    + `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&maximum_rows=${maxRows}`;
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}`, accept: 'text/csv' }, signal: AbortSignal.timeout(30_000) });
-  if (!resp.ok) throw new Error(`AppsFlyer API HTTP ${resp.status}`);
-  const rows = parseCSV(await resp.text()); // headers lowercased + underscored by parseCSV
+// Parse an AppsFlyer in-app-events CSV (string or Buffer) into [{click_id, status}]
+// using the attribution rules above. Shared by the API pull (mmpFetchEvents) and the
+// admin CSV upload route so both reconcile identically.
+function mmpEventsFromCSV(csvInput, adv) {
+  const rows = parseCSV(csvInput); // headers lowercased + underscored by parseCSV
   const wantPartner = (adv.mmp_partner_name || '').trim().toLowerCase();
   return rows
     .map(r => {
@@ -242,6 +238,17 @@ async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
     .filter(r => r.click_id || r.status);
 }
 
+async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
+  const token = decryptToken(adv.mmp_api_token);
+  if (!token) throw new Error('No API token configured');
+  if (!adv.mmp_app_id) throw new Error('No app ID configured');
+  const url = `${MMP_APPSFLYER_BASE}/api/raw-data/export/app/${encodeURIComponent(adv.mmp_app_id)}/in_app_events_report/v5`
+    + `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&maximum_rows=${maxRows}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}`, accept: 'text/csv' }, signal: AbortSignal.timeout(30_000) });
+  if (!resp.ok) throw new Error(`AppsFlyer API HTTP ${resp.status}`);
+  return mmpEventsFromCSV(await resp.text(), adv);
+}
+
 // Lightweight connection test — a 1-row report request validates token + app access.
 async function mmpTestConnection(adv) {
   const token = decryptToken(adv.mmp_api_token);
@@ -257,21 +264,11 @@ async function mmpTestConnection(adv) {
   } catch (e) { return { ok: false, message: `Connection error: ${e.message}` }; }
 }
 
-// Manual sync: pull last 24h of events, match by click_id, auto-approve/reject
-// pending conversions, log the run, and send a Telegram summary.
-async function runMmpSync(adv) {
-  const fromStr = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 10);
-  const toStr   = new Date().toISOString().slice(0, 10);
-  let events;
-  try {
-    events = await mmpFetchEvents(adv, fromStr, toStr);
-  } catch (e) {
-    db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, errors, status) VALUES (?,?,?,?,?,?,?)')
-      .run(adv.slug, 0, 0, 0, 0, JSON.stringify([e.message]), 'failed');
-    sendTelegram(`\u{274C} MMP sync failed for <b>${adv.name}</b>: ${e.message}`).catch(() => {});
-    return { ok: false, error: e.message };
-  }
-
+// Reconcile a set of {click_id, status} events against this advertiser's pending
+// conversions: auto-approve/reject/flag, log the run (tagged by `source`), and send a
+// Telegram summary. Shared by the API sync and the CSV upload. `source` is 'sync' or
+// 'csv_upload'; it is recorded on the mmp_sync_log row.
+function reconcileMmpEvents(adv, events, source = 'sync') {
   let matched = 0, approved = 0, rejected = 0, flagged = 0; const errors = [];
   const findConv  = db.prepare("SELECT id, status FROM conversions WHERE advertiser_slug = ? AND click_id = ? ORDER BY (status='pending') DESC, id DESC LIMIT 1");
   const setStatus = db.prepare('UPDATE conversions SET status = ?, reason = ? WHERE id = ?');
@@ -292,10 +289,27 @@ async function runMmpSync(adv) {
     else if (s === 'not_komorebi') { setStatus.run('pending', 'mmp_not_komorebi', conv.id); flagged++; }
   }
 
-  db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, flagged, errors, status) VALUES (?,?,?,?,?,?,?,?)')
-    .run(adv.slug, events.length, matched, approved, rejected, flagged, errors.length ? JSON.stringify(errors.slice(0, 500)) : null, 'success');
-  sendTelegram(`\u{1F4E5} MMP sync — <b>${adv.name}</b>: ${events.length} pulled, ${matched} matched, ${approved} auto-approved, ${rejected} auto-rejected${flagged ? `, ${flagged} flagged for review` : ''}.`).catch(() => {});
+  db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, flagged, errors, status, source) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(adv.slug, events.length, matched, approved, rejected, flagged, errors.length ? JSON.stringify(errors.slice(0, 500)) : null, 'success', source);
+  const label = source === 'csv_upload' ? 'MMP CSV upload' : 'MMP sync';
+  sendTelegram(`\u{1F4E5} ${label} — <b>${adv.name}</b>: ${events.length} ${source === 'csv_upload' ? 'rows' : 'pulled'}, ${matched} matched, ${approved} auto-approved, ${rejected} auto-rejected${flagged ? `, ${flagged} flagged for review` : ''}.`).catch(() => {});
   return { ok: true, events_pulled: events.length, matched, auto_approved: approved, auto_rejected: rejected, flagged, errors };
+}
+
+// Manual sync: pull last 24h of events from the AppsFlyer API, then reconcile.
+async function runMmpSync(adv) {
+  const fromStr = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 10);
+  const toStr   = new Date().toISOString().slice(0, 10);
+  let events;
+  try {
+    events = await mmpFetchEvents(adv, fromStr, toStr);
+  } catch (e) {
+    db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, errors, status, source) VALUES (?,?,?,?,?,?,?,?)')
+      .run(adv.slug, 0, 0, 0, 0, JSON.stringify([e.message]), 'failed', 'sync');
+    sendTelegram(`\u{274C} MMP sync failed for <b>${adv.name}</b>: ${e.message}`).catch(() => {});
+    return { ok: false, error: e.message };
+  }
+  return reconcileMmpEvents(adv, events, 'sync');
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,10 +1871,10 @@ app.post('/admin/logout', (req, res) => {
 // CSRF verification for all admin POST routes except /login and /logout
 app.post('/admin/*', (req, res, next) => {
   if (req.path.endsWith('/login') || req.path.endsWith('/logout')) return next();
-  // Multipart routes (e.g. /reconcile) parse their body via multer inside the
-  // handler, so req.body._csrf isn't available yet here — those routes call
-  // verifyCsrf themselves after the upload is parsed.
-  if (req.path.endsWith('/reconcile')) return next();
+  // Multipart routes (e.g. /reconcile, /mmp-sync/upload-csv) parse their body via
+  // multer inside the handler, so req.body._csrf isn't available yet here — those
+  // routes verify CSRF themselves after the upload is parsed.
+  if (req.path.endsWith('/reconcile') || req.path.endsWith('/mmp-sync/upload-csv')) return next();
   verifyCsrf(req, res, next);
 });
 
@@ -2076,6 +2090,42 @@ app.post('/admin/advertisers/:slug/mmp-sync/run', requireAdmin, async (req, res)
     ? `Sync complete — ${r.events_pulled} pulled, ${r.matched} matched, ${r.auto_approved} approved, ${r.auto_rejected} rejected${r.flagged ? `, ${r.flagged} flagged for review` : ''}`
     : `Sync failed — ${r.error}`;
   res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=${encodeURIComponent(msg)}&ok=${r.ok ? '1' : '0'}`);
+});
+
+// Upload an AppsFlyer in-app-events export and reconcile it like a sync run. Multipart,
+// so multer parses the body first (populating req.body for the CSRF check) — same
+// pattern as /reconcile. No API token required: the file IS the data.
+app.post('/admin/advertisers/:slug/mmp-sync/upload-csv', requireAdmin, (req, res) => {
+  csvUpload(req, res, err => {
+    if (err) return res.redirect(`/admin/advertisers/${req.params.slug}/mmp-sync?msg=${encodeURIComponent(err.message)}&ok=0`);
+
+    // CSRF check now that multer has populated req.body from the multipart form
+    const bodyToken    = (req.body._csrf || '').trim();
+    const sessionToken = req.session.csrfToken || '';
+    if (!bodyToken || !sessionToken || bodyToken !== sessionToken) {
+      return res.status(403).send('Invalid CSRF token');
+    }
+
+    const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+    if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+    if (!req.file) return res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=No+file+uploaded&ok=0`);
+
+    const filename = req.file.originalname;
+    let r;
+    try {
+      const events = mmpEventsFromCSV(req.file.buffer, adv);
+      r = reconcileMmpEvents(adv, events, 'csv_upload');
+    } catch (e) {
+      db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, errors, status, source) VALUES (?,?,?,?,?,?,?,?)')
+        .run(adv.slug, 0, 0, 0, 0, JSON.stringify([`CSV "${filename}": ${e.message}`]), 'failed', 'csv_upload');
+      return res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=${encodeURIComponent(`Could not parse "${filename}": ${e.message}`)}&ok=0`);
+    }
+
+    logAudit('advertiser.mmp_csv_upload', 'advertiser', adv.slug,
+      { filename, events_pulled: r.events_pulled, matched: r.matched, approved: r.auto_approved, rejected: r.auto_rejected, flagged: r.flagged }, req);
+    const msg = `Uploaded "${filename}" — ${r.events_pulled} rows, ${r.matched} matched, ${r.auto_approved} approved, ${r.auto_rejected} rejected${r.flagged ? `, ${r.flagged} flagged for review` : ''}`;
+    res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=${encodeURIComponent(msg)}&ok=1`);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3854,8 +3904,10 @@ ${flashHtml(flash)}
 function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   const rows = logs.map(l => {
     let errCount = 0; try { errCount = l.errors ? JSON.parse(l.errors).length : 0; } catch { errCount = l.errors ? 1 : 0; }
+    const srcLabel = l.source === 'csv_upload' ? 'CSV upload' : 'API sync';
     return `<tr>
       <td style="white-space:nowrap;font-size:11px">${H((l.synced_at||'').slice(0,16))}</td>
+      <td style="font-size:11px;color:#6e6e73;white-space:nowrap">${H(srcLabel)}</td>
       <td><span class="badge ${l.status==='success'?'active':'rejected'}">${H(l.status)}</span></td>
       <td>${N(l.events_pulled)}</td>
       <td>${N(l.matched)}</td>
@@ -3875,14 +3927,22 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   <div class="callout" style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#92651a">
     <strong>Matching requirement:</strong> our <code>click_id</code> must be passed as AppsFlyer's <code>customer_user_id</code> in your tracking link (the sync matches on AppsFlyer's <code>customer_user_id</code>, falling back to <code>appsflyer_id</code>). Attribution is read from <code>media_source</code> (organic ⇒ rejected).
   </div>
-  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp-sync/run" style="margin-bottom:18px"
-        data-confirm="Run a manual AppsFlyer sync now?">${csrfField(csrfToken)}
-    <button class="btn btn-primary"${adv.mmp_type==='appsflyer'?'':' disabled'}>Run Sync Now</button>
-    ${adv.mmp_type==='appsflyer' ? '' : '<small style="margin-left:8px;color:#8e8e93">Set MMP Type to AppsFlyer first.</small>'}
-  </form>
+  <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp-sync/run" style="margin:0"
+          data-confirm="Run a manual AppsFlyer sync now?">${csrfField(csrfToken)}
+      <button class="btn btn-primary"${adv.mmp_type==='appsflyer'?'':' disabled'}>Run Sync Now</button>
+      ${adv.mmp_type==='appsflyer' ? '' : '<small style="margin-left:8px;color:#8e8e93">Set MMP Type to AppsFlyer first.</small>'}
+    </form>
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp-sync/upload-csv" enctype="multipart/form-data"
+          style="margin:0;display:flex;gap:8px;align-items:center">${csrfField(csrfToken)}
+      <input type="file" name="csv_file" accept=".csv" required style="font-size:13px;max-width:340px">
+      <button class="btn btn-ghost">Upload AppsFlyer CSV</button>
+    </form>
+  </div>
+  <small style="display:block;color:#8e8e93;margin-bottom:18px">Upload a downloaded AppsFlyer in-app-events export to reconcile it the same way as a live sync — no API token required.</small>
   ${logs.length === 0
     ? '<div class="empty">No sync runs yet.</div>'
-    : `<table><thead><tr><th>When</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Flagged</th><th>Issues</th></tr></thead>
+    : `<table><thead><tr><th>When</th><th>Source</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Flagged</th><th>Issues</th></tr></thead>
         <tbody>${rows}</tbody></table>`}
 </div></main>`;
   return adminLayout(`MMP Sync — ${adv.name}`, body);
