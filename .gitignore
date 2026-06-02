@@ -2,6 +2,9 @@
 affiliate.db
 affiliate.db-wal
 affiliate.db-shm
+sessions.db
+sessions.db-wal
+sessions.db-shm
 *.db
 *.db-wal
 *.db-shm
