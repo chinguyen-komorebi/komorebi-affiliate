@@ -171,6 +171,42 @@ async function track(slug, pub) {
     tlog.events_pulled === 4 && tlog.matched === 4 && tlog.auto_approved === 1 && tlog.auto_rejected === 1 && tlog.flagged === 2,
     JSON.stringify({ p: tlog.events_pulled, m: tlog.matched, a: tlog.auto_approved, r: tlog.auto_rejected, f: tlog.flagged }));
 
+  // ---- CSV upload: reconcile an uploaded AppsFlyer export (multipart, source='csv_upload') ----
+  // Mirrors a real downloaded export filename; no API token is used for this path. The
+  // partner gate (PR #2) applies here too — non-organic only approves when the Partner
+  // column matches the advertiser's mmp_partner_name ('Komorebi'); otherwise mmp_not_komorebi.
+  const cU1 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cU1}&event=sale`, { redirect: 'manual' });
+  const cU2 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cU2}&event=sale`, { redirect: 'manual' });
+  const cU3 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cU3}&event=sale`, { redirect: 'manual' });
+  const cU4 = await track('mmpadv', 'mmppub'); await fetch(`${BASE}/postback/mmpadv?click_id=${cU4}&event=sale`, { redirect: 'manual' });
+  const uploadCsv = `AppsFlyer ID,Customer User ID,Event Name,Event Time,Media Source,Campaign,Partner\n`
+    + `af-u1,${cU1},af_purchase,2025-09-12 10:00:00,facebook,camp,Komorebi\n`
+    + `af-u2,${cU2},af_purchase,2025-09-12 11:00:00,organic,,\n`
+    + `af-u3,${cU3},af_purchase,2025-09-12 12:00:00,restricted,,\n`
+    + `af-u4,${cU4},af_purchase,2025-09-12 13:00:00,bytedance_int,camp,SomeOtherAgency\n`;
+  const upTok = await csrf(admin, '/admin/advertisers/mmpadv/mmp-sync');
+  const fd = new FormData();
+  fd.append('_csrf', upTok);
+  fd.append('csv_file', new Blob([uploadCsv], { type: 'text/csv' }), 'id1633169952_in_app_events_postbacks_2025_09_12_2025_09_19_Asia.csv');
+  const upRes = await fetch(`${BASE}/admin/advertisers/mmpadv/mmp-sync/upload-csv`, { method: 'POST', headers: { Cookie: admin.cookie }, body: fd, redirect: 'manual' });
+  ok('CSV upload → redirect ok=1', (upRes.headers.get('location') || '').includes('ok=1'), String(upRes.status));
+  const uU1 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cU1);
+  const uU2 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cU2);
+  const uU3 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cU3);
+  const uU4 = db.prepare('SELECT status,reason FROM conversions WHERE click_id=?').get(cU4);
+  ok('CSV upload: non-organic + partner matches → approved', uU1.status === 'approved' && uU1.reason === 'mmp_attributed', JSON.stringify(uU1));
+  ok('CSV upload: organic → rejected', uU2.status === 'rejected' && uU2.reason === 'mmp_rejected', JSON.stringify(uU2));
+  ok('CSV upload: restricted → flagged pending', uU3.status === 'pending' && uU3.reason === 'mmp_restricted', JSON.stringify(uU3));
+  ok('CSV upload: non-organic + partner != mmp_partner_name → pending mmp_not_komorebi', uU4.status === 'pending' && uU4.reason === 'mmp_not_komorebi', JSON.stringify(uU4));
+  const ulog = db.prepare("SELECT * FROM mmp_sync_log WHERE advertiser_slug='mmpadv' ORDER BY id DESC LIMIT 1").get();
+  ok('CSV upload logged with source=csv_upload + counts',
+    ulog.source === 'csv_upload' && ulog.events_pulled === 4 && ulog.matched === 4 && ulog.auto_approved === 1 && ulog.auto_rejected === 1 && ulog.flagged === 2,
+    JSON.stringify({ src: ulog.source, p: ulog.events_pulled, m: ulog.matched, a: ulog.auto_approved, r: ulog.auto_rejected, f: ulog.flagged }));
+  const fdNoCsrf = new FormData();
+  fdNoCsrf.append('csv_file', new Blob([uploadCsv], { type: 'text/csv' }), 'x.csv');
+  const upNoCsrf = await fetch(`${BASE}/admin/advertisers/mmpadv/mmp-sync/upload-csv`, { method: 'POST', headers: { Cookie: admin.cookie }, body: fdNoCsrf, redirect: 'manual' });
+  ok('CSV upload without CSRF → 403', upNoCsrf.status === 403);
+
   // ---- sync failure path (bad token → mock 401) ----
   await adminPost(admin, '/admin/advertisers/mmpadv/update',
     { name: 'MMPAdv', offer_url: 'https://mmp.test/o', payout_amount: 5, payout_type: 'fixed', click_lookback_window: 30,

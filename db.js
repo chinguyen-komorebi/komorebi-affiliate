@@ -497,6 +497,9 @@ db.exec(`
 // auto-decided; this column records how many a sync flagged.
 const mmpLogCols = db.prepare('PRAGMA table_info(mmp_sync_log)').all().map(c => c.name);
 if (!mmpLogCols.includes('flagged')) db.exec('ALTER TABLE mmp_sync_log ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0');
+// How the run was triggered: 'sync' = scheduled/manual API pull; 'csv_upload' = admin
+// uploaded an AppsFlyer export file. Pre-migration rows default to 'sync'.
+if (!mmpLogCols.includes('source')) db.exec("ALTER TABLE mmp_sync_log ADD COLUMN source TEXT NOT NULL DEFAULT 'sync'");
 
 // Seed a legacy advertiser so pre-migration rows have a valid foreign key target
 db.prepare(`
