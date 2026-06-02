@@ -488,6 +488,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_mmp_sync_adv ON mmp_sync_log(advertiser_slug, synced_at);
 `);
 
+// Conversions whose AppsFlyer media_source = "restricted" (attributed to a privacy-
+// restricted SRN, not our affiliate) are left pending for manual review rather than
+// auto-decided; this column records how many a sync flagged.
+const mmpLogCols = db.prepare('PRAGMA table_info(mmp_sync_log)').all().map(c => c.name);
+if (!mmpLogCols.includes('flagged')) db.exec('ALTER TABLE mmp_sync_log ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0');
+
 // Seed a legacy advertiser so pre-migration rows have a valid foreign key target
 db.prepare(`
   INSERT OR IGNORE INTO advertisers (slug, name, offer_url, status)

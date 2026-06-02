@@ -204,8 +204,10 @@ function decryptToken(stored) {
 // event_name, event_time, media_source, campaign (NOT click_id / status). We therefore:
 //   - take click_id from customer_user_id (the value the tracking link sets), then
 //     fall back to appsflyer_id, then to a literal click_id column;
-//   - derive attribution from media_source (organic → reject, anything else → approve),
-//     falling back to a literal status column (attributed/organic/fraud) for flexibility.
+//   - derive attribution from media_source: organic → reject; "restricted" (attributed
+//     to a privacy-restricted SRN such as Facebook/Google, i.e. NOT our affiliate) →
+//     flag for manual review (left pending); anything else → approve. Falls back to a
+//     literal status column (attributed/organic/fraud) for the non-real-export format.
 async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
   const token = decryptToken(adv.mmp_api_token);
   if (!token) throw new Error('No API token configured');
@@ -220,7 +222,7 @@ async function mmpFetchEvents(adv, from, to, maxRows = 200000) {
       const click_id = (r.customer_user_id || r.appsflyer_id || r.click_id || r.clickid || '').trim();
       const ms = (r.media_source != null ? String(r.media_source) : '').trim().toLowerCase();
       let status;
-      if (ms) status = ms === 'organic' ? 'organic' : 'attributed';        // real export
+      if (ms) status = ms === 'organic' ? 'organic' : (ms === 'restricted' ? 'restricted' : 'attributed'); // real export
       else    status = (r.status || r.af_status || '').trim().toLowerCase(); // fallback format
       return { click_id, status };
     })
@@ -257,7 +259,7 @@ async function runMmpSync(adv) {
     return { ok: false, error: e.message };
   }
 
-  let matched = 0, approved = 0, rejected = 0; const errors = [];
+  let matched = 0, approved = 0, rejected = 0, flagged = 0; const errors = [];
   const findConv  = db.prepare("SELECT id, status FROM conversions WHERE advertiser_slug = ? AND click_id = ? ORDER BY (status='pending') DESC, id DESC LIMIT 1");
   const setStatus = db.prepare('UPDATE conversions SET status = ?, reason = ? WHERE id = ?');
   for (const ev of events) {
@@ -269,12 +271,15 @@ async function runMmpSync(adv) {
     const s = ev.status;
     if (s === 'attributed' || s === 'non-organic' || s === 'nonorganic') { setStatus.run('approved', 'mmp_attributed', conv.id); approved++; }
     else if (s === 'organic' || s === 'fraud' || s === 'rejected')        { setStatus.run('rejected', 'mmp_rejected', conv.id); rejected++; }
+    // "restricted" = attributed to a privacy-restricted SRN, not our affiliate. Leave the
+    // conversion pending (tagged so an admin can review) rather than auto-deciding it.
+    else if (s === 'restricted') { setStatus.run('pending', 'mmp_restricted', conv.id); flagged++; }
   }
 
-  db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, errors, status) VALUES (?,?,?,?,?,?,?)')
-    .run(adv.slug, events.length, matched, approved, rejected, errors.length ? JSON.stringify(errors.slice(0, 500)) : null, 'success');
-  sendTelegram(`\u{1F4E5} MMP sync — <b>${adv.name}</b>: ${events.length} pulled, ${matched} matched, ${approved} auto-approved, ${rejected} auto-rejected.`).catch(() => {});
-  return { ok: true, events_pulled: events.length, matched, auto_approved: approved, auto_rejected: rejected, errors };
+  db.prepare('INSERT INTO mmp_sync_log (advertiser_slug, events_pulled, matched, auto_approved, auto_rejected, flagged, errors, status) VALUES (?,?,?,?,?,?,?,?)')
+    .run(adv.slug, events.length, matched, approved, rejected, flagged, errors.length ? JSON.stringify(errors.slice(0, 500)) : null, 'success');
+  sendTelegram(`\u{1F4E5} MMP sync — <b>${adv.name}</b>: ${events.length} pulled, ${matched} matched, ${approved} auto-approved, ${rejected} auto-rejected${flagged ? `, ${flagged} flagged for review` : ''}.`).catch(() => {});
+  return { ok: true, events_pulled: events.length, matched, auto_approved: approved, auto_rejected: rejected, flagged, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,9 +2054,9 @@ app.post('/admin/advertisers/:slug/mmp-sync/run', requireAdmin, async (req, res)
   }
   const r = await runMmpSync(adv);
   logAudit('advertiser.mmp_sync', 'advertiser', adv.slug,
-    r.ok ? { events_pulled: r.events_pulled, matched: r.matched, approved: r.auto_approved, rejected: r.auto_rejected } : { error: r.error }, req);
+    r.ok ? { events_pulled: r.events_pulled, matched: r.matched, approved: r.auto_approved, rejected: r.auto_rejected, flagged: r.flagged } : { error: r.error }, req);
   const msg = r.ok
-    ? `Sync complete — ${r.events_pulled} pulled, ${r.matched} matched, ${r.auto_approved} approved, ${r.auto_rejected} rejected`
+    ? `Sync complete — ${r.events_pulled} pulled, ${r.matched} matched, ${r.auto_approved} approved, ${r.auto_rejected} rejected${r.flagged ? `, ${r.flagged} flagged for review` : ''}`
     : `Sync failed — ${r.error}`;
   res.redirect(`/admin/advertisers/${adv.slug}/mmp-sync?msg=${encodeURIComponent(msg)}&ok=${r.ok ? '1' : '0'}`);
 });
@@ -3838,6 +3843,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
       <td>${N(l.matched)}</td>
       <td style="color:#2e7d32">${N(l.auto_approved)}</td>
       <td style="color:#c62828">${N(l.auto_rejected)}</td>
+      <td style="color:#92651a">${l.flagged ? N(l.flagged) : '—'}</td>
       <td>${errCount ? `<span title="${H((l.errors||'').slice(0,300))}" style="color:#f57f17">${errCount} issue(s)</span>` : '—'}</td>
     </tr>`;
   }).join('');
@@ -3847,7 +3853,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   <h2>MMP Sync — ${H(adv.name)}</h2>
   ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
   ${error ? `<div class="form-err">${H(error)}</div>` : ''}
-  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events and auto-approves non-organic (attributed) / auto-rejects organic conversions matched by <code>click_id</code>. Manual trigger only.</p>
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Pulls the last 24h of AppsFlyer in-app events and auto-approves non-organic (attributed) / auto-rejects organic conversions matched by <code>click_id</code>. Events with <code>media_source = restricted</code> (attributed to a privacy-restricted network, not your affiliate) are left <strong>pending and flagged</strong> for manual review. Manual trigger only.</p>
   <div class="callout" style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:#92651a">
     <strong>Matching requirement:</strong> our <code>click_id</code> must be passed as AppsFlyer's <code>customer_user_id</code> in your tracking link (the sync matches on AppsFlyer's <code>customer_user_id</code>, falling back to <code>appsflyer_id</code>). Attribution is read from <code>media_source</code> (organic ⇒ rejected).
   </div>
@@ -3858,7 +3864,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   </form>
   ${logs.length === 0
     ? '<div class="empty">No sync runs yet.</div>'
-    : `<table><thead><tr><th>When</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Issues</th></tr></thead>
+    : `<table><thead><tr><th>When</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Flagged</th><th>Issues</th></tr></thead>
         <tbody>${rows}</tbody></table>`}
 </div></main>`;
   return adminLayout(`MMP Sync — ${adv.name}`, body);
