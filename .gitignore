@@ -5,6 +5,7 @@ affiliate.db-shm
 *.db
 *.db-wal
 *.db-shm
+*.db.prod
 
 # Logs
 *.log
