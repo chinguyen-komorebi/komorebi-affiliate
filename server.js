@@ -6,7 +6,8 @@ const os          = require('node:os');
 const path        = require('node:path');
 const express     = require('express');
 const session     = require('express-session');
-const SQLiteStore  = require('connect-sqlite3')(session);
+const Database     = require('better-sqlite3');
+const SQLiteStore  = require('better-sqlite3-session-store')(session);
 const multer      = require('multer');
 const nodemailer  = require('nodemailer');
 const cron        = require('node-cron');
@@ -118,13 +119,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// Persist sessions in their own SQLite file (not affiliate.db, to avoid WAL
+// contention with the app DB). Replaces the default in-memory MemoryStore,
+// which leaked RAM and dropped every session on each PM2 restart. Uses
+// better-sqlite3 (prebuilt binary, clean audit) — no native sqlite3 build.
+// Anchored to __dirname so the path is stable regardless of the process's cwd;
+// WAL mode for better read/write concurrency.
+const sessionDb = new Database(path.join(__dirname, 'sessions.db'));
+sessionDb.pragma('journal_mode = WAL');
+
 app.use(session({
-  // Persist sessions in their own SQLite file (not affiliate.db, to avoid WAL
-  // contention with the app DB). Replaces the default in-memory MemoryStore,
-  // which leaked RAM and dropped every session on each PM2 restart. Anchored to
-  // __dirname so the path is stable regardless of the process's working dir.
-  // concurrentDB enables WAL on sessions.db for better read/write concurrency.
-  store: new SQLiteStore({ db: 'sessions.db', dir: __dirname, table: 'sessions', concurrentDB: true }),
+  // Prune expired rows every 15 min so sessions.db doesn't grow unbounded.
+  store: new SQLiteStore({ client: sessionDb, expired: { clear: true, intervalMs: 15 * 60 * 1000 } }),
   secret: process.env.SESSION_SECRET || 'komorebi-dev-secret-change-in-prod',
   resave: false,
   saveUninitialized: false,
