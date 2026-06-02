@@ -1991,7 +1991,7 @@ app.post('/admin/advertisers', requireAdmin, (req, res) => {
   const description = (req.body.description || '').trim() || null;
   const countriesAllowed = (req.body.countries_allowed || '').trim() || null;
   const postbackSecret = (req.body.postback_secret || '').trim() || null;
-  const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
+  const mmpType = ['appsflyer', 'adjust'].includes(req.body.mmp_type) ? req.body.mmp_type : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
   const mmpToken = encryptToken((req.body.mmp_api_token || '').trim() || null);
   const s = slug || slugify(name);
@@ -2129,7 +2129,7 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const description = (req.body.description || '').trim() || null;
   const countriesAllowed = (req.body.countries_allowed || '').trim() || null;
   const postbackSecret = (req.body.postback_secret || '').trim() || null;
-  const mmpType = req.body.mmp_type === 'appsflyer' ? 'appsflyer' : 'none';
+  const mmpType = ['appsflyer', 'adjust'].includes(req.body.mmp_type) ? req.body.mmp_type : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
   const mmpTokenRaw = (req.body.mmp_api_token || '').trim();
   const { slug } = req.params;
@@ -3968,13 +3968,15 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
         <small>If set, postbacks must include <code>&amp;sig=HMAC_SHA256(secret, click_id+event+payout)</code> as a hex digest, or they are rejected (403). Leave blank to accept unsigned postbacks (backward compatible).</small></div>
     </fieldset>
     <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
-      <legend style="font-size:12px;font-weight:600;padding:0 6px">MMP Integration (AppsFlyer)</legend>
+      <legend style="font-size:12px;font-weight:600;padding:0 6px">MMP Integration (AppsFlyer / Adjust)</legend>
       <div class="fg-row">
         <div class="fg"><label>MMP Type</label>
           <select name="mmp_type">
             <option value="none"      ${(adv.mmp_type||'none')==='none'      ?'selected':''}>None</option>
             <option value="appsflyer" ${(adv.mmp_type||'none')==='appsflyer' ?'selected':''}>AppsFlyer</option>
-          </select></div>
+            <option value="adjust"    ${(adv.mmp_type||'none')==='adjust'    ?'selected':''}>Adjust</option>
+          </select>
+          <small>AppsFlyer reconciles via Komorebi's pull sync (needs App ID + API Token). Adjust is push-based (real-time S2S postbacks) — App ID/Token are not required; see the <a href="/docs#adjust" target="_blank">Adjust postback docs</a>.</small></div>
         <div class="fg"><label>App ID</label>
           <input type="text" name="mmp_app_id" value="${H(adv.mmp_app_id||'')}" placeholder="e.g. id123456789 or com.app"></div>
       </div>
@@ -6124,6 +6126,12 @@ function renderDocs() {
       </table>
 
       <h3 class="sub-title" id="adjust">Adjust Integration</h3>
+      <p>Adjust is <strong>push-based</strong>: unlike AppsFlyer, there is <strong>no CSV export and no pull sync</strong>. Adjust fires a server-to-server (S2S) postback to Komorebi in real time the moment a conversion is attributed, and the <code>click_id</code> is carried back via Adjust's <code>{click_id}</code> macro. Conversions are recorded the instant the postback arrives — no reconciliation pull is required.</p>
+
+      <div class="callout info">
+        <strong>No export needed:</strong> Set MMP Type to <strong>Adjust</strong> on the advertiser and configure the postback URL below — you do not need an App ID or API token, and the Sync Dashboard / pull export (used for AppsFlyer) does not apply.
+      </div>
+
       <p>To configure a custom postback in Adjust:</p>
       <ol class="steps">
         <li>Log in to your Adjust dashboard and open the app.</li>
