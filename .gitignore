@@ -22,3 +22,4 @@ node_modules/
 
 # Scratch
 /tmp
+ecosystem.config.js
