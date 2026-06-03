@@ -75,6 +75,8 @@ if (!advCols.includes('mmp_api_token')) db.exec('ALTER TABLE advertisers ADD COL
 //   currency — default currency for this advertiser's conversions (e.g. USD, VND).
 if (!advCols.includes('timezone')) db.exec('ALTER TABLE advertisers ADD COLUMN timezone TEXT');
 if (!advCols.includes('currency')) db.exec("ALTER TABLE advertisers ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
+// Backlog #5 — per-advertiser partner-link template (macro mapping for AppsFlyer onboarding).
+if (!advCols.includes('partner_link_template')) db.exec('ALTER TABLE advertisers ADD COLUMN partner_link_template TEXT');
 
 // ---------------------------------------------------------------------------
 // Clicks  (advertiser_slug added via migration for existing dbs)
@@ -424,6 +426,22 @@ const goalCols = db.prepare('PRAGMA table_info(goals)').all().map(c => c.name);
 if (!goalCols.includes('payout_type')) {
   db.exec("ALTER TABLE goals ADD COLUMN payout_type TEXT NOT NULL DEFAULT 'fixed'");
 }
+
+// ---------------------------------------------------------------------------
+// Backlog #7 — Event name mapping per advertiser.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS event_mappings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_id INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    source_event  TEXT NOT NULL,
+    mapped_event  TEXT NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(advertiser_id, source_event)
+  );
+  CREATE INDEX IF NOT EXISTS idx_evmap_advertiser ON event_mappings(advertiser_id);
+`);
+
 
 // ---------------------------------------------------------------------------
 // Publisher ↔ Advertiser assignments  (junction)
