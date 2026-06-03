@@ -926,6 +926,16 @@ function matchGoal(advertiserId, event) {
   ).get(advertiserId, event) || null;
 }
 
+// Backlog #7 — map an advertiser's SDK event name to the Komorebi event value.
+// Case-insensitive on source_event. Returns the original event if no mapping exists.
+function mapEvent(advertiserId, event) {
+  if (!event) return event;
+  const row = db.prepare(
+    'SELECT mapped_event FROM event_mappings WHERE advertiser_id = ? AND lower(source_event) = lower(?)'
+  ).get(advertiserId, event);
+  return row ? row.mapped_event : event;
+}
+
 // Resolve the payout for a conversion. Precedence:
 //   1. assignment.payout_override — always a fixed dollar amount, wins outright
 //   2. matching goal           — fixed dollars, or percent of loan_amount
@@ -1196,7 +1206,8 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   }
 
   const { slug }                             = req.params;
-  const { click_id, payout, event = 'sale' } = req.query;
+  const { click_id, payout }                 = req.query;
+  const rawEvent                             = req.query.event || 'sale';
   // loan_amount is the basis for percentage payouts; revenue is what the
   // advertiser pays Komorebi (used for margin reporting). Both optional.
   const loanAmount = req.query.loan_amount != null && req.query.loan_amount !== '' && !isNaN(parseFloat(req.query.loan_amount))
@@ -1229,7 +1240,7 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   // Advertiser must sign using the same format: click_id:event:payout
   if (adv.postback_secret) {
     const sig = String(req.query.sig || '').toLowerCase();
-    const base = [click_id, event, payout ?? ''].join(':');
+    const base = [click_id, rawEvent, payout ?? ''].join(':');
     const expected = crypto.createHmac('sha256', adv.postback_secret).update(base).digest('hex');
     const valid = sig.length === expected.length &&
       crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
@@ -1240,6 +1251,9 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   }
 
   const pub = click.publisher;
+
+  // Backlog #7 — map advertiser SDK event name to Komorebi event before goal matching
+  const event = mapEvent(adv.id, rawEvent);
 
   // F11 click expiry — reject if the click is older than the advertiser's lookback window.
   const lookbackDays = adv.click_lookback_window != null ? adv.click_lookback_window : 30;
@@ -2033,6 +2047,7 @@ app.get('/admin/advertisers/:slug/edit', requireAdmin, (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
   const goals = db.prepare('SELECT * FROM goals WHERE advertiser_id = ? ORDER BY created_at').all(adv.id);
+  const eventMappings = db.prepare('SELECT * FROM event_mappings WHERE advertiser_id = ? ORDER BY source_event').all(adv.id);
   const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
   const capUsed = adv.monthly_conversion_cap != null ? advertiserApprovedCount(adv) : null;
@@ -2040,7 +2055,7 @@ app.get('/admin/advertisers/:slug/edit', requireAdmin, (req, res) => {
   const hasMmpToken = !!adv.mmp_api_token;
   adv.mmp_api_token = null;
   res.send(renderAdvForm({ title: `Edit — ${adv.name}`, action: `/admin/advertisers/${adv.slug}/update`,
-    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed, hasMmpToken }));
+    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed, hasMmpToken, eventMappings }));
 });
 
 // ---------------------------------------------------------------------------
@@ -2155,6 +2170,44 @@ app.post('/admin/advertisers/:slug/goals/:goalId/delete', requireAdmin, (req, re
   }
   res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Goal+deleted`);
 });
+
+// Backlog #5 — save partner-link template
+app.post('/admin/advertisers/:slug/partner-link', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const tpl = (req.body.partner_link_template || '').trim().slice(0, 2000) || null;
+  db.prepare('UPDATE advertisers SET partner_link_template = ? WHERE id = ?').run(tpl, adv.id);
+  logAudit('advertiser.partner_link_saved', 'advertiser', adv.slug, {}, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Partner-link+template+saved`);
+});
+
+// Backlog #7 — event name mappings CRUD
+app.post('/admin/advertisers/:slug/event-mappings', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const src = (req.body.source_event || '').trim().slice(0, 120);
+  const dst = (req.body.mapped_event || '').trim().slice(0, 120);
+  if (!src || !dst) return res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Both+event+names+are+required&ok=0`);
+  try {
+    db.prepare('INSERT INTO event_mappings (advertiser_id, source_event, mapped_event) VALUES (?, ?, ?)').run(adv.id, src, dst);
+  } catch (err) {
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err.message || '').includes('UNIQUE')) {
+      return res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=${encodeURIComponent(`Mapping for "${src}" already exists`)}&ok=0`);
+    }
+    throw err;
+  }
+  logAudit('advertiser.event_mapping_added', 'advertiser', adv.slug, { source_event: src, mapped_event: dst }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Event+mapping+added`);
+});
+
+app.post('/admin/advertisers/:slug/event-mappings/:id/delete', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  db.prepare('DELETE FROM event_mappings WHERE id = ? AND advertiser_id = ?').run(req.params.id, adv.id);
+  logAudit('advertiser.event_mapping_deleted', 'advertiser', adv.slug, { id: req.params.id }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Event+mapping+deleted`);
+});
+
 
 app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const { name, offer_url, payout_amount, status } = req.body;
@@ -4027,7 +4080,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   return adminLayout(`MMP Sync — ${adv.name}`, body);
 }
 
-function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], flash, capUsed = null, hasMmpToken = false }) {
+function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], eventMappings = [], flash, capUsed = null, hasMmpToken = false }) {
   const isEdit = action.includes('/update');
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(adv.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
@@ -4064,6 +4117,49 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
     </form>
   </div>`;
 
+// Backlog #7 — event name mapping (advertiser SDK event → Komorebi event value)
+  const eventMapSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Event Name Mapping <span style="font-size:11px;color:#6e6e73">(Backlog #7)</span></h2>
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Map the advertiser's SDK event names (e.g. <code>deposit_Trade_succeeded</code>, <code>af_purchase</code>) to the Komorebi event value used for goal/payout matching. Prevents event mismatch in reconciliation.</p>
+    ${eventMappings.length === 0 ? '<div class="empty" style="margin-bottom:14px">No event mappings — incoming event names are used as-is.</div>' : `
+    <table style="margin-bottom:16px"><thead><tr><th>Advertiser Event (source)</th><th>Komorebi Event (mapped)</th><th></th></tr></thead><tbody>
+    ${eventMappings.map(m => `<tr>
+      <td><code class="xs">${H(m.source_event)}</code></td>
+      <td><code class="xs">${H(m.mapped_event)}</code></td>
+      <td><form method="POST" action="/admin/advertisers/${H(adv.slug)}/event-mappings/${H(m.id)}/delete" style="display:inline" data-confirm="Delete mapping ${H(m.source_event)}?">${csrfField(csrfToken)}<button class="btn btn-danger">Delete</button></form></td>
+    </tr>`).join('')}
+    </tbody></table>`}
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/event-mappings" style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px">${csrfField(csrfToken)}
+      <div class="fg" style="margin:0"><label>Advertiser Event</label><input type="text" name="source_event" required placeholder="e.g. af_purchase"></div>
+      <div class="fg" style="margin:0"><label>Komorebi Event</label><input type="text" name="mapped_event" required placeholder="e.g. sale"></div>
+      <button type="submit" class="btn btn-primary">Add Mapping</button>
+    </form>
+  </div>`;
+
+  
+// Backlog #5 — partner-link template + copy-paste AppsFlyer setup block. The template
+  // maps Komorebi's click_id into AppsFlyer's customer_user_id and standard sub-params.
+  const trackUrl = `${BASE_URL}/track/${H(adv.slug||'SLUG')}?pub=PUBLISHER`;
+  const defaultTemplate =
+    `${BASE_URL}/track/${adv.slug||'SLUG'}?pub={publisher}&customer_user_id={click_id}&af_siteid={af_siteid}&af_sub1={af_sub1}&af_sub2={af_sub2}&af_sub3={af_sub3}&af_sub4={af_sub4}&af_sub5={af_sub5}&af_c_id={af_c_id}&clickid={click_id}`;
+  const tpl = adv.partner_link_template || defaultTemplate;
+  const partnerLinkSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Partner-Link Template <span style="font-size:11px;color:#6e6e73">(Backlog #5)</span></h2>
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:12px">Macro template handed to the advertiser for AppsFlyer onboarding. <code>{click_id}</code> auto-injects as <code>customer_user_id</code> (the reconciliation match key). Also maps <code>af_siteid</code>, <code>af_sub1-5</code>, <code>af_c_id</code>, <code>clickid</code>.</p>
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/partner-link" style="margin-bottom:14px">${csrfField(csrfToken)}
+      <textarea name="partner_link_template" rows="3" style="width:100%;padding:8px 10px;border:1px solid #d2d2d7;border-radius:7px;font-family:monospace;font-size:12px;resize:vertical">${H(tpl)}</textarea>
+      <div style="margin-top:8px"><button class="btn btn-primary">Save Template</button></div>
+    </form>
+    <div style="background:#f5f5f7;border-radius:8px;padding:14px 16px;font-size:12px;line-height:1.7">
+      <strong>Copy-paste AppsFlyer setup block</strong> — give this to the advertiser:
+      <div class="ubox" data-copy="${H(tpl)}" style="margin-top:8px;word-break:break-all">${H(tpl)}</div>
+      <div style="margin-top:8px;color:#6e6e73">Base tracking URL: <code>${trackUrl}</code> · Match key: <code>customer_user_id = click_id</code> · App ID: <code>${H(adv.mmp_app_id||'(set in MMP section)')}</code></div>
+    </div>
+  </div>`;
+
+  
   const body = `${adminHeader()}
 <main><div class="fw">
   <h2>${H(title)}</h2>
@@ -4183,6 +4279,8 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
     </div>
   </form>
   ${goalsSection}
+  ${eventMapSection}
+  ${partnerLinkSection}
 </div></main>
 <script>
 function autoSlug(n){const s=document.getElementById('slug');if(s)s.value=n.value.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');}
