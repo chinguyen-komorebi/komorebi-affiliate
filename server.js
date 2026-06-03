@@ -3264,6 +3264,99 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Backlog #9 — Cohort / Retention reporting. Cohorts are keyed by media source
+// (publisher), network, or campaign; retention is the day-gap between the click
+// (D0) and each conversion, bucketed D0 / D1-7 / D8-14 / D15-28 / D28+. LTV is the
+// approved payout per cohort. cohort_type splits a click's first conversion
+// (acquisition) from later ones (re-engagement). CSV export via ?format=csv.
+// ---------------------------------------------------------------------------
+function cohortRows({ by, cohortType, advFilter }) {
+  const dimExpr = by === 'network'  ? "COALESCE(NULLIF(cl.network,''),'(none)')"
+                : by === 'campaign' ? "COALESCE(NULLIF(cl.campaign,''),'(none)')"
+                : 'cv.publisher';
+  const where = ['cl.click_id IS NOT NULL'];
+  const params = [];
+  if (advFilter) { where.push('cv.advertiser_slug = ?'); params.push(advFilter); }
+  const base = `
+    SELECT ${dimExpr} AS dim,
+      CAST(julianday(date(cv.received_at)) - julianday(date(cl.created_at)) AS INTEGER) AS d,
+      cv.payout AS payout, cv.status AS status,
+      ROW_NUMBER() OVER (PARTITION BY cv.click_id ORDER BY cv.received_at, cv.id) AS rn
+    FROM conversions cv JOIN clicks cl ON cl.click_id = cv.click_id
+    WHERE ${where.join(' AND ')}`;
+  const typeFilter = cohortType === 'acquisition' ? 'WHERE rn = 1'
+                   : cohortType === 'reengagement' ? 'WHERE rn > 1' : '';
+  return db.prepare(`
+    SELECT dim,
+      COUNT(*) AS conversions,
+      SUM(CASE WHEN status='approved' THEN payout ELSE 0 END) AS ltv,
+      SUM(CASE WHEN d<=0 THEN 1 ELSE 0 END) AS d0,
+      SUM(CASE WHEN d BETWEEN 1 AND 7   THEN 1 ELSE 0 END) AS d1_7,
+      SUM(CASE WHEN d BETWEEN 8 AND 14  THEN 1 ELSE 0 END) AS d8_14,
+      SUM(CASE WHEN d BETWEEN 15 AND 28 THEN 1 ELSE 0 END) AS d15_28,
+      SUM(CASE WHEN d > 28 THEN 1 ELSE 0 END) AS d28p
+    FROM ( ${base} ) ${typeFilter}
+    GROUP BY dim ORDER BY conversions DESC`).all(...params);
+}
+
+app.get('/admin/reports/cohort', requireAdmin, (req, res) => {
+  const by = ['media_source', 'network', 'campaign'].includes(req.query.by) ? req.query.by : 'media_source';
+  const cohortType = ['acquisition', 'reengagement'].includes(req.query.type) ? req.query.type : 'all';
+  const advFilter = (req.query.advertiser || '').trim();
+  const rows = cohortRows({ by, cohortType, advFilter });
+  if (req.query.format === 'csv') {
+    const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="cohort-${by}-${cohortType}.csv"`);
+    return res.send([
+      'media_source,conversions,ltv,D0,D1-7,D8-14,D15-28,D28+',
+      ...rows.map(r => [r.dim, r.conversions, $(r.ltv), r.d0, r.d1_7, r.d8_14, r.d15_28, r.d28p].map(q).join(',')),
+    ].join('\r\n'));
+  }
+  const advertisers = db.prepare("SELECT slug, name FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  res.send(renderCohortReport({ rows, by, cohortType, advFilter, advertisers }));
+});
+
+// ---------------------------------------------------------------------------
+// Backlog #10 — Pivot / grouped report. Flexible breakdown over up to two of:
+// media source (publisher), sub-source (subpub), geo (country), campaign, date,
+// advertiser. Metrics: conversions, approved, approved payout, revenue. CSV export.
+// ---------------------------------------------------------------------------
+const PIVOT_DIMS = {
+  publisher:  { label: 'Media Source',  expr: 'cv.publisher' },
+  subpub:     { label: 'Sub-source',    expr: "COALESCE(NULLIF(cl.subpub,''),'(none)')" },
+  country:    { label: 'Geo',           expr: "COALESCE(NULLIF(cl.country,''),'(none)')" },
+  campaign:   { label: 'Campaign',      expr: "COALESCE(NULLIF(cl.campaign,''),'(none)')" },
+  date:       { label: 'Date',          expr: 'date(cv.received_at)' },
+  advertiser: { label: 'Advertiser',    expr: 'cv.advertiser_slug' },
+};
+app.get('/admin/reports/pivot', requireAdmin, (req, res) => {
+  const dim1 = PIVOT_DIMS[req.query.dim1] ? req.query.dim1 : 'publisher';
+  const dim2 = (req.query.dim2 && PIVOT_DIMS[req.query.dim2] && req.query.dim2 !== dim1) ? req.query.dim2 : '';
+  const sel = dim2 ? `${PIVOT_DIMS[dim1].expr} AS k1, ${PIVOT_DIMS[dim2].expr} AS k2` : `${PIVOT_DIMS[dim1].expr} AS k1`;
+  const grp = dim2 ? 'k1, k2' : 'k1';
+  const rows = db.prepare(`
+    SELECT ${sel},
+      COUNT(*) AS conversions,
+      SUM(CASE WHEN cv.status='approved' THEN 1 ELSE 0 END) AS approved,
+      SUM(CASE WHEN cv.status='approved' THEN cv.payout ELSE 0 END) AS payout,
+      SUM(COALESCE(cv.revenue,0)) AS revenue
+    FROM conversions cv LEFT JOIN clicks cl ON cl.click_id = cv.click_id
+    GROUP BY ${grp} ORDER BY conversions DESC LIMIT 1000`).all();
+  if (req.query.format === 'csv') {
+    const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="pivot-${dim1}${dim2?'-'+dim2:''}.csv"`);
+    const head = [PIVOT_DIMS[dim1].label, ...(dim2 ? [PIVOT_DIMS[dim2].label] : []), 'conversions', 'approved', 'payout', 'revenue'];
+    return res.send([
+      head.join(','),
+      ...rows.map(r => [r.k1, ...(dim2 ? [r.k2] : []), r.conversions, r.approved, $(r.payout), $(r.revenue)].map(q).join(',')),
+    ].join('\r\n'));
+  }
+  res.send(renderPivotReport({ rows, dim1, dim2 }));
+});
+
+
 // HTML templates — shared helpers
 // ---------------------------------------------------------------------------
 
@@ -3658,6 +3751,7 @@ function adminSidebar() {
     auditlog:    ic(`<circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8 4.5V8.2l2.5 1.5"/>`),
     settings:    ic(`<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.2 3.2l1 1M11.8 11.8l1 1M12.8 3.2l-1 1M4.2 11.8l-1 1"/>`),
     postback:    ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M3 6h8l-2-2M13 10H5l2 2"/>`),
+    reports:     ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3 2h7l3 3v9H3z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 8.5h5M5.5 11h3M5.5 6h2"/>`),
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
@@ -3669,6 +3763,9 @@ function adminSidebar() {
   ${nav('/admin/advertisers', 'Advertisers', 'advertisers', '/admin/advertisers')}
   ${nav('/admin/publishers',  'Publishers',  'publishers',  '/admin/publishers')}
   ${nav('/admin/invoices',    'Invoices',    'invoices',    '/admin/invoices')}
+  <div class="adm-sb-group">REPORTS</div>
+  ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
+  ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/postback-log','Postback Log','postback',    '/admin/postback-log')}
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
@@ -5450,6 +5547,78 @@ ${resultHtml}
 </main>
 <script>${CP_JS}</script>`;
   return adminLayout(`Postback Test — ${adv.name}`, body);
+}
+
+// Backlog #9 — cohort / retention report view
+function renderCohortReport({ rows, by, cohortType, advFilter, advertisers }) {
+  const byTab = (v, label) => `<a href="/admin/reports/cohort?by=${v}${cohortType!=='all'?`&type=${cohortType}`:''}${advFilter?`&advertiser=${encodeURIComponent(advFilter)}`:''}" class="btn ${by===v?'btn-primary':'btn-ghost'}" style="margin-right:6px">${label}</a>`;
+  const typeTab = (v, label) => `<a href="/admin/reports/cohort?by=${by}${v!=='all'?`&type=${v}`:''}${advFilter?`&advertiser=${encodeURIComponent(advFilter)}`:''}" class="btn ${cohortType===v?'btn-primary':'btn-ghost'}" style="margin-right:6px;padding:5px 10px;font-size:12px">${label}</a>`;
+  const csvHref = `/admin/reports/cohort?by=${by}&type=${cohortType}${advFilter?`&advertiser=${encodeURIComponent(advFilter)}`:''}&format=csv`;
+  const tableRows = rows.map(r => `<tr>
+    <td><strong>${H(r.dim||'(none)')}</strong></td>
+    <td>${N(r.conversions)}</td>
+    <td>$${$(r.ltv)}</td>
+    <td>${N(r.d0)}</td><td>${N(r.d1_7)}</td><td>${N(r.d8_14)}</td><td>${N(r.d15_28)}</td><td>${N(r.d28p)}</td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="${csvHref}" class="hbtn">Export CSV</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Cohort / Retention Report</h2><span class="meta">Retention by days from click · LTV = approved payout</span></div>
+  <div style="padding:14px 20px;border-bottom:1px solid #f0f0f0">
+    <div style="margin-bottom:8px;font-size:11px;color:#6e6e73">GROUP BY</div>
+    <div style="margin-bottom:12px">${byTab('media_source','Media Source')}${byTab('network','Network')}${byTab('campaign','Campaign')}</div>
+    <div style="margin-bottom:8px;font-size:11px;color:#6e6e73">COHORT TYPE</div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      ${typeTab('all','All')}${typeTab('acquisition','Acquisition (first)')}${typeTab('reengagement','Re-engagement (repeat)')}
+      <form method="GET" action="/admin/reports/cohort" style="margin-left:auto;display:flex;gap:6px">
+        <input type="hidden" name="by" value="${H(by)}"><input type="hidden" name="type" value="${H(cohortType)}">
+        <select name="advertiser" onchange="this.form.submit()" style="padding:6px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+          <option value="">All advertisers</option>
+          ${advertisers.map(a => `<option value="${H(a.slug)}" ${advFilter===a.slug?'selected':''}>${H(a.name)}</option>`).join('')}
+        </select>
+      </form>
+    </div>
+  </div>
+  ${rows.length===0 ? '<div class="empty">No conversion data for this cohort.</div>' : `
+  <table><thead><tr>
+    <th>Media Source</th><th>Conversions</th><th>LTV</th><th>D0</th><th>D1-7</th><th>D8-14</th><th>D15-28</th><th>D28+</th>
+  </tr></thead><tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Cohort Report', body);
+}
+
+// Backlog #10 — pivot / grouped report view
+function renderPivotReport({ rows, dim1, dim2 }) {
+  const dimSelect = (name, current, allowNone) => `<select name="${name}" onchange="this.form.submit()" style="padding:6px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+    ${allowNone ? `<option value="">— none —</option>` : ''}
+    ${Object.entries(PIVOT_DIMS).map(([k, v]) => `<option value="${k}" ${current===k?'selected':''}>${v.label}</option>`).join('')}
+  </select>`;
+  const csvHref = `/admin/reports/pivot?dim1=${dim1}${dim2?`&dim2=${dim2}`:''}&format=csv`;
+  const head = `<th>${H(PIVOT_DIMS[dim1].label)}</th>${dim2?`<th>${H(PIVOT_DIMS[dim2].label)}</th>`:''}<th>Conversions</th><th>Approved</th><th>Payout</th><th>Revenue</th>`;
+  const tableRows = rows.map(r => `<tr>
+    <td><strong>${H(r.k1||'(none)')}</strong></td>${dim2?`<td>${H(r.k2||'(none)')}</td>`:''}
+    <td>${N(r.conversions)}</td><td>${N(r.approved)}</td><td>$${$(r.payout)}</td><td>$${$(r.revenue)}</td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="${csvHref}" class="hbtn">Export CSV</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Pivot / Grouped Report</h2><span class="meta">Conversion breakdown · payout &amp; revenue are approved-only</span></div>
+  <div style="padding:14px 20px;border-bottom:1px solid #f0f0f0">
+    <form method="GET" action="/admin/reports/pivot" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:12px;color:#6e6e73">Break down by</span>
+      ${dimSelect('dim1', dim1, false)}
+      <span style="font-size:12px;color:#6e6e73">then</span>
+      ${dimSelect('dim2', dim2, true)}
+      <noscript><button class="btn btn-ghost">Apply</button></noscript>
+    </form>
+    <p style="font-size:11px;color:#6e6e73;margin-top:8px">Tip: export to CSV for scheduled/emailed delivery. (A nightly emailed export can be wired to this endpoint via cron — see ops notes.)</p>
+  </div>
+  ${rows.length===0 ? '<div class="empty">No conversion data.</div>' : `
+  <table><thead><tr>${head}</tr></thead><tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Pivot Report', body);
 }
 
 // Publisher portal HTML templates
