@@ -77,6 +77,9 @@ if (!advCols.includes('timezone')) db.exec('ALTER TABLE advertisers ADD COLUMN t
 if (!advCols.includes('currency')) db.exec("ALTER TABLE advertisers ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
 // Backlog #5 — per-advertiser partner-link template (macro mapping for AppsFlyer onboarding).
 if (!advCols.includes('partner_link_template')) db.exec('ALTER TABLE advertisers ADD COLUMN partner_link_template TEXT');
+// Backlog #11 — advertiser portal login (separate from admin). Username = slug; password
+// is set by an admin. Null = portal access disabled for this advertiser.
+if (!advCols.includes('portal_password_hash')) db.exec('ALTER TABLE advertisers ADD COLUMN portal_password_hash TEXT');
 
 // ---------------------------------------------------------------------------
 // Clicks  (advertiser_slug added via migration for existing dbs)
