@@ -2208,6 +2208,43 @@ app.post('/admin/advertisers/:slug/event-mappings/:id/delete', requireAdmin, (re
   res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Event+mapping+deleted`);
 });
 
+// Backlog #8 — Postback Test Tool (admin fires a test postback and shows the response)
+app.get('/admin/advertisers/:slug/postback-test', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const recentClick = db.prepare('SELECT click_id FROM clicks WHERE advertiser_slug = ? ORDER BY created_at DESC LIMIT 1').get(adv.slug);
+  res.send(renderPostbackTest({ adv, csrfToken: req.session.csrfToken, prefillClick: recentClick?.click_id || '', result: null }));
+});
+
+app.post('/admin/advertisers/:slug/postback-test', requireAdmin, async (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const clickId = (req.body.click_id || '').trim();
+  const event   = (req.body.event || 'sale').trim();
+  const payout  = (req.body.payout || '').trim();
+  const loan    = (req.body.loan_amount || '').trim();
+  const params = new URLSearchParams({ click_id: clickId, event });
+  if (payout) params.set('payout', payout);
+  if (loan)   params.set('loan_amount', loan);
+  // Backlog #8 — include an HMAC signature when the advertiser has a secret set, so the
+  // test exercises the exact signed-postback path partners must use.
+  if (adv.postback_secret) {
+    const base = [clickId, event, payout || ''].join(':');
+    params.set('sig', crypto.createHmac('sha256', adv.postback_secret).update(base).digest('hex'));
+  }
+  const url = `${BASE_URL}/postback/${adv.slug}?${params.toString()}`;
+  let result;
+  try {
+    const r = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(8000) });
+    let bodyTxt = ''; try { bodyTxt = await r.text(); } catch {}
+    result = { ok: r.ok, status: r.status, url, body: bodyTxt.slice(0, 1000) };
+  } catch (e) {
+    result = { ok: false, status: 0, url, body: `Request failed: ${e.message}` };
+  }
+  logAudit('advertiser.postback_test', 'advertiser', adv.slug, { status: result.status, click_id: clickId, event }, req);
+  res.send(renderPostbackTest({ adv, csrfToken: req.session.csrfToken, prefillClick: clickId, result }));
+});
+
 
 app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const { name, offer_url, payout_amount, status } = req.body;
@@ -4160,6 +4197,17 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
   </div>`;
 
   
+
+  // Backlog #8 — postback test tool + HMAC doc links
+  const pbToolsSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Integration Tools</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a href="/admin/advertisers/${H(adv.slug)}/postback-test" class="btn btn-ghost">Postback Test Tool &rarr;</a>
+      <a href="/docs#hmac" target="_blank" class="btn btn-ghost">HMAC Signing Docs &rarr;</a>
+    </div>
+  </div>`;
+
   const body = `${adminHeader()}
 <main><div class="fw">
   <h2>${H(title)}</h2>
@@ -4281,6 +4329,7 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
   ${goalsSection}
   ${eventMapSection}
   ${partnerLinkSection}
+  ${pbToolsSection}
 </div></main>
 <script>
 function autoSlug(n){const s=document.getElementById('slug');if(s)s.value=n.value.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');}
@@ -5366,6 +5415,43 @@ function renderGlobalPostbackLog({ dir, status, q, rows, stats, dupCount, dupSet
 }
 
 // ---------------------------------------------------------------------------
+// Backlog #8 — admin postback test tool
+function renderPostbackTest({ adv, csrfToken = '', prefillClick = '', result }) {
+  const resultHtml = result ? `
+    <section style="border:2px solid ${result.ok ? '#2e7d32' : '#c62828'};margin-top:20px">
+      <div class="sh"><h2>Test Result — HTTP ${result.status}${result.ok ? ' ✓' : ' ✗'}</h2></div>
+      <div style="padding:16px 20px">
+        <div style="font-size:12px;color:#6e6e73;margin-bottom:6px">Request URL (HMAC signature included when a secret is set):</div>
+        <div class="ubox" data-copy="${H(result.url)}" style="word-break:break-all;margin-bottom:12px">${H(result.url)}</div>
+        <div style="font-size:12px;color:#6e6e73;margin-bottom:6px">Response body:</div>
+        <pre style="background:#1d1d1f;color:#e8e8ed;padding:12px 14px;border-radius:8px;font-size:12px;overflow:auto;white-space:pre-wrap">${H(result.body || '(empty)')}</pre>
+      </div>
+    </section>` : '';
+
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">← Edit advertiser</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Postback Test Tool — ${H(adv.name)}</h2><span class="meta">${H(adv.slug)}</span></div>
+  <div style="padding:20px 24px">
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:16px">Fire a test postback to <code>/postback/${H(adv.slug)}</code>. ${adv.postback_secret ? 'This advertiser has an HMAC secret — the request is signed automatically.' : 'No HMAC secret set — the request is unsigned.'} The click_id must belong to an existing click for this advertiser.</p>
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/postback-test">${csrfField(csrfToken)}
+      <div class="fg"><label>Click ID *</label>
+        <input type="text" name="click_id" value="${H(prefillClick)}" required placeholder="existing click_id" style="font-family:monospace"></div>
+      <div class="fg-row">
+        <div class="fg"><label>Event</label><input type="text" name="event" value="sale"></div>
+        <div class="fg"><label>Payout (optional)</label><input type="number" name="payout" step="0.01" placeholder="advertiser default"></div>
+        <div class="fg"><label>Loan Amount (optional)</label><input type="number" name="loan_amount" step="0.01" placeholder="for percent payouts"></div>
+      </div>
+      <button type="submit" class="btn btn-primary btn-lg">Send Test Postback</button>
+    </form>
+  </div>
+</section>
+${resultHtml}
+</main>
+<script>${CP_JS}</script>`;
+  return adminLayout(`Postback Test — ${adv.name}`, body);
+}
+
 // Publisher portal HTML templates
 // ---------------------------------------------------------------------------
 
@@ -6502,6 +6588,21 @@ function renderDocs() {
 
       <div class="callout warn">
         <strong>The single most important step:</strong> Komorebi's <code>click_id</code> must be carried into AppsFlyer as <code>customer_user_id</code> — it is the reconciliation match key. If it is empty, conversions cannot be attributed to your traffic.
+      </div>
+
+      <h3 class="sub-title" id="hmac">HMAC Postback Signing</h3>
+      <p>Komorebi supports optional per-advertiser <strong>HMAC-SHA256</strong> signing on inbound postbacks. When a postback secret is configured for an advertiser, every postback must include a valid <code>sig</code> parameter or it is rejected (HTTP 403). Leave the secret blank to accept unsigned postbacks (backward compatible).</p>
+      <div class="code-label">Signature formula</div>
+      <table>
+        <thead><tr><th>Field</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Base string</td><td><code>click_id + ":" + event + ":" + payout</code> (payout empty string if omitted)</td></tr>
+          <tr><td>Algorithm</td><td><code>HMAC-SHA256(secret, base)</code> → lowercase hex digest</td></tr>
+          <tr><td>Parameter</td><td>append <code>&amp;sig=&lt;hex digest&gt;</code> to the postback URL</td></tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        Example (pseudocode): <code>sig = hex(hmac_sha256("mysecret", "abc-123:sale:15.00"))</code>. Admins can verify the exact signed URL using the <strong>Postback Test Tool</strong> on the advertiser edit page, which signs automatically when a secret is set.
       </div>
 
       
