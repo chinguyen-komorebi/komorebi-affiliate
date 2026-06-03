@@ -1344,6 +1344,16 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     }
   }
 
+  // Backlog #13 (ordering) — if Protect360 already flagged this click_id for this
+  // advertiser, a later sale postback must also be rejected ($0), not left pending.
+  const preFlagged = db.prepare("SELECT 1 FROM conversions WHERE click_id = ? AND advertiser_slug = ? AND fraud_source = 'protect360'").get(click_id, slug);
+  if (preFlagged) {
+    convStatus = 'rejected';
+    convReason = convReason || 'protect360';
+    amount = 0;
+    note = note || 'protect360_pre_flagged';
+  }
+
   // Backlog #15 — CTIT (click-to-conversion time, seconds) + anomaly flag.
   // clickAgeMs was computed above for the lookback check.
   const ctitSeconds = Number.isFinite(clickAgeMs) ? Math.max(0, Math.floor(clickAgeMs / 1000)) : null;
