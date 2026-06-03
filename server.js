@@ -6483,6 +6483,28 @@ function renderDocs() {
         <strong>Important:</strong> The <code>{click_id}</code> macro must be passed through from the tracking link click to the postback. Your account manager will confirm which advertiser slug to use in the postback URL.
       </div>
 
+      <h3 class="sub-title" id="appsflyer-onboarding">AppsFlyer Onboarding Walkthrough</h3>
+      <p>Komorebi integrates with AppsFlyer as an <strong>Agency partner</strong>. Follow these steps in your AppsFlyer dashboard to grant Komorebi the access it needs and start sending attributed conversions. This mirrors AppsFlyer's exact permission and event-selection flow.</p>
+
+      <div class="callout info">
+        <strong>Before you start:</strong> have your Komorebi advertiser <code>slug</code>, your partner-link template (provided by your account manager — see <a href="#partner-link">Partner-Link Template</a>), and AppsFlyer admin access to the relevant app.
+      </div>
+
+      <ol class="steps">
+        <li><strong>Add Komorebi as an Agency partner.</strong> In AppsFlyer, go to <em>Configuration → Partner Marketplace</em> (or <em>Active Integrations → Add Partner</em>), search for your agency/partner entry, and enable it for the app. If Komorebi is set up as a custom partner, use <em>Configuration → Integrated Partners → Add a dedicated partner</em> and enter the Komorebi partner ID supplied to you.</li>
+        <li><strong>Set the attribution / click-through lookback window</strong> to match the value configured on the Komorebi advertiser (default <strong>90 days</strong>). A mismatch causes valid postbacks to be rejected. See <a href="#appsflyer">AppsFlyer Integration</a>.</li>
+        <li><strong>Configure the tracking link.</strong> Paste Komorebi's partner-link template into the partner's <em>Attribution Link</em> / <em>Click-through URL</em>. The template injects Komorebi's <code>click_id</code> into <code>customer_user_id</code> and maps <code>af_siteid</code>, <code>af_sub1–5</code>, and <code>af_c_id</code>.</li>
+        <li><strong>Grant event postbacks.</strong> Open the partner's <em>Integration → In-app events</em> tab. Toggle <em>"Send in-app events to this partner"</em> on, then select <em>"Events attributed to this partner only"</em> (recommended) and map each in-app event (e.g. <code>af_purchase</code>, <code>deposit_Trade_succeeded</code>) you want Komorebi to receive. Map those names to the matching Komorebi event under <a href="#event-mapping">Event Name Mapping</a> on the advertiser.</li>
+        <li><strong>Configure the postback URL.</strong> For real-time postbacks, set the partner's <em>Postback URL</em> to Komorebi's endpoint: <code>${BASE_URL}/postback/&lt;slug&gt;?click_id={click_id}&amp;event={event_name}</code>. For pull-based reconciliation, grant Komorebi <em>Raw Data / Pull API</em> access and an API token (entered in the advertiser's MMP section).</li>
+        <li><strong>Grant raw-data access (for reconciliation).</strong> Under <em>Configuration → Permissions</em>, enable raw-data report access so Komorebi's MMP sync can pull the in-app-events export and reconcile each event against the originating click.</li>
+        <li><strong>Verify.</strong> Use the <a href="#postback-setup">postback test</a> or your account manager's test tool to fire a sample conversion and confirm it appears as <em>attributed</em> in Komorebi.</li>
+      </ol>
+
+      <div class="callout warn">
+        <strong>The single most important step:</strong> Komorebi's <code>click_id</code> must be carried into AppsFlyer as <code>customer_user_id</code> — it is the reconciliation match key. If it is empty, conversions cannot be attributed to your traffic.
+      </div>
+
+      
       <h3 class="sub-title" id="appsflyer">AppsFlyer Integration</h3>
       <p>AppsFlyer conversions are reconciled by Komorebi's <strong>MMP sync</strong>: Komorebi pulls AppsFlyer's raw in-app-events export and matches each event back to the originating click. The match key is AppsFlyer's <strong>Customer User ID</strong> — so Komorebi's auto-generated <code>click_id</code> must be passed into AppsFlyer as the <code>customer_user_id</code>.</p>
 
