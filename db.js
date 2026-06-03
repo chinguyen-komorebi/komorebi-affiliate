@@ -69,6 +69,12 @@ if (!advCols.includes('postback_secret'))   db.exec('ALTER TABLE advertisers ADD
 if (!advCols.includes('mmp_type'))      db.exec("ALTER TABLE advertisers ADD COLUMN mmp_type TEXT NOT NULL DEFAULT 'none'");
 if (!advCols.includes('mmp_app_id'))    db.exec('ALTER TABLE advertisers ADD COLUMN mmp_app_id TEXT');
 if (!advCols.includes('mmp_api_token')) db.exec('ALTER TABLE advertisers ADD COLUMN mmp_api_token TEXT');
+// Backlog #4 — per-advertiser timezone + default currency (additive). Must match the
+// advertiser's AppsFlyer app settings exactly; the #1 cause of reconciliation disputes.
+//   timezone — IANA name (e.g. Asia/Ho_Chi_Minh); null = fall back to the platform default.
+//   currency — default currency for this advertiser's conversions (e.g. USD, VND).
+if (!advCols.includes('timezone')) db.exec('ALTER TABLE advertisers ADD COLUMN timezone TEXT');
+if (!advCols.includes('currency')) db.exec("ALTER TABLE advertisers ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
 
 // ---------------------------------------------------------------------------
 // Clicks  (advertiser_slug added via migration for existing dbs)
@@ -155,6 +161,15 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_conv_transaction ON conversions(transact
 // Migration: user_id (F15) — advertiser's end-user id, for duplicate-user detection
 if (!convCols2.includes('user_id')) db.exec('ALTER TABLE conversions ADD COLUMN user_id TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_conv_user ON conversions(advertiser_slug, user_id)');
+// Backlog #1 — dispute / adjustment state per conversion (additive, backward-compatible):
+//   dispute_state — 'none' | 'disputed' | 'resolved'; set when a reconciliation run
+//     overturns a previously-decided conversion, or manually by an admin.
+//   adjustment / adjustment_note — a signed payout adjustment (e.g. clawback) applied
+//     during dispute resolution, kept separate from the original payout for an audit trail.
+if (!convCols2.includes('dispute_state'))   db.exec("ALTER TABLE conversions ADD COLUMN dispute_state TEXT NOT NULL DEFAULT 'none'");
+if (!convCols2.includes('adjustment'))      db.exec('ALTER TABLE conversions ADD COLUMN adjustment REAL');
+if (!convCols2.includes('adjustment_note')) db.exec('ALTER TABLE conversions ADD COLUMN adjustment_note TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_dispute ON conversions(advertiser_slug, dispute_state)');
 
 // ---------------------------------------------------------------------------
 // Reconciliation
@@ -185,6 +200,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_recon_um_run    ON reconciliation_unmatched(run_id);
   CREATE INDEX IF NOT EXISTS idx_conv_status     ON conversions(status);
 `);
+
+// Backlog #1 — discrepancy count per reconciliation run (additive). A discrepancy is a
+// matched row whose advertiser-supplied status overturns a conversion we had already
+// decided (e.g. we approved, the advertiser rejects), surfaced for dispute handling.
+const reconRunCols = db.prepare('PRAGMA table_info(reconciliation_runs)').all().map(c => c.name);
+if (!reconRunCols.includes('discrepancy')) db.exec('ALTER TABLE reconciliation_runs ADD COLUMN discrepancy INTEGER NOT NULL DEFAULT 0');
 
 // ---------------------------------------------------------------------------
 // Indexes
@@ -282,6 +303,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pblog_click_id  ON postback_log(click_id);
   CREATE INDEX IF NOT EXISTS idx_pblog_fired_at  ON postback_log(fired_at);
 `);
+
+// Backlog #2 — direction on the postback delivery log (additive). 'sent' = outbound S2S
+// postback Komorebi fires to a publisher (existing rows); 'received' = inbound conversion
+// postback an advertiser/MMP fires to Komorebi. Lets the global log show both legs.
+const pbLogCols = db.prepare('PRAGMA table_info(postback_log)').all().map(c => c.name);
+if (!pbLogCols.includes('direction')) db.exec("ALTER TABLE postback_log ADD COLUMN direction TEXT NOT NULL DEFAULT 'sent'");
+db.exec('CREATE INDEX IF NOT EXISTS idx_pblog_direction ON postback_log(direction, fired_at)');
 
 // ---------------------------------------------------------------------------
 // Settings  (key-value store for admin toggles)
