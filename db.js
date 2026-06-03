@@ -75,6 +75,11 @@ if (!advCols.includes('mmp_api_token')) db.exec('ALTER TABLE advertisers ADD COL
 //   currency — default currency for this advertiser's conversions (e.g. USD, VND).
 if (!advCols.includes('timezone')) db.exec('ALTER TABLE advertisers ADD COLUMN timezone TEXT');
 if (!advCols.includes('currency')) db.exec("ALTER TABLE advertisers ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
+// Backlog #5 — per-advertiser partner-link template (macro mapping for AppsFlyer onboarding).
+if (!advCols.includes('partner_link_template')) db.exec('ALTER TABLE advertisers ADD COLUMN partner_link_template TEXT');
+// Backlog #11 — advertiser portal login (separate from admin). Username = slug; password
+// is set by an admin. Null = portal access disabled for this advertiser.
+if (!advCols.includes('portal_password_hash')) db.exec('ALTER TABLE advertisers ADD COLUMN portal_password_hash TEXT');
 
 // ---------------------------------------------------------------------------
 // Clicks  (advertiser_slug added via migration for existing dbs)
@@ -256,6 +261,10 @@ if (!pubCols.includes('registration_note')) db.exec("ALTER TABLE publishers ADD 
 if (!pubCols.includes('minimum_payout'))    db.exec('ALTER TABLE publishers ADD COLUMN minimum_payout REAL NOT NULL DEFAULT 50');
 if (!pubCols.includes('api_key_hash'))      db.exec('ALTER TABLE publishers ADD COLUMN api_key_hash TEXT');
 if (!pubCols.includes('api_key_suffix'))    db.exec('ALTER TABLE publishers ADD COLUMN api_key_suffix TEXT'); // M3 — last 8 chars for UI badge
+// Backlog #12 — per-publisher custom tracking domain (e.g. go.partner.com). Null = use the
+// platform default (BASE_URL). Tracking/smart-link URLs are generated against it and the
+// app accepts requests arriving on it via the Host header.
+if (!pubCols.includes('custom_domain'))     db.exec('ALTER TABLE publishers ADD COLUMN custom_domain TEXT');
 
 // Ensure index exists for api_key_hash on existing databases
 db.exec('CREATE INDEX IF NOT EXISTS idx_pub_api_key_hash ON publishers(api_key_hash)');
@@ -424,6 +433,24 @@ const goalCols = db.prepare('PRAGMA table_info(goals)').all().map(c => c.name);
 if (!goalCols.includes('payout_type')) {
   db.exec("ALTER TABLE goals ADD COLUMN payout_type TEXT NOT NULL DEFAULT 'fixed'");
 }
+
+// ---------------------------------------------------------------------------
+// Backlog #7 — Event name mapping per advertiser. Maps the advertiser's own SDK
+// event name (e.g. "deposit_Trade_succeeded", "af_purchase") to a Komorebi event
+// value, so postbacks and MMP sync resolve to the right goal/payout regardless of
+// the advertiser's naming. Matching is case-insensitive on source_event.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS event_mappings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_id INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    source_event  TEXT NOT NULL,
+    mapped_event  TEXT NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(advertiser_id, source_event)
+  );
+  CREATE INDEX IF NOT EXISTS idx_evmap_advertiser ON event_mappings(advertiser_id);
+`);
 
 // ---------------------------------------------------------------------------
 // Publisher ↔ Advertiser assignments  (junction)
