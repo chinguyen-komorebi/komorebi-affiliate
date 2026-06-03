@@ -1996,7 +1996,9 @@ app.get('/admin/advertisers/new', requireAdmin, (req, res) => {
 app.post('/admin/advertisers', requireAdmin, (req, res) => {
   const { name, slug, offer_url, payout_amount, status } = req.body;
   const payoutType = req.body.payout_type === 'percent' ? 'percent' : 'fixed';
-  const lookback = parseInt(req.body.click_lookback_window, 10) > 0 ? parseInt(req.body.click_lookback_window, 10) : 30;
+  // Backlog #3 — default 90d aligns with AppsFlyer's default click lookback window;
+  // a misaligned window rejects valid postbacks (and disputes the rejections).
+  const lookback = parseInt(req.body.click_lookback_window, 10) > 0 ? parseInt(req.body.click_lookback_window, 10) : 90;
   const cap = (req.body.monthly_conversion_cap !== '' && req.body.monthly_conversion_cap != null && parseInt(req.body.monthly_conversion_cap, 10) >= 0)
     ? parseInt(req.body.monthly_conversion_cap, 10) : null;
   const isPublic = req.body.is_public ? 1 : 0;
@@ -2007,14 +2009,17 @@ app.post('/admin/advertisers', requireAdmin, (req, res) => {
   const mmpType = ['appsflyer', 'adjust'].includes(req.body.mmp_type) ? req.body.mmp_type : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
   const mmpToken = encryptToken((req.body.mmp_api_token || '').trim() || null);
+  // Backlog #4 — per-advertiser timezone + currency (validated; default USD)
+  const timezone = validTz((req.body.timezone || '').trim()) || null;
+  const currency = ((req.body.currency || 'USD').trim().toUpperCase().slice(0, 8)) || 'USD';
   const s = slug || slugify(name);
   if (!name || !s) return res.send(renderAdvForm({ title: 'New Advertiser', action: '/admin/advertisers',
     adv: req.body, error: 'Name and slug are required.', csrfToken: req.session.csrfToken }));
   if (!/^[a-z0-9-]+$/.test(s)) return res.send(renderAdvForm({ title: 'New Advertiser',
     action: '/admin/advertisers', adv: req.body, error: 'Slug must be lowercase letters, numbers, and hyphens.', csrfToken: req.session.csrfToken }));
   try {
-    db.prepare('INSERT INTO advertisers (slug, name, offer_url, payout_amount, payout_type, click_lookback_window, monthly_conversion_cap, is_public, category, description, countries_allowed, postback_secret, mmp_type, mmp_app_id, mmp_api_token, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(s, name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap, isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, status || 'active');
+    db.prepare('INSERT INTO advertisers (slug, name, offer_url, payout_amount, payout_type, click_lookback_window, monthly_conversion_cap, is_public, category, description, countries_allowed, postback_secret, mmp_type, mmp_app_id, mmp_api_token, timezone, currency, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(s, name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap, isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, status || 'active');
     logAudit('advertiser.created', 'advertiser', s,
       { name: name.trim(), slug: s, offer_url: offer_url || '', payout_type: payoutType, click_lookback_window: lookback, monthly_conversion_cap: cap, status: status || 'active' }, req);
     res.redirect(`/admin?msg=Advertiser+%22${encodeURIComponent(name)}%22+created`);
@@ -2093,6 +2098,26 @@ app.post('/admin/conversions/:id/status', requireAdmin, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Backlog #1 — set dispute/adjustment state on a conversion (reconciliation report)
+// ---------------------------------------------------------------------------
+app.post('/admin/conversions/:id/dispute', requireAdmin, (req, res) => {
+  const conv = db.prepare('SELECT * FROM conversions WHERE id = ?').get(req.params.id);
+  if (!conv) return res.redirect('/admin?msg=Conversion+not+found&ok=0');
+  const dispute = ['none', 'disputed', 'resolved'].includes(req.body.dispute_state) ? req.body.dispute_state : conv.dispute_state;
+  const adjRaw  = (req.body.adjustment ?? '').toString().trim();
+  const adjustment = adjRaw === '' ? null : (isNaN(parseFloat(adjRaw)) ? conv.adjustment : parseFloat(adjRaw));
+  const note = (req.body.adjustment_note || '').toString().trim() || null;
+  db.prepare('UPDATE conversions SET dispute_state=?, adjustment=?, adjustment_note=? WHERE id=?')
+    .run(dispute, adjustment, note, conv.id);
+  logAudit('conversion.dispute_updated', 'conversion', conv.id,
+    { dispute_state: dispute, adjustment, click_id: conv.click_id, advertiser: conv.advertiser_slug }, req);
+  const back = conv.reconciliation_run_id
+    ? `/admin/advertisers/${conv.advertiser_slug}/reconcile?run=${conv.reconciliation_run_id}`
+    : '/admin';
+  res.redirect(`${back}${back.includes('?') ? '&' : '?'}msg=Dispute+state+updated`);
+});
+
+// ---------------------------------------------------------------------------
 // Admin — conversion goals per advertiser
 // ---------------------------------------------------------------------------
 
@@ -2134,7 +2159,9 @@ app.post('/admin/advertisers/:slug/goals/:goalId/delete', requireAdmin, (req, re
 app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const { name, offer_url, payout_amount, status } = req.body;
   const payoutType = req.body.payout_type === 'percent' ? 'percent' : 'fixed';
-  const lookback = parseInt(req.body.click_lookback_window, 10) > 0 ? parseInt(req.body.click_lookback_window, 10) : 30;
+  // Backlog #3 — default 90d aligns with AppsFlyer's default click lookback window;
+  // a misaligned window rejects valid postbacks (and disputes the rejections).
+  const lookback = parseInt(req.body.click_lookback_window, 10) > 0 ? parseInt(req.body.click_lookback_window, 10) : 90;
   const cap = (req.body.monthly_conversion_cap !== '' && req.body.monthly_conversion_cap != null && parseInt(req.body.monthly_conversion_cap, 10) >= 0)
     ? parseInt(req.body.monthly_conversion_cap, 10) : null;
   const isPublic = req.body.is_public ? 1 : 0;
@@ -2145,6 +2172,9 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const mmpType = ['appsflyer', 'adjust'].includes(req.body.mmp_type) ? req.body.mmp_type : 'none';
   const mmpAppId = (req.body.mmp_app_id || '').trim() || null;
   const mmpTokenRaw = (req.body.mmp_api_token || '').trim();
+  // Backlog #4 — per-advertiser timezone + currency (validated; default USD)
+  const timezone = validTz((req.body.timezone || '').trim()) || null;
+  const currency = ((req.body.currency || 'USD').trim().toUpperCase().slice(0, 8)) || 'USD';
   const { slug } = req.params;
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
@@ -2162,17 +2192,17 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   if (isReset) {
     db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
         monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
-        mmp_type=?, mmp_app_id=?, mmp_api_token=?,
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, timezone=?, currency=?,
         status='active', cap_reset_month=?, cap_reset_at=datetime('now'),
         cap_alert_month=strftime('%Y-%m','now'), cap_alerted_80=0, cap_alerted_100=0 WHERE slug=?`)
       .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
-        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, submittedReset, slug);
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, submittedReset, slug);
   } else {
     db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
         monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
-        mmp_type=?, mmp_app_id=?, mmp_api_token=?, status=? WHERE slug=?`)
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, timezone=?, currency=?, status=? WHERE slug=?`)
       .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
-        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, status || 'active', slug);
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, status || 'active', slug);
   }
   logAudit('advertiser.updated', 'advertiser', slug,
     { name: name.trim(), offer_url: offer_url || '', payout_amount: parseFloat(payout_amount) || 0, payout_type: payoutType,
@@ -2575,6 +2605,55 @@ app.get('/admin/publishers/:id/postback-log', requireAdmin, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Backlog #2 — global Postback Delivery Log (sent S2S + received conversions),
+// filterable, with duplicate detection for debugging failed/duplicate postbacks.
+// "Sent" = outbound S2S we fire to publishers (postback_log). "Received" = inbound
+// conversion postbacks advertisers/MMPs fire to us (one row per conversion).
+// ---------------------------------------------------------------------------
+app.get('/admin/postback-log', requireAdmin, (req, res) => {
+  const dir    = ['sent', 'received'].includes(req.query.dir) ? req.query.dir : 'sent';
+  const status = ['ok', 'fail'].includes(req.query.status) ? req.query.status : 'all';
+  const q      = (req.query.q || '').trim();
+  const like   = `%${q}%`;
+  const LIMIT  = 300;
+
+  let rows, stats, dupSet;
+  if (dir === 'received') {
+    const where = ['1=1'];
+    const params = [];
+    if (q) { where.push('(cv.click_id LIKE ? OR cv.publisher LIKE ? OR cv.advertiser_slug LIKE ?)'); params.push(like, like, like); }
+    if (status === 'ok')   where.push("cv.status = 'approved'");
+    if (status === 'fail') where.push("cv.status IN ('rejected','duplicate')");
+    const w = where.join(' AND ');
+    rows = db.prepare(`SELECT cv.id, cv.click_id, cv.advertiser_slug, cv.publisher, cv.event, cv.status, cv.reason, cv.received_at AS ts
+      FROM conversions cv WHERE ${w} ORDER BY cv.received_at DESC LIMIT ${LIMIT}`).all(...params);
+    const s = db.prepare(`SELECT COUNT(*) total,
+        SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) ok,
+        SUM(CASE WHEN status IN ('rejected','duplicate') THEN 1 ELSE 0 END) fail FROM conversions`).get();
+    stats = { total: s.total, succeeded: s.ok, failed: s.fail };
+    // duplicate = same click_id received more than once (across events)
+    const dups = db.prepare('SELECT click_id FROM conversions GROUP BY click_id HAVING COUNT(*) > 1').all();
+    dupSet = new Set(dups.map(d => d.click_id));
+  } else {
+    const where = ['1=1'];
+    const params = [];
+    if (q) { where.push('(click_id LIKE ? OR publisher LIKE ? OR url LIKE ?)'); params.push(like, like, like); }
+    if (status === 'ok')   where.push('success = 1');
+    if (status === 'fail') where.push('success = 0');
+    const w = where.join(' AND ');
+    rows = db.prepare(`SELECT id, publisher, click_id, url, http_status, attempt, success, error, fired_at AS ts
+      FROM postback_log WHERE ${w} ORDER BY fired_at DESC LIMIT ${LIMIT}`).all(...params);
+    const s = db.prepare('SELECT COUNT(*) total, SUM(success) ok, COUNT(*)-SUM(success) fail FROM postback_log').get();
+    stats = { total: s.total, succeeded: s.ok || 0, failed: s.fail || 0 };
+    // duplicate = same click_id fired more than once
+    const dups = db.prepare('SELECT click_id FROM postback_log GROUP BY click_id HAVING COUNT(*) > 1').all();
+    dupSet = new Set(dups.map(d => d.click_id));
+  }
+
+  res.send(renderGlobalPostbackLog({ dir, status, q, rows, stats, dupCount: dupSet.size, dupSet }));
+});
+
+// ---------------------------------------------------------------------------
 // Invoices
 // ---------------------------------------------------------------------------
 
@@ -2808,7 +2887,18 @@ app.get('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res) => {
       const rejected  = db.prepare(
         "SELECT click_id, reason, payout FROM conversions WHERE reconciliation_run_id = ? AND status = 'rejected'"
       ).all(run.id);
-      runResult = { run, unmatched, rejected };
+      // Backlog #1 — disputed conversions (advertiser overturned our decision) for this run,
+      // with their dispute/adjustment state for manual resolution.
+      const disputed = db.prepare(
+        "SELECT id, click_id, status, reason, payout, currency, dispute_state, adjustment, adjustment_note FROM conversions WHERE reconciliation_run_id = ? AND dispute_state != 'none' ORDER BY id"
+      ).all(run.id);
+      // Backlog #1 — AppsFlyer flag breakdown across this advertiser's conversions.
+      const flags = db.prepare(`SELECT
+          SUM(CASE WHEN reason='mmp_attributed' THEN 1 ELSE 0 END) AS attributed,
+          SUM(CASE WHEN reason='mmp_rejected'   THEN 1 ELSE 0 END) AS rejectedFlag,
+          SUM(CASE WHEN reason='mmp_restricted' THEN 1 ELSE 0 END) AS restricted
+        FROM conversions WHERE advertiser_slug = ?`).get(adv.slug);
+      runResult = { run, unmatched, rejected, disputed, flags };
     }
   }
 
@@ -2838,7 +2928,7 @@ app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) =>
       'INSERT INTO reconciliation_runs (advertiser_slug, filename, total_rows) VALUES (?, ?, ?)'
     ).run(adv.slug, filename, rows.length).lastInsertRowid;
 
-    let matched = 0, approved = 0, rejected = 0, unmatched = 0;
+    let matched = 0, approved = 0, rejected = 0, unmatched = 0, discrepancy = 0;
 
     const insertUnmatched = db.prepare(
       'INSERT INTO reconciliation_unmatched (run_id, click_id, raw_status, reason, issue) VALUES (?, ?, ?, ?, ?)'
@@ -2867,10 +2957,10 @@ app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) =>
       // Prefer click_id; fall back to transaction_id (F9).
       let conv = null;
       if (click_id) {
-        conv = db.prepare('SELECT id FROM conversions WHERE click_id = ? AND advertiser_slug = ?').get(click_id, adv.slug);
+        conv = db.prepare('SELECT id, status FROM conversions WHERE click_id = ? AND advertiser_slug = ?').get(click_id, adv.slug);
       }
       if (!conv && txnId) {
-        conv = db.prepare('SELECT id FROM conversions WHERE transaction_id = ? AND advertiser_slug = ?').get(txnId, adv.slug);
+        conv = db.prepare('SELECT id, status FROM conversions WHERE transaction_id = ? AND advertiser_slug = ?').get(txnId, adv.slug);
       }
 
       if (!conv) {
@@ -2882,21 +2972,28 @@ app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) =>
       matched++;
       if (rawStatus === 'approved') approved++; else rejected++;
 
+      // Backlog #1 — a discrepancy is the advertiser overturning a conversion we had
+      // already decided (approved→rejected or rejected→approved). Flag it disputed so it
+      // surfaces in the reconciliation report for manual review.
+      const isDiscrepancy = (conv.status === 'approved' || conv.status === 'rejected') && conv.status !== rawStatus;
+      if (isDiscrepancy) discrepancy++;
+      const disputeSql = isDiscrepancy ? ", dispute_state='disputed'" : '';
+
       // Update by conversion id — robust whether matched by click_id or transaction_id.
       if (payout !== null && !isNaN(payout)) {
-        db.prepare('UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?, payout=? WHERE id=?')
+        db.prepare(`UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?, payout=?${disputeSql} WHERE id=?`)
           .run(rawStatus, reason, runId, payout, conv.id);
       } else {
-        db.prepare('UPDATE conversions SET status=?, reason=?, reconciliation_run_id=? WHERE id=?')
+        db.prepare(`UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?${disputeSql} WHERE id=?`)
           .run(rawStatus, reason, runId, conv.id);
       }
     }
 
-    db.prepare('UPDATE reconciliation_runs SET matched=?, approved=?, rejected=?, unmatched=? WHERE id=?')
-      .run(matched, approved, rejected, unmatched, runId);
+    db.prepare('UPDATE reconciliation_runs SET matched=?, approved=?, rejected=?, unmatched=?, discrepancy=? WHERE id=?')
+      .run(matched, approved, rejected, unmatched, discrepancy, runId);
 
     logAudit('reconciliation.uploaded', 'advertiser', adv.slug,
-      { advertiser: adv.name, filename, total_rows: rows.length, matched, approved, rejected, unmatched }, req);
+      { advertiser: adv.name, filename, total_rows: rows.length, matched, approved, rejected, unmatched, discrepancy }, req);
 
     res.redirect(`/admin/advertisers/${adv.slug}/reconcile?run=${runId}`);
   });
@@ -3470,6 +3567,7 @@ function adminSidebar() {
     analytics:   ic(`<rect x="1" y="9" width="3.5" height="5.5" rx=".5"/><rect x="6.2" y="5.5" width="3.5" height="9" rx=".5"/><rect x="11.5" y="2" width="3.5" height="12.5" rx=".5"/>`),
     auditlog:    ic(`<circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8 4.5V8.2l2.5 1.5"/>`),
     settings:    ic(`<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.2 3.2l1 1M11.8 11.8l1 1M12.8 3.2l-1 1M4.2 11.8l-1 1"/>`),
+    postback:    ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M3 6h8l-2-2M13 10H5l2 2"/>`),
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
@@ -3482,6 +3580,7 @@ function adminSidebar() {
   ${nav('/admin/publishers',  'Publishers',  'publishers',  '/admin/publishers')}
   ${nav('/admin/invoices',    'Invoices',    'invoices',    '/admin/invoices')}
   <div class="adm-sb-group">SYSTEM</div>
+  ${nav('/admin/postback-log','Postback Log','postback',    '/admin/postback-log')}
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
   ${nav('/admin/settings',    'Settings',    'settings',    '/admin/settings')}
   <div class="adm-sb-foot">
@@ -3992,9 +4091,29 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
         </select></div>
       <div class="fg"><label>Status</label><select name="status">${statusOpts}</select></div>
     </div>
-    <div class="fg"><label>Click Lookback Window (days)</label>
-      <input type="number" name="click_lookback_window" value="${H(adv.click_lookback_window ?? 30)}" step="1" min="1" style="max-width:160px">
-      <small>Postbacks for clicks older than this are rejected (HTTP 410). Default 30.</small></div>
+    <div class="fg"><label>Click Lookback / Attribution Window (days)</label>
+      <input type="number" name="click_lookback_window" value="${H(adv.click_lookback_window ?? 90)}" step="1" min="1" style="max-width:160px">
+      <small>Postbacks for clicks older than this are rejected (HTTP 410). <strong>Set this to match the advertiser's AppsFlyer attribution window exactly</strong> (AppsFlyer default is 90 days) — a misaligned window rejects valid postbacks and causes reconciliation disputes.</small></div>
+    <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <legend style="font-size:12px;font-weight:600;padding:0 6px">Reporting — Timezone &amp; Currency</legend>
+      <p style="font-size:12px;color:#6e6e73;margin:0 0 10px">Must match the advertiser's AppsFlyer app <strong>timezone</strong> and <strong>currency</strong> exactly — mismatches are the #1 cause of reconciliation disputes. Reconciliation timestamps for this advertiser are displayed in the timezone below.</p>
+      <div class="fg-row">
+        <div class="fg"><label>Timezone (IANA)</label>
+          <input type="text" name="timezone" value="${H(adv.timezone||'')}" placeholder="e.g. Asia/Ho_Chi_Minh (blank = platform default)" list="tzlist">
+          <datalist id="tzlist">
+            <option value="Asia/Ho_Chi_Minh"><option value="Asia/Bangkok"><option value="Asia/Singapore"><option value="Asia/Jakarta">
+            <option value="Asia/Manila"><option value="Asia/Kolkata"><option value="Asia/Dubai"><option value="Europe/London">
+            <option value="America/New_York"><option value="America/Los_Angeles"><option value="UTC">
+          </datalist>
+          <small>AppsFlyer app timezone. Blank falls back to ${H(FALLBACK_TZ)}.</small></div>
+        <div class="fg"><label>Default Currency</label>
+          <select name="currency">
+            ${['USD','VND','THB','SGD','IDR','PHP','INR','EUR','GBP','AED'].map(c =>
+              `<option value="${c}" ${(adv.currency||'USD')===c?'selected':''}>${c}</option>`).join('')}
+          </select>
+          <small>AppsFlyer app reporting currency.</small></div>
+      </div>
+    </fieldset>
     <div class="fg-row">
       <div class="fg"><label>Monthly Conversion Cap</label>
         <input type="number" name="monthly_conversion_cap" value="${adv.monthly_conversion_cap ?? ''}" step="1" min="0" placeholder="unlimited" style="max-width:160px">
@@ -4903,9 +5022,11 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
 }
 
 function renderReconcilePage({ adv, runs, runResult, csrfToken = '' }) {
+  const advTz = validTz(adv.timezone) || FALLBACK_TZ;
   const resultHtml = runResult ? (() => {
-    const { run, unmatched, rejected } = runResult;
+    const { run, unmatched, rejected, disputed = [], flags = {} } = runResult;
     const matchRate = run.total_rows > 0 ? Math.round((run.matched / run.total_rows) * 100) : 0;
+    const discrepancy = run.discrepancy || 0;
     const unmatchedRows = unmatched.map(r => `<tr>
       <td><code class="xs">${H(r.click_id||'—')}</code></td>
       <td>${H(r.raw_status)}</td>
@@ -4918,17 +5039,54 @@ function renderReconcilePage({ adv, runs, runResult, csrfToken = '' }) {
       <td>${H(r.reason||'—')}</td>
     </tr>`).join('');
 
+    const disputeOpt = (cur) => ['none','disputed','resolved'].map(s =>
+      `<option value="${s}" ${cur===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`).join('');
+    const disputedRows = disputed.map(c => `<tr>
+      <td><code class="xs">${H(c.click_id)}</code></td>
+      <td><span class="badge ${c.status==='approved'?'active':'paused'}">${H(c.status)}</span></td>
+      <td>${H(c.reason||'—')}</td>
+      <td>${fmtCur(c.payout, c.currency)}</td>
+      <td>
+        <form method="POST" action="/admin/conversions/${H(c.id)}/dispute" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${csrfField(csrfToken)}
+          <select name="dispute_state" style="padding:4px 6px;font-size:12px">${disputeOpt(c.dispute_state)}</select>
+          <input type="number" name="adjustment" value="${c.adjustment ?? ''}" step="0.01" placeholder="adj." style="width:90px;padding:4px 6px;font-size:12px">
+          <input type="text" name="adjustment_note" value="${H(c.adjustment_note||'')}" placeholder="note" style="width:140px;padding:4px 6px;font-size:12px">
+          <button class="btn btn-ghost" style="padding:4px 10px;font-size:12px">Save</button>
+        </form>
+      </td>
+    </tr>`).join('');
+
+    const flagTotal = (flags.attributed||0) + (flags.rejectedFlag||0) + (flags.restricted||0);
+
     return `
     <section style="border:2px solid #0071e3">
-      <div class="sh"><h2>Run #${run.id} — ${H(run.filename)}</h2>
-        <span class="meta">${H(run.uploaded_at)}</span></div>
-      <div class="cards" style="padding:20px;margin-bottom:0">
+      <div class="sh"><h2>Reconciliation Report — Run #${run.id} · ${H(run.filename)}</h2>
+        <span class="meta">${H(formatInTz(run.uploaded_at, advTz))} · ${H(advTz)}</span></div>
+      <div style="padding:8px 20px 0;font-size:12px;color:#6e6e73">Match key: <code>click_id</code> ↔ AppsFlyer <code>customer_user_id</code> · Currency <strong>${H(adv.currency||'USD')}</strong></div>
+      <div class="cards" style="padding:16px 20px 4px;margin-bottom:0">
         <div class="card"><div class="lbl">Total Rows</div><div class="val">${N(run.total_rows)}</div></div>
         <div class="card"><div class="lbl">Matched</div><div class="val">${N(run.matched)} <small style="font-size:12px;color:#6e6e73">(${matchRate}%)</small></div></div>
         <div class="card"><div class="lbl">Approved</div><div class="val green">${N(run.approved)}</div></div>
         <div class="card"><div class="lbl">Rejected</div><div class="val" style="color:#c62828">${N(run.rejected)}</div></div>
         <div class="card"><div class="lbl">Unmatched</div><div class="val" style="color:#f57f17">${N(run.unmatched)}</div></div>
+        <div class="card"><div class="lbl">Discrepancies</div><div class="val" style="color:${discrepancy>0?'#c62828':'#1d1d1f'}">${N(discrepancy)}</div></div>
       </div>
+      ${flagTotal > 0 ? `
+      <div style="padding:4px 20px 16px">
+        <h3 style="font-size:13px;font-weight:600;margin-bottom:8px">AppsFlyer Attribution Flags <small style="font-weight:400;color:#6e6e73">(this advertiser)</small></h3>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;font-size:12px">
+          <span class="badge active">Attributed: ${N(flags.attributed||0)}</span>
+          <span class="badge paused">Rejected / organic: ${N(flags.rejectedFlag||0)}</span>
+          <span class="badge" style="background:#fff3e0;color:#e65100">Restricted (review): ${N(flags.restricted||0)}</span>
+        </div>
+      </div>` : ''}
+      ${disputed.length > 0 ? `
+      <div style="padding:0 20px 16px">
+        <h3 style="font-size:13px;font-weight:600;margin-bottom:8px">Disputed / Discrepant Conversions (${disputed.length})</h3>
+        <p style="font-size:11px;color:#6e6e73;margin-bottom:8px">The advertiser's decision overturned ours. Set a dispute state and an optional payout adjustment (e.g. a clawback) per conversion.</p>
+        <table><thead><tr><th>Click ID</th><th>Status</th><th>Reason</th><th>Payout</th><th>Dispute / Adjustment</th></tr></thead>
+        <tbody>${disputedRows}</tbody></table>
+      </div>` : ''}
       ${rejected.length > 0 ? `
       <div style="padding:0 20px 16px">
         <h3 style="font-size:13px;font-weight:600;margin-bottom:8px">Rejected Conversions (${rejected.length})</h3>
@@ -4945,13 +5103,14 @@ function renderReconcilePage({ adv, runs, runResult, csrfToken = '' }) {
   })() : '';
 
   const historyRows = runs.map(r => `<tr>
-    <td>${H(r.uploaded_at)}</td>
+    <td>${H(formatInTz(r.uploaded_at, advTz))}</td>
     <td>${H(r.filename)}</td>
     <td>${N(r.total_rows)}</td>
     <td>${N(r.matched)}</td>
     <td><span style="color:#2e7d32;font-weight:600">${N(r.approved)}</span></td>
     <td><span style="color:#c62828">${N(r.rejected)}</span></td>
     <td><span style="color:#f57f17">${N(r.unmatched)}</span></td>
+    <td><span style="color:${(r.discrepancy||0)>0?'#c62828':'#6e6e73'}">${N(r.discrepancy||0)}</span></td>
     <td><a href="/admin/advertisers/${H(adv.slug)}/reconcile?run=${r.id}" class="btn btn-ghost">View</a></td>
   </tr>`).join('');
 
@@ -4988,7 +5147,7 @@ ${resultHtml}
   ${runs.length === 0 ? '<div class="empty">No reconciliation runs yet.</div>' : `
   <table><thead><tr>
     <th>Date</th><th>Filename</th><th>Total Rows</th><th>Matched</th>
-    <th>Approved</th><th>Rejected</th><th>Unmatched</th><th></th>
+    <th>Approved</th><th>Rejected</th><th>Unmatched</th><th>Discrepancy</th><th></th>
   </tr></thead><tbody>${historyRows}</tbody></table>`}
 </section>
 </main>`;
@@ -5039,6 +5198,73 @@ function renderPostbackLog({ pub, logs, stats }) {
 </main>`;
 
   return adminLayout(`S2S Log — ${pub.username}`, body);
+}
+
+// Backlog #2 — global postback delivery log (sent + received) with filters + dup flags
+function renderGlobalPostbackLog({ dir, status, q, rows, stats, dupCount, dupSet }) {
+  const tab = (d, label) => `<a href="/admin/postback-log?dir=${d}${status!=='all'?`&status=${status}`:''}${q?`&q=${encodeURIComponent(q)}`:''}"
+    class="btn ${dir===d?'btn-primary':'btn-ghost'}" style="margin-right:6px">${label}</a>`;
+  const statusPill = (s, label) => `<a href="/admin/postback-log?dir=${dir}${s!=='all'?`&status=${s}`:''}${q?`&q=${encodeURIComponent(q)}`:''}"
+    class="btn ${status===s?'btn-primary':'btn-ghost'}" style="margin-right:6px;padding:5px 10px;font-size:12px">${label}</a>`;
+
+  const sentRows = rows.map(l => {
+    const dup = dupSet.has(l.click_id);
+    const ok  = l.success;
+    return `<tr${dup?' style="background:#fffbf0"':''}>
+      <td>${H(l.ts)}</td>
+      <td>${H(l.publisher)}</td>
+      <td><code class="xs">${H(l.click_id)}</code>${dup?' <span class="badge" style="background:#fff3e0;color:#e65100">dup</span>':''}</td>
+      <td style="font-size:11px;max-width:320px;word-break:break-all">${H(l.url)}</td>
+      <td><span class="badge ${ok?'active':'paused'}">${ok ? `${l.http_status} OK` : (l.http_status?`${l.http_status} Err`:'Failed')}</span></td>
+      <td style="text-align:center">${l.attempt}</td>
+      <td style="font-size:11px;color:#c62828">${H(l.error||'')}</td>
+    </tr>`;
+  }).join('');
+
+  const recvRows = rows.map(l => {
+    const dup = dupSet.has(l.click_id);
+    const cls = l.status === 'approved' ? 'active' : (l.status === 'pending' ? '' : 'paused');
+    return `<tr${dup?' style="background:#fffbf0"':''}>
+      <td>${H(l.ts)}</td>
+      <td>${H(l.publisher)}</td>
+      <td>${H(l.advertiser_slug)}</td>
+      <td><code class="xs">${H(l.click_id)}</code>${dup?' <span class="badge" style="background:#fff3e0;color:#e65100">dup</span>':''}</td>
+      <td>${H(l.event)}</td>
+      <td><span class="badge ${cls}">${H(l.status)}</span></td>
+      <td style="font-size:11px;color:#6e6e73">${H(l.reason||'')}</td>
+    </tr>`;
+  }).join('');
+
+  const table = dir === 'received'
+    ? `<table><thead><tr><th>Received At</th><th>Publisher</th><th>Advertiser</th><th>Click ID</th><th>Event</th><th>Status</th><th>Reason</th></tr></thead><tbody>${recvRows}</tbody></table>`
+    : `<table><thead><tr><th>Fired At</th><th>Publisher</th><th>Click ID</th><th>URL Fired</th><th>Status</th><th style="text-align:center">Attempt</th><th>Error</th></tr></thead><tbody>${sentRows}</tbody></table>`;
+
+  const body = `${adminHeader()}
+<main>
+<div class="cards" style="margin-bottom:16px">
+  <div class="card"><div class="lbl">Total ${dir==='received'?'Received':'Sent'}</div><div class="val">${N(stats?.total||0)}</div></div>
+  <div class="card"><div class="lbl">${dir==='received'?'Approved':'Succeeded'}</div><div class="val green">${N(stats?.succeeded||0)}</div></div>
+  <div class="card"><div class="lbl">${dir==='received'?'Rejected/Dup':'Failed'}</div><div class="val" style="color:#c62828">${N(stats?.failed||0)}</div></div>
+  <div class="card"><div class="lbl">Duplicate click_ids</div><div class="val" style="color:${dupCount>0?'#e65100':'#1d1d1f'}">${N(dupCount||0)}</div></div>
+</div>
+<section>
+  <div class="sh"><h2>Postback Delivery Log</h2><span class="meta">Last ${N(rows.length)} ${dir==='received'?'received':'sent'} · compare against AppsFlyer Postbacks raw report</span></div>
+  <div style="padding:14px 20px;border-bottom:1px solid #f0f0f0">
+    <div style="margin-bottom:10px">${tab('sent','Sent (S2S → publisher)')}${tab('received','Received (← advertiser/MMP)')}</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      ${statusPill('all','All')}${statusPill('ok',dir==='received'?'Approved':'Success')}${statusPill('fail',dir==='received'?'Rejected':'Failed')}
+      <form method="GET" action="/admin/postback-log" style="display:flex;gap:6px;margin-left:auto">
+        <input type="hidden" name="dir" value="${H(dir)}"><input type="hidden" name="status" value="${H(status)}">
+        <input type="text" name="q" value="${H(q)}" placeholder="search click_id / publisher" style="padding:6px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px;width:240px">
+        <button class="btn btn-ghost">Search</button>
+        ${q?`<a href="/admin/postback-log?dir=${H(dir)}" class="btn btn-ghost">Clear</a>`:''}
+      </form>
+    </div>
+  </div>
+  ${rows.length===0 ? '<div class="empty">No postback records match.</div>' : table}
+</section>
+</main>`;
+  return adminLayout('Postback Delivery Log', body);
 }
 
 // ---------------------------------------------------------------------------
