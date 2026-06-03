@@ -494,6 +494,20 @@ function formatInTz(utcStr, tz) {
   }).format(date).replace(',', '');
 }
 
+// Backlog #12 — normalize a custom tracking domain to a bare host (strip scheme,
+// path, port, whitespace, lowercase). Returns null for blank/invalid input.
+function normalizeDomain(input) {
+  let d = (input || '').trim().toLowerCase();
+  if (!d) return null;
+  d = d.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/:\d+$/, '');
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : null;
+}
+
+// Base URL for a publisher's tracking links — their custom domain if set, else the platform default.
+function publisherBase(pub) {
+  return pub && pub.custom_domain ? `https://${pub.custom_domain}` : BASE_URL;
+}
+
 function generateApiKey() {
   return 'kom_live_' + crypto.randomBytes(16).toString('hex');
 }
@@ -1727,7 +1741,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
     approved_count: convMap[a.slug]?.approved_count || 0,
     pending_count:  convMap[a.slug]?.pending_count || 0,
     rejected_count: convMap[a.slug]?.rejected_count || 0,
-    trackingUrl: `${BASE_URL}/track/${a.slug}?pub=${encodeURIComponent(pub.username)}`,
+    trackingUrl: `${publisherBase(pub)}/track/${a.slug}?pub=${encodeURIComponent(pub.username)}`,
   }));
 
   const recent = db.prepare(`
@@ -2053,9 +2067,10 @@ app.get('/admin/advertisers/:slug/edit', requireAdmin, (req, res) => {
   const capUsed = adv.monthly_conversion_cap != null ? advertiserApprovedCount(adv) : null;
   // H2 — never send the decrypted token to the client. Pass only a "stored?" flag.
   const hasMmpToken = !!adv.mmp_api_token;
+  const hasPortalPw = !!adv.portal_password_hash;
   adv.mmp_api_token = null;
   res.send(renderAdvForm({ title: `Edit — ${adv.name}`, action: `/admin/advertisers/${adv.slug}/update`,
-    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed, hasMmpToken, eventMappings }));
+    adv, csrfToken: req.session.csrfToken, goals, flash, error, capUsed, hasMmpToken, eventMappings, hasPortalPw }));
 });
 
 // ---------------------------------------------------------------------------
@@ -2245,6 +2260,22 @@ app.post('/admin/advertisers/:slug/postback-test', requireAdmin, async (req, res
   res.send(renderPostbackTest({ adv, csrfToken: req.session.csrfToken, prefillClick: clickId, result }));
 });
 
+// Backlog #11 — set/clear advertiser portal password
+app.post('/admin/advertisers/:slug/portal-password', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const pw = (req.body.portal_password || '').trim();
+  if (pw === '') {
+    db.prepare('UPDATE advertisers SET portal_password_hash = NULL WHERE id = ?').run(adv.id);
+    logAudit('advertiser.portal_disabled', 'advertiser', adv.slug, {}, req);
+    return res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Advertiser+portal+disabled`);
+  }
+  if (pw.length < 8) return res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Portal+password+must+be+at+least+8+characters&ok=0`);
+  db.prepare('UPDATE advertisers SET portal_password_hash = ? WHERE id = ?').run(hashPassword(pw), adv.id);
+  logAudit('advertiser.portal_enabled', 'advertiser', adv.slug, {}, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/edit?msg=Advertiser+portal+access+updated`);
+});
+
 
 app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   const { name, offer_url, payout_amount, status } = req.body;
@@ -2359,11 +2390,12 @@ app.post('/admin/publishers', requireAdmin, (req, res) => {
   if (password.length < 8) return res.send(renderPubForm({ title: 'New Publisher',
     action: '/admin/publishers', pub: req.body, error: 'Password must be at least 8 characters.', csrfToken: req.session.csrfToken }));
   const pbUrl  = (postback_url || '').trim();
+  const customDomain = normalizeDomain(req.body.custom_domain);
   const apiKey = generateApiKey();
   try {
     // M3 — store hash + suffix only (no plaintext); the key is shown once on the edit page.
-    const info = db.prepare('INSERT INTO publishers (username, password_hash, postback_url, api_key_hash, api_key_suffix, status) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(uname, hashPassword(password), pbUrl, hashApiKey(apiKey), apiKey.slice(-8), status || 'active');
+    const info = db.prepare('INSERT INTO publishers (username, password_hash, postback_url, custom_domain, api_key_hash, api_key_suffix, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(uname, hashPassword(password), pbUrl, customDomain, hashApiKey(apiKey), apiKey.slice(-8), status || 'active');
     logAudit('publisher.created', 'publisher', uname,
       { username: uname, status: status || 'active', s2s_url: pbUrl || null }, req);
     req.session.newApiKey = apiKey; // shown once on the edit page
@@ -2559,12 +2591,13 @@ app.post('/admin/publishers/:id/update', requireAdmin, (req, res) => {
     error: 'Password must be at least 8 characters.', csrfToken: req.session.csrfToken }));
   const pbUrl  = (postback_url || '').trim();
   const minPay = parseFloat(minimum_payout) >= 0 ? parseFloat(minimum_payout) : 50;
+  const customDomain = normalizeDomain(req.body.custom_domain);
   if (password) {
-    db.prepare('UPDATE publishers SET password_hash=?, postback_url=?, status=?, minimum_payout=? WHERE id=?')
-      .run(hashPassword(password), pbUrl, status || 'active', minPay, id);
+    db.prepare('UPDATE publishers SET password_hash=?, postback_url=?, custom_domain=?, status=?, minimum_payout=? WHERE id=?')
+      .run(hashPassword(password), pbUrl, customDomain, status || 'active', minPay, id);
   } else {
-    db.prepare('UPDATE publishers SET postback_url=?, status=?, minimum_payout=? WHERE id=?')
-      .run(pbUrl, status || 'active', minPay, id);
+    db.prepare('UPDATE publishers SET postback_url=?, custom_domain=?, status=?, minimum_payout=? WHERE id=?')
+      .run(pbUrl, customDomain, status || 'active', minPay, id);
   }
   const detail = { status: status || 'active', password_changed: !!password, minimum_payout: minPay };
   if (pbUrl !== (pub.postback_url || '')) {
@@ -2960,6 +2993,57 @@ app.post('/admin/settings/password', requireAdmin, (req, res) => {
 // Reconciliation  GET+POST /admin/advertisers/:slug/reconcile
 // ---------------------------------------------------------------------------
 
+// Shared reconciliation processor — used by the admin route and the advertiser
+// portal (Backlog #11). Creates a run, matches each CSV row to a conversion,
+// counts matched/approved/rejected/unmatched/discrepancy, flags overturned
+// conversions as disputed (Backlog #1), and writes the run summary.
+function processReconcileRows(adv, rows, filename, req) {
+  const runId = db.prepare(
+    'INSERT INTO reconciliation_runs (advertiser_slug, filename, total_rows) VALUES (?, ?, ?)'
+  ).run(adv.slug, filename, rows.length).lastInsertRowid;
+
+  let matched = 0, approved = 0, rejected = 0, unmatched = 0, discrepancy = 0;
+  const insertUnmatched = db.prepare(
+    'INSERT INTO reconciliation_unmatched (run_id, click_id, raw_status, reason, issue) VALUES (?, ?, ?, ?, ?)'
+  );
+
+  for (const row of rows) {
+    const click_id  = (row.click_id || row.clickid || row.click || '').trim();
+    const txnId     = (row.transaction_id || row.transactionid || row.txn_id || '').trim();
+    const rawStatus = (row.status || '').trim().toLowerCase();
+    const reason    = (row.reason || row.note || row.notes || '').trim();
+    const payout    = row.payout !== undefined && row.payout !== '' ? parseFloat(row.payout) : null;
+    const idLabel   = click_id || txnId;
+
+    if (!click_id && !txnId) { unmatched++; insertUnmatched.run(runId, '', rawStatus, reason, 'Missing click_id and transaction_id'); continue; }
+    if (!['approved', 'rejected'].includes(rawStatus)) { unmatched++; insertUnmatched.run(runId, idLabel, rawStatus, reason, `Invalid status: "${rawStatus}"`); continue; }
+
+    let conv = null;
+    if (click_id) conv = db.prepare('SELECT id, status FROM conversions WHERE click_id = ? AND advertiser_slug = ?').get(click_id, adv.slug);
+    if (!conv && txnId) conv = db.prepare('SELECT id, status FROM conversions WHERE transaction_id = ? AND advertiser_slug = ?').get(txnId, adv.slug);
+    if (!conv) { unmatched++; insertUnmatched.run(runId, idLabel, rawStatus, reason, 'No matching click_id or transaction_id for this advertiser'); continue; }
+
+    matched++;
+    if (rawStatus === 'approved') approved++; else rejected++;
+
+    const isDiscrepancy = (conv.status === 'approved' || conv.status === 'rejected') && conv.status !== rawStatus;
+    if (isDiscrepancy) discrepancy++;
+    const disputeSql = isDiscrepancy ? ", dispute_state='disputed'" : '';
+
+    if (payout !== null && !isNaN(payout)) {
+      db.prepare(`UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?, payout=?${disputeSql} WHERE id=?`).run(rawStatus, reason, runId, payout, conv.id);
+    } else {
+      db.prepare(`UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?${disputeSql} WHERE id=?`).run(rawStatus, reason, runId, conv.id);
+    }
+  }
+
+  db.prepare('UPDATE reconciliation_runs SET matched=?, approved=?, rejected=?, unmatched=?, discrepancy=? WHERE id=?')
+    .run(matched, approved, rejected, unmatched, discrepancy, runId);
+  logAudit('reconciliation.uploaded', 'advertiser', adv.slug,
+    { advertiser: adv.name, filename, total_rows: rows.length, matched, approved, rejected, unmatched, discrepancy }, req);
+  return { runId, matched, approved, rejected, unmatched, discrepancy };
+}
+
 app.get('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
@@ -3011,80 +3095,7 @@ app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) =>
     if (!req.file) return res.redirect(`/admin/advertisers/${adv.slug}/reconcile?msg=No+file+uploaded&ok=0`);
 
     const rows     = parseCSV(req.file.buffer);
-    const filename = req.file.originalname;
-
-    // Create run record
-    const runId = db.prepare(
-      'INSERT INTO reconciliation_runs (advertiser_slug, filename, total_rows) VALUES (?, ?, ?)'
-    ).run(adv.slug, filename, rows.length).lastInsertRowid;
-
-    let matched = 0, approved = 0, rejected = 0, unmatched = 0, discrepancy = 0;
-
-    const insertUnmatched = db.prepare(
-      'INSERT INTO reconciliation_unmatched (run_id, click_id, raw_status, reason, issue) VALUES (?, ?, ?, ?, ?)'
-    );
-
-    for (const row of rows) {
-      const click_id  = (row.click_id || row.clickid || row.click || '').trim();
-      // F9 — allow matching by the advertiser's transaction_id when click_id is absent
-      const txnId     = (row.transaction_id || row.transactionid || row.txn_id || '').trim();
-      const rawStatus = (row.status || '').trim().toLowerCase();
-      const reason    = (row.reason || row.note || row.notes || '').trim();
-      const payout    = row.payout !== undefined && row.payout !== '' ? parseFloat(row.payout) : null;
-      const idLabel   = click_id || txnId;
-
-      if (!click_id && !txnId) {
-        unmatched++;
-        insertUnmatched.run(runId, '', rawStatus, reason, 'Missing click_id and transaction_id');
-        continue;
-      }
-      if (!['approved', 'rejected'].includes(rawStatus)) {
-        unmatched++;
-        insertUnmatched.run(runId, idLabel, rawStatus, reason, `Invalid status: "${rawStatus}"`);
-        continue;
-      }
-
-      // Prefer click_id; fall back to transaction_id (F9).
-      let conv = null;
-      if (click_id) {
-        conv = db.prepare('SELECT id, status FROM conversions WHERE click_id = ? AND advertiser_slug = ?').get(click_id, adv.slug);
-      }
-      if (!conv && txnId) {
-        conv = db.prepare('SELECT id, status FROM conversions WHERE transaction_id = ? AND advertiser_slug = ?').get(txnId, adv.slug);
-      }
-
-      if (!conv) {
-        unmatched++;
-        insertUnmatched.run(runId, idLabel, rawStatus, reason, 'No matching click_id or transaction_id for this advertiser');
-        continue;
-      }
-
-      matched++;
-      if (rawStatus === 'approved') approved++; else rejected++;
-
-      // Backlog #1 — a discrepancy is the advertiser overturning a conversion we had
-      // already decided (approved→rejected or rejected→approved). Flag it disputed so it
-      // surfaces in the reconciliation report for manual review.
-      const isDiscrepancy = (conv.status === 'approved' || conv.status === 'rejected') && conv.status !== rawStatus;
-      if (isDiscrepancy) discrepancy++;
-      const disputeSql = isDiscrepancy ? ", dispute_state='disputed'" : '';
-
-      // Update by conversion id — robust whether matched by click_id or transaction_id.
-      if (payout !== null && !isNaN(payout)) {
-        db.prepare(`UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?, payout=?${disputeSql} WHERE id=?`)
-          .run(rawStatus, reason, runId, payout, conv.id);
-      } else {
-        db.prepare(`UPDATE conversions SET status=?, reason=?, reconciliation_run_id=?${disputeSql} WHERE id=?`)
-          .run(rawStatus, reason, runId, conv.id);
-      }
-    }
-
-    db.prepare('UPDATE reconciliation_runs SET matched=?, approved=?, rejected=?, unmatched=?, discrepancy=? WHERE id=?')
-      .run(matched, approved, rejected, unmatched, discrepancy, runId);
-
-    logAudit('reconciliation.uploaded', 'advertiser', adv.slug,
-      { advertiser: adv.name, filename, total_rows: rows.length, matched, approved, rejected, unmatched, discrepancy }, req);
-
+    const { runId } = processReconcileRows(adv, rows, req.file.originalname, req);
     res.redirect(`/admin/advertisers/${adv.slug}/reconcile?run=${runId}`);
   });
 });
@@ -3264,6 +3275,205 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Backlog #9 — Cohort / Retention reporting. Cohorts are keyed by media source
+// (publisher), network, or campaign; retention is the day-gap between the click
+// (D0) and each conversion, bucketed D0 / D1-7 / D8-14 / D15-28 / D28+. LTV is the
+// approved payout per cohort. cohort_type splits a click's first conversion
+// (acquisition) from later ones (re-engagement). CSV export via ?format=csv.
+// ---------------------------------------------------------------------------
+function cohortRows({ by, cohortType, advFilter }) {
+  const dimExpr = by === 'network'  ? "COALESCE(NULLIF(cl.network,''),'(none)')"
+                : by === 'campaign' ? "COALESCE(NULLIF(cl.campaign,''),'(none)')"
+                : 'cv.publisher';
+  const where = ['cl.click_id IS NOT NULL'];
+  const params = [];
+  if (advFilter) { where.push('cv.advertiser_slug = ?'); params.push(advFilter); }
+  const base = `
+    SELECT ${dimExpr} AS dim,
+      CAST(julianday(date(cv.received_at)) - julianday(date(cl.created_at)) AS INTEGER) AS d,
+      cv.payout AS payout, cv.status AS status,
+      ROW_NUMBER() OVER (PARTITION BY cv.click_id ORDER BY cv.received_at, cv.id) AS rn
+    FROM conversions cv JOIN clicks cl ON cl.click_id = cv.click_id
+    WHERE ${where.join(' AND ')}`;
+  const typeFilter = cohortType === 'acquisition' ? 'WHERE rn = 1'
+                   : cohortType === 'reengagement' ? 'WHERE rn > 1' : '';
+  return db.prepare(`
+    SELECT dim,
+      COUNT(*) AS conversions,
+      SUM(CASE WHEN status='approved' THEN payout ELSE 0 END) AS ltv,
+      SUM(CASE WHEN d<=0 THEN 1 ELSE 0 END) AS d0,
+      SUM(CASE WHEN d BETWEEN 1 AND 7   THEN 1 ELSE 0 END) AS d1_7,
+      SUM(CASE WHEN d BETWEEN 8 AND 14  THEN 1 ELSE 0 END) AS d8_14,
+      SUM(CASE WHEN d BETWEEN 15 AND 28 THEN 1 ELSE 0 END) AS d15_28,
+      SUM(CASE WHEN d > 28 THEN 1 ELSE 0 END) AS d28p
+    FROM ( ${base} ) ${typeFilter}
+    GROUP BY dim ORDER BY conversions DESC`).all(...params);
+}
+
+app.get('/admin/reports/cohort', requireAdmin, (req, res) => {
+  const by = ['media_source', 'network', 'campaign'].includes(req.query.by) ? req.query.by : 'media_source';
+  const cohortType = ['acquisition', 'reengagement'].includes(req.query.type) ? req.query.type : 'all';
+  const advFilter = (req.query.advertiser || '').trim();
+  const rows = cohortRows({ by, cohortType, advFilter });
+  if (req.query.format === 'csv') {
+    const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="cohort-${by}-${cohortType}.csv"`);
+    return res.send([
+      'media_source,conversions,ltv,D0,D1-7,D8-14,D15-28,D28+',
+      ...rows.map(r => [r.dim, r.conversions, $(r.ltv), r.d0, r.d1_7, r.d8_14, r.d15_28, r.d28p].map(q).join(',')),
+    ].join('\r\n'));
+  }
+  const advertisers = db.prepare("SELECT slug, name FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  res.send(renderCohortReport({ rows, by, cohortType, advFilter, advertisers }));
+});
+
+// ---------------------------------------------------------------------------
+// Backlog #10 — Pivot / grouped report. Flexible breakdown over up to two of:
+// media source (publisher), sub-source (subpub), geo (country), campaign, date,
+// advertiser. Metrics: conversions, approved, approved payout, revenue. CSV export.
+// ---------------------------------------------------------------------------
+const PIVOT_DIMS = {
+  publisher:  { label: 'Media Source',  expr: 'cv.publisher' },
+  subpub:     { label: 'Sub-source',    expr: "COALESCE(NULLIF(cl.subpub,''),'(none)')" },
+  country:    { label: 'Geo',           expr: "COALESCE(NULLIF(cl.country,''),'(none)')" },
+  campaign:   { label: 'Campaign',      expr: "COALESCE(NULLIF(cl.campaign,''),'(none)')" },
+  date:       { label: 'Date',          expr: 'date(cv.received_at)' },
+  advertiser: { label: 'Advertiser',    expr: 'cv.advertiser_slug' },
+};
+app.get('/admin/reports/pivot', requireAdmin, (req, res) => {
+  const dim1 = PIVOT_DIMS[req.query.dim1] ? req.query.dim1 : 'publisher';
+  const dim2 = (req.query.dim2 && PIVOT_DIMS[req.query.dim2] && req.query.dim2 !== dim1) ? req.query.dim2 : '';
+  const sel = dim2 ? `${PIVOT_DIMS[dim1].expr} AS k1, ${PIVOT_DIMS[dim2].expr} AS k2` : `${PIVOT_DIMS[dim1].expr} AS k1`;
+  const grp = dim2 ? 'k1, k2' : 'k1';
+  const rows = db.prepare(`
+    SELECT ${sel},
+      COUNT(*) AS conversions,
+      SUM(CASE WHEN cv.status='approved' THEN 1 ELSE 0 END) AS approved,
+      SUM(CASE WHEN cv.status='approved' THEN cv.payout ELSE 0 END) AS payout,
+      SUM(COALESCE(cv.revenue,0)) AS revenue
+    FROM conversions cv LEFT JOIN clicks cl ON cl.click_id = cv.click_id
+    GROUP BY ${grp} ORDER BY conversions DESC LIMIT 1000`).all();
+  if (req.query.format === 'csv') {
+    const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="pivot-${dim1}${dim2?'-'+dim2:''}.csv"`);
+    const head = [PIVOT_DIMS[dim1].label, ...(dim2 ? [PIVOT_DIMS[dim2].label] : []), 'conversions', 'approved', 'payout', 'revenue'];
+    return res.send([
+      head.join(','),
+      ...rows.map(r => [r.k1, ...(dim2 ? [r.k2] : []), r.conversions, r.approved, $(r.payout), $(r.revenue)].map(q).join(',')),
+    ].join('\r\n'));
+  }
+  res.send(renderPivotReport({ rows, dim1, dim2 }));
+});
+
+// Backlog #11 — Advertiser Portal (separate from Admin). Advertisers log in with
+// username = slug and an admin-set portal password; they get read-only access to
+// their own conversions, analytics, tracking links, and can upload reconciliation
+// CSVs — all scoped to their slug. No admin access.
+// ===========================================================================
+function requireAdvertiser(req, res, next) {
+  const slug = req.session?.advSlug;
+  if (!slug) return res.redirect('/advertiser/login');
+  const now = Date.now();
+  if (req.session.advLastActivity && now - req.session.advLastActivity > PUBLISHER_IDLE_MS) {
+    return req.session.destroy(() => res.redirect('/advertiser/login?err=' + encodeURIComponent('Session expired')));
+  }
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
+  if (!adv || !adv.portal_password_hash) {
+    return req.session.destroy(() => res.redirect('/advertiser/login?err=Portal+access+disabled'));
+  }
+  req.session.advLastActivity = now;
+  if (!req.session.csrfToken) req.session.csrfToken = generateCsrfToken();
+  req.advertiser = adv;
+  next();
+}
+
+app.get('/advertiser/login', (req, res) => {
+  if (req.session?.advSlug) return res.redirect('/advertiser/dashboard');
+  res.send(renderAdvLogin({ error: req.query.err || null }));
+});
+
+app.post('/advertiser/login', (req, res) => {
+  if (checkLoginLockout(req, res, publisherLoginAttempts)) return;
+  const slug = (req.body.username || '').trim().toLowerCase();
+  const adv = slug ? db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug) : null;
+  if (!adv || !adv.portal_password_hash || !checkPassword(req.body.password || '', adv.portal_password_hash)) {
+    recordLoginFailure(req.ip, publisherLoginAttempts);
+    return res.send(renderAdvLogin({ error: 'Invalid advertiser slug or password' }));
+  }
+  req.session.regenerate(err => {
+    if (err) return res.status(500).send('Session error');
+    req.session.advSlug = adv.slug;
+    req.session.save(saveErr => {
+      if (saveErr) return res.status(500).send('Session error');
+      recordLoginSuccess(req.ip, publisherLoginAttempts);
+      logAudit('advertiser.portal_login', 'advertiser', adv.slug, {}, req);
+      res.redirect('/advertiser/dashboard');
+    });
+  });
+});
+
+app.post('/advertiser/logout', (req, res) => {
+  req.session.destroy(() => res.redirect('/advertiser/login'));
+});
+
+app.get('/advertiser/dashboard', requireAdvertiser, (req, res) => {
+  const adv = req.advertiser;
+  const clicks = db.prepare('SELECT COUNT(*) n FROM clicks WHERE advertiser_slug = ?').get(adv.slug).n;
+  const statusRows = db.prepare(`SELECT
+      COUNT(*) total,
+      SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved,
+      SUM(CASE WHEN status='pending'  THEN 1 ELSE 0 END) pending,
+      SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) rejected
+    FROM conversions WHERE advertiser_slug = ?`).get(adv.slug);
+  const payoutRows = db.prepare(`SELECT currency, COALESCE(SUM(CASE WHEN status='approved' THEN payout ELSE 0 END),0) approved
+    FROM conversions WHERE advertiser_slug = ? GROUP BY currency`).all(adv.slug);
+  const recent = db.prepare('SELECT * FROM conversions WHERE advertiser_slug = ? ORDER BY received_at DESC LIMIT 15').all(adv.slug);
+  res.send(renderAdvDashboard({ adv, clicks, statusRows, payoutRows, recent }));
+});
+
+app.get('/advertiser/conversions', requireAdvertiser, (req, res) => {
+  const adv = req.advertiser;
+  const conversions = db.prepare('SELECT * FROM conversions WHERE advertiser_slug = ? ORDER BY received_at DESC LIMIT 500').all(adv.slug);
+  res.send(renderAdvConversions({ adv, conversions }));
+});
+
+app.get('/advertiser/analytics', requireAdvertiser, (req, res) => {
+  const adv = req.advertiser;
+  const dailyClicks = db.prepare("SELECT date(created_at) day, COUNT(*) n FROM clicks WHERE advertiser_slug=? AND created_at>=date('now','-29 days') GROUP BY day ORDER BY day").all(adv.slug);
+  const dailyConv   = db.prepare("SELECT date(received_at) day, COUNT(*) n FROM conversions WHERE advertiser_slug=? AND received_at>=date('now','-29 days') GROUP BY day ORDER BY day").all(adv.slug);
+  const geo = db.prepare("SELECT country, COUNT(*) n FROM clicks WHERE advertiser_slug=? AND country IS NOT NULL AND country!='XX' GROUP BY country ORDER BY n DESC LIMIT 10").all(adv.slug);
+  res.send(renderAdvAnalytics({ adv, dailyClicks, dailyConv, geo }));
+});
+
+app.get('/advertiser/tracking-links', requireAdvertiser, (req, res) => {
+  const adv = req.advertiser;
+  const pubs = db.prepare(`SELECT p.username FROM publisher_advertisers pa
+    JOIN publishers p ON p.id = pa.publisher_id WHERE pa.advertiser_id = ? ORDER BY p.username`).all(adv.id);
+  res.send(renderAdvTrackingLinks({ adv, pubs }));
+});
+
+app.get('/advertiser/reconcile', requireAdvertiser, (req, res) => {
+  const adv = req.advertiser;
+  const runs = db.prepare('SELECT * FROM reconciliation_runs WHERE advertiser_slug = ? ORDER BY uploaded_at DESC LIMIT 20').all(adv.slug);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderAdvReconcile({ adv, runs, csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/advertiser/reconcile', requireAdvertiser, (req, res) => {
+  csvUpload(req, res, err => {
+    if (err) return res.redirect(`/advertiser/reconcile?msg=${encodeURIComponent(err.message)}&ok=0`);
+    const bodyToken = (req.body._csrf || '').trim();
+    if (!bodyToken || bodyToken !== (req.session.csrfToken || '')) return res.status(403).send('Invalid CSRF token');
+    if (!req.file) return res.redirect('/advertiser/reconcile?msg=No+file+uploaded&ok=0');
+    const rows = parseCSV(req.file.buffer);
+    const r = processReconcileRows(req.advertiser, rows, req.file.originalname, req);
+    res.redirect(`/advertiser/reconcile?msg=${encodeURIComponent(`Processed ${rows.length} rows — ${r.matched} matched, ${r.approved} approved, ${r.rejected} rejected, ${r.unmatched} unmatched`)}`);
+  });
+});
+
 // HTML templates — shared helpers
 // ---------------------------------------------------------------------------
 
@@ -3658,6 +3868,7 @@ function adminSidebar() {
     auditlog:    ic(`<circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8 4.5V8.2l2.5 1.5"/>`),
     settings:    ic(`<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.2 3.2l1 1M11.8 11.8l1 1M12.8 3.2l-1 1M4.2 11.8l-1 1"/>`),
     postback:    ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M3 6h8l-2-2M13 10H5l2 2"/>`),
+    reports:     ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3 2h7l3 3v9H3z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 8.5h5M5.5 11h3M5.5 6h2"/>`),
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
@@ -3669,6 +3880,9 @@ function adminSidebar() {
   ${nav('/admin/advertisers', 'Advertisers', 'advertisers', '/admin/advertisers')}
   ${nav('/admin/publishers',  'Publishers',  'publishers',  '/admin/publishers')}
   ${nav('/admin/invoices',    'Invoices',    'invoices',    '/admin/invoices')}
+  <div class="adm-sb-group">REPORTS</div>
+  ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
+  ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/postback-log','Postback Log','postback',    '/admin/postback-log')}
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
@@ -4117,7 +4331,7 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   return adminLayout(`MMP Sync — ${adv.name}`, body);
 }
 
-function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], eventMappings = [], flash, capUsed = null, hasMmpToken = false }) {
+function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals = [], eventMappings = [], flash, capUsed = null, hasMmpToken = false, hasPortalPw = false }) {
   const isEdit = action.includes('/update');
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(adv.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
@@ -4206,6 +4420,20 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
       <a href="/admin/advertisers/${H(adv.slug)}/postback-test" class="btn btn-ghost">Postback Test Tool &rarr;</a>
       <a href="/docs#hmac" target="_blank" class="btn btn-ghost">HMAC Signing Docs &rarr;</a>
     </div>
+  </div>`;
+
+  // Backlog #11 — advertiser portal access (admin sets the portal password)
+  const portalSection = !isEdit ? '' : `
+  <div style="margin-top:28px">
+    <h2 style="font-size:16px;margin-bottom:4px">Advertiser Portal Access <span style="font-size:11px;color:#6e6e73">(Backlog #11)</span></h2>
+    <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px">
+      <p style="font-size:12px;color:#6e6e73;margin:0 0 10px">Give the advertiser read-only portal access (login at <code>/advertiser/login</code>, username <code>${H(adv.slug)}</code>): conversions, analytics, tracking links, and CSV reconciliation upload &mdash; no admin access.</p>
+      <form method="POST" action="/admin/advertisers/${H(adv.slug)}/portal-password" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${csrfField(csrfToken)}
+        <input type="password" name="portal_password" autocomplete="new-password" placeholder="${hasPortalPw ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (set) \u2014 enter to change' : 'set a portal password'}" style="flex:1;min-width:220px;font-family:monospace;font-size:12px;padding:8px 10px;border:1px solid #d2d2d7;border-radius:7px">
+        <button class="btn btn-primary">${hasPortalPw ? 'Update' : 'Enable'} Portal</button>
+        ${hasPortalPw ? `<button class="btn btn-danger" formaction="/admin/advertisers/${H(adv.slug)}/portal-password" name="portal_password" value="">Disable</button>` : ''}
+      </form>
+    </fieldset>
   </div>`;
 
   const body = `${adminHeader()}
@@ -4330,6 +4558,7 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
   ${eventMapSection}
   ${partnerLinkSection}
   ${pbToolsSection}
+  ${portalSection}
 </div></main>
 <script>
 function autoSlug(n){const s=document.getElementById('slug');if(s)s.value=n.value.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');}
@@ -4681,7 +4910,7 @@ ${flash ? `<div class="flash ${flash.type}">${H(flash.text)}</div>` : ''}
 }
 
 function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, error }) {
-  const smartUrl = `${BASE_URL}/go/${encodeURIComponent(pub.username)}`;
+  const smartUrl = `${publisherBase(pub)}/go/${encodeURIComponent(pub.username)}`;
   const ruleRows = rules.map(r => `<tr>
     <td>${r.priority}</td>
     <td><strong>${H(r.adv_name)}</strong> <span style="color:#8e8e93;font-size:11px">${H(r.adv_slug)}</span></td>
@@ -4890,6 +5119,10 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
              placeholder="https://partner.com/postback?cid={click_id}&payout={payout}&event={event}">
       <small>Macros: <code>{click_id}</code> <code>{payout}</code> <code>{event}</code> <code>{advertiser}</code> — fired on every conversion. Up to 3 attempts with 5-min retry on failure.</small>
     </div>
+    <div class="fg"><label>Custom Tracking Domain <span style="font-size:11px;color:#6e6e73">(Backlog #12)</span></label>
+      <input type="text" name="custom_domain" value="${H(pub.custom_domain||'')}" placeholder="e.g. go.partner.com (blank = platform default)">
+      <small>Branded domain for this publisher's tracking links. Point a CNAME at the Komorebi host; links are generated against it (e.g. <code>https://${H(pub.custom_domain||'go.partner.com')}/track/SLUG?pub=${H(pub.username||'PUB')}</code>). Enter the bare host, no scheme or path.</small>
+    </div>
     ${isEdit ? `<div class="fg"><label>API Key</label>
       ${newApiKey ? `<div style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:8px">
             <div style="font-size:11px;font-weight:600;margin-bottom:6px">New API key — copy it now; it will not be shown again.</div>
@@ -4925,7 +5158,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <small style="display:block;margin-bottom:8px">One link per active advertiser — pre-filled with their username.</small>
       ${db.prepare("SELECT slug,name FROM advertisers WHERE status='active' AND slug!='legacy' ORDER BY name").all()
         .map(a => {
-          const url = `${BASE_URL}/track/${a.slug}?pub=${encodeURIComponent(pub.username||'')}`;
+          const url = `${publisherBase(pub)}/track/${a.slug}?pub=${encodeURIComponent(pub.username||'')}`;
           return `<div style="margin-bottom:6px">
             <div style="font-size:10px;color:#6e6e73;margin-bottom:2px">${H(a.name)}</div>
             <div class="ubox" data-copy="${H(url)}">${H(url)}</div>
@@ -5450,6 +5683,230 @@ ${resultHtml}
 </main>
 <script>${CP_JS}</script>`;
   return adminLayout(`Postback Test — ${adv.name}`, body);
+}
+
+// Backlog #9 — cohort / retention report view
+function renderCohortReport({ rows, by, cohortType, advFilter, advertisers }) {
+  const byTab = (v, label) => `<a href="/admin/reports/cohort?by=${v}${cohortType!=='all'?`&type=${cohortType}`:''}${advFilter?`&advertiser=${encodeURIComponent(advFilter)}`:''}" class="btn ${by===v?'btn-primary':'btn-ghost'}" style="margin-right:6px">${label}</a>`;
+  const typeTab = (v, label) => `<a href="/admin/reports/cohort?by=${by}${v!=='all'?`&type=${v}`:''}${advFilter?`&advertiser=${encodeURIComponent(advFilter)}`:''}" class="btn ${cohortType===v?'btn-primary':'btn-ghost'}" style="margin-right:6px;padding:5px 10px;font-size:12px">${label}</a>`;
+  const csvHref = `/admin/reports/cohort?by=${by}&type=${cohortType}${advFilter?`&advertiser=${encodeURIComponent(advFilter)}`:''}&format=csv`;
+  const tableRows = rows.map(r => `<tr>
+    <td><strong>${H(r.dim||'(none)')}</strong></td>
+    <td>${N(r.conversions)}</td>
+    <td>$${$(r.ltv)}</td>
+    <td>${N(r.d0)}</td><td>${N(r.d1_7)}</td><td>${N(r.d8_14)}</td><td>${N(r.d15_28)}</td><td>${N(r.d28p)}</td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="${csvHref}" class="hbtn">Export CSV</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Cohort / Retention Report</h2><span class="meta">Retention by days from click · LTV = approved payout</span></div>
+  <div style="padding:14px 20px;border-bottom:1px solid #f0f0f0">
+    <div style="margin-bottom:8px;font-size:11px;color:#6e6e73">GROUP BY</div>
+    <div style="margin-bottom:12px">${byTab('media_source','Media Source')}${byTab('network','Network')}${byTab('campaign','Campaign')}</div>
+    <div style="margin-bottom:8px;font-size:11px;color:#6e6e73">COHORT TYPE</div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      ${typeTab('all','All')}${typeTab('acquisition','Acquisition (first)')}${typeTab('reengagement','Re-engagement (repeat)')}
+      <form method="GET" action="/admin/reports/cohort" style="margin-left:auto;display:flex;gap:6px">
+        <input type="hidden" name="by" value="${H(by)}"><input type="hidden" name="type" value="${H(cohortType)}">
+        <select name="advertiser" onchange="this.form.submit()" style="padding:6px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+          <option value="">All advertisers</option>
+          ${advertisers.map(a => `<option value="${H(a.slug)}" ${advFilter===a.slug?'selected':''}>${H(a.name)}</option>`).join('')}
+        </select>
+      </form>
+    </div>
+  </div>
+  ${rows.length===0 ? '<div class="empty">No conversion data for this cohort.</div>' : `
+  <table><thead><tr>
+    <th>Media Source</th><th>Conversions</th><th>LTV</th><th>D0</th><th>D1-7</th><th>D8-14</th><th>D15-28</th><th>D28+</th>
+  </tr></thead><tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Cohort Report', body);
+}
+
+// Backlog #10 — pivot / grouped report view
+function renderPivotReport({ rows, dim1, dim2 }) {
+  const dimSelect = (name, current, allowNone) => `<select name="${name}" onchange="this.form.submit()" style="padding:6px 10px;border:1px solid #d2d2d7;border-radius:7px;font-size:13px">
+    ${allowNone ? `<option value="">— none —</option>` : ''}
+    ${Object.entries(PIVOT_DIMS).map(([k, v]) => `<option value="${k}" ${current===k?'selected':''}>${v.label}</option>`).join('')}
+  </select>`;
+  const csvHref = `/admin/reports/pivot?dim1=${dim1}${dim2?`&dim2=${dim2}`:''}&format=csv`;
+  const head = `<th>${H(PIVOT_DIMS[dim1].label)}</th>${dim2?`<th>${H(PIVOT_DIMS[dim2].label)}</th>`:''}<th>Conversions</th><th>Approved</th><th>Payout</th><th>Revenue</th>`;
+  const tableRows = rows.map(r => `<tr>
+    <td><strong>${H(r.k1||'(none)')}</strong></td>${dim2?`<td>${H(r.k2||'(none)')}</td>`:''}
+    <td>${N(r.conversions)}</td><td>${N(r.approved)}</td><td>$${$(r.payout)}</td><td>$${$(r.revenue)}</td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="${csvHref}" class="hbtn">Export CSV</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Pivot / Grouped Report</h2><span class="meta">Conversion breakdown · payout &amp; revenue are approved-only</span></div>
+  <div style="padding:14px 20px;border-bottom:1px solid #f0f0f0">
+    <form method="GET" action="/admin/reports/pivot" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:12px;color:#6e6e73">Break down by</span>
+      ${dimSelect('dim1', dim1, false)}
+      <span style="font-size:12px;color:#6e6e73">then</span>
+      ${dimSelect('dim2', dim2, true)}
+      <noscript><button class="btn btn-ghost">Apply</button></noscript>
+    </form>
+    <p style="font-size:11px;color:#6e6e73;margin-top:8px">Tip: export to CSV for scheduled/emailed delivery. (A nightly emailed export can be wired to this endpoint via cron — see ops notes.)</p>
+  </div>
+  ${rows.length===0 ? '<div class="empty">No conversion data.</div>' : `
+  <table><thead><tr>${head}</tr></thead><tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Pivot Report', body);
+}
+
+// Backlog #11 — Advertiser portal HTML templates (reuse the publisher portal CSS)
+// ---------------------------------------------------------------------------
+function advLayout(title, body, adv = null, activeTab = null) {
+  const fonts = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">';
+  if (!adv) {
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${H(title)} — Komorebi Advertiser</title>${fonts}<style>${PUB_CSS}</style></head>
+<body>${body}<script>${PORTAL_JS}</script></body></html>`;
+  }
+  const navItem = (href, key, label) => `<a href="${href}" class="pub-nav-a${activeTab===key?' active':''}"><span>${label}</span></a>`;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${H(title)} — Komorebi Advertiser Portal</title>${fonts}<style>${PUB_CSS}</style></head>
+<body><div class="pub-shell">
+  <header class="pub-topbar">
+    <div class="pub-brand">
+      <button class="nav-burger" type="button" data-nav-toggle aria-label="Toggle menu" aria-controls="adv-sidebar" aria-expanded="false">☰</button>
+      <div class="pub-logo-mark">${SUN_ICON}</div>
+      <div><div class="pub-brand-name">KOMOREBI</div><div class="pub-brand-sub">ADVERTISER</div></div>
+    </div>
+    <div class="pub-topbar-r">
+      <span class="pub-topbar-user">Signed in as <strong>${H(adv.name)}</strong></span>
+      <form method="POST" action="/advertiser/logout" style="display:inline"><button class="pub-logout">Sign out</button></form>
+    </div>
+  </header>
+  <div class="pub-body">
+    <aside class="pub-sidebar" id="adv-sidebar" data-nav-sidebar>
+      <div class="pub-sb-group">OVERVIEW</div>
+      ${navItem('/advertiser/dashboard','dashboard','Dashboard')}
+      ${navItem('/advertiser/conversions','conversions','Conversions')}
+      ${navItem('/advertiser/analytics','analytics','Analytics')}
+      <div class="pub-sb-group">TOOLS</div>
+      ${navItem('/advertiser/reconcile','reconcile','Reconciliation')}
+      ${navItem('/advertiser/tracking-links','links','Tracking Links')}
+    </aside>
+    <div class="nav-backdrop" data-nav-backdrop></div>
+    <div class="pub-content">${body}</div>
+  </div>
+</div><script>${CP_JS}${PORTAL_JS}${NAV_TOGGLE_JS}</script></body></html>`;
+}
+
+function renderAdvLogin({ error }) {
+  const body = `<div style="max-width:400px;margin:80px auto;padding:0 20px">
+    <div style="text-align:center;margin-bottom:24px"><div class="pub-logo-mark" style="margin:0 auto 12px">${SUN_ICON}</div>
+      <h1 style="font-size:22px;font-weight:600">Advertiser Portal</h1>
+      <p style="color:#6e6e73;font-size:13px">Sign in with your advertiser slug and portal password.</p></div>
+    ${error ? `<div style="background:#fde8e8;color:#c62828;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:14px">${H(error)}</div>` : ''}
+    <form method="POST" action="/advertiser/login">
+      <div style="margin-bottom:12px"><label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">Advertiser Slug</label>
+        <input type="text" name="username" required autofocus style="width:100%;padding:10px 12px;border:1px solid #d2d2d7;border-radius:8px"></div>
+      <div style="margin-bottom:16px"><label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">Password</label>
+        <input type="password" name="password" required style="width:100%;padding:10px 12px;border:1px solid #d2d2d7;border-radius:8px"></div>
+      <button type="submit" style="width:100%;padding:11px;background:#0F6E56;color:#fff;border:0;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Sign In</button>
+    </form>
+  </div>`;
+  return advLayout('Advertiser Login', body);
+}
+
+function renderAdvDashboard({ adv, clicks, statusRows, payoutRows, recent }) {
+  const payoutCards = (payoutRows.length ? payoutRows : [{ currency: adv.currency || 'USD', approved: 0 }])
+    .map(p => `<div class="card"><div class="lbl">Approved Payout (${H(p.currency)})</div><div class="val green">${fmtCur(p.approved, p.currency)}</div></div>`).join('');
+  const rows = recent.map(c => `<tr>
+    <td>${H(formatInTz(c.received_at, validTz(adv.timezone) || FALLBACK_TZ))}</td>
+    <td><code class="xs">${H(c.click_id)}</code></td><td>${H(c.event)}</td>
+    <td>${fmtCur(c.payout, c.currency)}</td>
+    <td><span class="badge ${c.status==='approved'?'active':(c.status==='pending'?'':'paused')}">${H(c.status)}</span></td>
+  </tr>`).join('');
+  const body = `
+  <h1 style="font-size:22px;margin-bottom:4px">${H(adv.name)}</h1>
+  <p style="color:#6e6e73;font-size:13px;margin-bottom:20px">Timezone ${H(validTz(adv.timezone)||FALLBACK_TZ)} · Currency ${H(adv.currency||'USD')}</p>
+  <div class="cards" style="margin-bottom:24px">
+    <div class="card"><div class="lbl">Clicks</div><div class="val">${N(clicks)}</div></div>
+    <div class="card"><div class="lbl">Conversions</div><div class="val">${N(statusRows.total||0)}</div></div>
+    <div class="card"><div class="lbl">Approved</div><div class="val green">${N(statusRows.approved||0)}</div></div>
+    <div class="card"><div class="lbl">Pending</div><div class="val">${N(statusRows.pending||0)}</div></div>
+    ${payoutCards}
+  </div>
+  <section><div class="sh"><h2>Recent Conversions</h2></div>
+  ${recent.length===0 ? '<div class="empty">No conversions yet.</div>' :
+    `<table><thead><tr><th>Received</th><th>Click ID</th><th>Event</th><th>Payout</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`}
+  </section>`;
+  return advLayout('Dashboard', body, adv, 'dashboard');
+}
+
+function renderAdvConversions({ adv, conversions }) {
+  const tz = validTz(adv.timezone) || FALLBACK_TZ;
+  const rows = conversions.map(c => `<tr>
+    <td>${H(formatInTz(c.received_at, tz))}</td>
+    <td><code class="xs">${H(c.click_id)}</code></td><td>${H(c.publisher)}</td><td>${H(c.event)}</td>
+    <td>${fmtCur(c.payout, c.currency)}</td>
+    <td><span class="badge ${c.status==='approved'?'active':(c.status==='pending'?'':'paused')}">${H(c.status)}</span></td>
+    <td>${c.dispute_state && c.dispute_state!=='none' ? `<span class="badge paused">${H(c.dispute_state)}</span>` : ''}</td>
+  </tr>`).join('');
+  const body = `<h1 style="font-size:22px;margin-bottom:16px">Conversions</h1>
+  <section>${conversions.length===0 ? '<div class="empty">No conversions yet.</div>' :
+    `<table><thead><tr><th>Received</th><th>Click ID</th><th>Publisher</th><th>Event</th><th>Payout</th><th>Status</th><th>Dispute</th></tr></thead><tbody>${rows}</tbody></table>`}</section>`;
+  return advLayout('Conversions', body, adv, 'conversions');
+}
+
+function renderAdvAnalytics({ adv, dailyClicks, dailyConv, geo }) {
+  const clickMap = Object.fromEntries(dailyClicks.map(r => [r.day, r.n]));
+  const convMap  = Object.fromEntries(dailyConv.map(r => [r.day, r.n]));
+  const days = [...new Set([...dailyClicks.map(r => r.day), ...dailyConv.map(r => r.day)])].sort().reverse();
+  const dayRows = days.map(d => `<tr><td>${H(d)}</td><td>${N(clickMap[d]||0)}</td><td>${N(convMap[d]||0)}</td></tr>`).join('');
+  const geoRows = geo.map(g => `<tr><td>${H(g.country)}</td><td>${N(g.n)}</td></tr>`).join('');
+  const body = `<h1 style="font-size:22px;margin-bottom:16px">Analytics</h1>
+  <section style="margin-bottom:20px"><div class="sh"><h2>Last 30 Days</h2></div>
+    ${days.length===0 ? '<div class="empty">No activity in the last 30 days.</div>' :
+      `<table><thead><tr><th>Day</th><th>Clicks</th><th>Conversions</th></tr></thead><tbody>${dayRows}</tbody></table>`}</section>
+  <section><div class="sh"><h2>Top Geos</h2></div>
+    ${geo.length===0 ? '<div class="empty">No geo data.</div>' :
+      `<table><thead><tr><th>Country</th><th>Clicks</th></tr></thead><tbody>${geoRows}</tbody></table>`}</section>`;
+  return advLayout('Analytics', body, adv, 'analytics');
+}
+
+function renderAdvTrackingLinks({ adv, pubs }) {
+  const rows = pubs.map(p => {
+    const base = BASE_URL;
+    const url = `${base}/track/${adv.slug}?pub=${encodeURIComponent(p.username)}`;
+    return `<tr><td>${H(p.username)}</td><td><div class="ubox" data-copy="${H(url)}" style="word-break:break-all">${H(url)}</div></td></tr>`;
+  }).join('');
+  const body = `<h1 style="font-size:22px;margin-bottom:6px">Tracking Links</h1>
+  <p style="color:#6e6e73;font-size:13px;margin-bottom:16px">Live tracking links for publishers assigned to your campaign. Each click generates a unique <code>click_id</code> (your AppsFlyer <code>customer_user_id</code>).</p>
+  <section>${pubs.length===0 ? '<div class="empty">No publishers are assigned to your campaign yet.</div>' :
+    `<table><thead><tr><th>Publisher</th><th>Tracking URL</th></tr></thead><tbody>${rows}</tbody></table>`}</section>`;
+  return advLayout('Tracking Links', body, adv, 'links');
+}
+
+function renderAdvReconcile({ adv, runs, csrfToken, flash, error }) {
+  const tz = validTz(adv.timezone) || FALLBACK_TZ;
+  const rows = runs.map(r => `<tr>
+    <td>${H(formatInTz(r.uploaded_at, tz))}</td><td>${H(r.filename)}</td>
+    <td>${N(r.total_rows)}</td><td>${N(r.matched)}</td>
+    <td style="color:#2e7d32">${N(r.approved)}</td><td style="color:#c62828">${N(r.rejected)}</td>
+    <td style="color:#f57f17">${N(r.unmatched)}</td><td>${N(r.discrepancy||0)}</td>
+  </tr>`).join('');
+  const body = `<h1 style="font-size:22px;margin-bottom:6px">Reconciliation Upload</h1>
+  <p style="color:#6e6e73;font-size:13px;margin-bottom:16px">Upload your conversion decisions as CSV to approve/reject conversions. Columns: <code>click_id</code> (or <code>transaction_id</code>), <code>status</code> (approved/rejected), optional <code>reason</code>, <code>payout</code>.</p>
+  ${flash ? `<div class="flash success" style="margin-bottom:14px">${H(flash)}</div>` : ''}
+  ${error ? `<div style="background:#fde8e8;color:#c62828;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:14px">${H(error)}</div>` : ''}
+  <section style="margin-bottom:20px"><div style="padding:18px 20px">
+    <form method="POST" action="/advertiser/reconcile" enctype="multipart/form-data">${csrfField(csrfToken)}
+      <input type="file" name="csv_file" accept=".csv,.txt" required style="padding:6px;border:1px solid #d2d2d7;border-radius:7px;width:100%;max-width:420px;margin-bottom:12px"><br>
+      <button type="submit" style="padding:10px 18px;background:#0F6E56;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer">Upload &amp; Process</button>
+    </form>
+  </div></section>
+  <section><div class="sh"><h2>Recent Runs</h2></div>
+  ${runs.length===0 ? '<div class="empty">No reconciliation runs yet.</div>' :
+    `<table><thead><tr><th>Date</th><th>File</th><th>Rows</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Unmatched</th><th>Discrepancy</th></tr></thead><tbody>${rows}</tbody></table>`}
+  </section>`;
+  return advLayout('Reconciliation', body, adv, 'reconcile');
 }
 
 // Publisher portal HTML templates
