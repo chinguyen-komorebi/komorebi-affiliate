@@ -494,6 +494,20 @@ function formatInTz(utcStr, tz) {
   }).format(date).replace(',', '');
 }
 
+// Backlog #12 — normalize a custom tracking domain to a bare host (strip scheme,
+// path, port, whitespace, lowercase). Returns null for blank/invalid input.
+function normalizeDomain(input) {
+  let d = (input || '').trim().toLowerCase();
+  if (!d) return null;
+  d = d.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/:\d+$/, '');
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : null;
+}
+
+// Base URL for a publisher's tracking links — their custom domain if set, else the platform default.
+function publisherBase(pub) {
+  return pub && pub.custom_domain ? `https://${pub.custom_domain}` : BASE_URL;
+}
+
 function generateApiKey() {
   return 'kom_live_' + crypto.randomBytes(16).toString('hex');
 }
@@ -1727,7 +1741,7 @@ app.get('/publisher/dashboard', requirePublisher, (req, res) => {
     approved_count: convMap[a.slug]?.approved_count || 0,
     pending_count:  convMap[a.slug]?.pending_count || 0,
     rejected_count: convMap[a.slug]?.rejected_count || 0,
-    trackingUrl: `${BASE_URL}/track/${a.slug}?pub=${encodeURIComponent(pub.username)}`,
+    trackingUrl: `${publisherBase(pub)}/track/${a.slug}?pub=${encodeURIComponent(pub.username)}`,
   }));
 
   const recent = db.prepare(`
@@ -2359,11 +2373,12 @@ app.post('/admin/publishers', requireAdmin, (req, res) => {
   if (password.length < 8) return res.send(renderPubForm({ title: 'New Publisher',
     action: '/admin/publishers', pub: req.body, error: 'Password must be at least 8 characters.', csrfToken: req.session.csrfToken }));
   const pbUrl  = (postback_url || '').trim();
+  const customDomain = normalizeDomain(req.body.custom_domain);
   const apiKey = generateApiKey();
   try {
     // M3 — store hash + suffix only (no plaintext); the key is shown once on the edit page.
-    const info = db.prepare('INSERT INTO publishers (username, password_hash, postback_url, api_key_hash, api_key_suffix, status) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(uname, hashPassword(password), pbUrl, hashApiKey(apiKey), apiKey.slice(-8), status || 'active');
+    const info = db.prepare('INSERT INTO publishers (username, password_hash, postback_url, custom_domain, api_key_hash, api_key_suffix, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(uname, hashPassword(password), pbUrl, customDomain, hashApiKey(apiKey), apiKey.slice(-8), status || 'active');
     logAudit('publisher.created', 'publisher', uname,
       { username: uname, status: status || 'active', s2s_url: pbUrl || null }, req);
     req.session.newApiKey = apiKey; // shown once on the edit page
@@ -2559,12 +2574,13 @@ app.post('/admin/publishers/:id/update', requireAdmin, (req, res) => {
     error: 'Password must be at least 8 characters.', csrfToken: req.session.csrfToken }));
   const pbUrl  = (postback_url || '').trim();
   const minPay = parseFloat(minimum_payout) >= 0 ? parseFloat(minimum_payout) : 50;
+  const customDomain = normalizeDomain(req.body.custom_domain);
   if (password) {
-    db.prepare('UPDATE publishers SET password_hash=?, postback_url=?, status=?, minimum_payout=? WHERE id=?')
-      .run(hashPassword(password), pbUrl, status || 'active', minPay, id);
+    db.prepare('UPDATE publishers SET password_hash=?, postback_url=?, custom_domain=?, status=?, minimum_payout=? WHERE id=?')
+      .run(hashPassword(password), pbUrl, customDomain, status || 'active', minPay, id);
   } else {
-    db.prepare('UPDATE publishers SET postback_url=?, status=?, minimum_payout=? WHERE id=?')
-      .run(pbUrl, status || 'active', minPay, id);
+    db.prepare('UPDATE publishers SET postback_url=?, custom_domain=?, status=?, minimum_payout=? WHERE id=?')
+      .run(pbUrl, customDomain, status || 'active', minPay, id);
   }
   const detail = { status: status || 'active', password_changed: !!password, minimum_payout: minPay };
   if (pbUrl !== (pub.postback_url || '')) {
@@ -4681,7 +4697,7 @@ ${flash ? `<div class="flash ${flash.type}">${H(flash.text)}</div>` : ''}
 }
 
 function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, error }) {
-  const smartUrl = `${BASE_URL}/go/${encodeURIComponent(pub.username)}`;
+  const smartUrl = `${publisherBase(pub)}/go/${encodeURIComponent(pub.username)}`;
   const ruleRows = rules.map(r => `<tr>
     <td>${r.priority}</td>
     <td><strong>${H(r.adv_name)}</strong> <span style="color:#8e8e93;font-size:11px">${H(r.adv_slug)}</span></td>
@@ -4890,6 +4906,10 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
              placeholder="https://partner.com/postback?cid={click_id}&payout={payout}&event={event}">
       <small>Macros: <code>{click_id}</code> <code>{payout}</code> <code>{event}</code> <code>{advertiser}</code> — fired on every conversion. Up to 3 attempts with 5-min retry on failure.</small>
     </div>
+    <div class="fg"><label>Custom Tracking Domain <span style="font-size:11px;color:#6e6e73">(Backlog #12)</span></label>
+      <input type="text" name="custom_domain" value="${H(pub.custom_domain||'')}" placeholder="e.g. go.partner.com (blank = platform default)">
+      <small>Branded domain for this publisher's tracking links. Point a CNAME at the Komorebi host; links are generated against it (e.g. <code>https://${H(pub.custom_domain||'go.partner.com')}/track/SLUG?pub=${H(pub.username||'PUB')}</code>). Enter the bare host, no scheme or path.</small>
+    </div>
     ${isEdit ? `<div class="fg"><label>API Key</label>
       ${newApiKey ? `<div style="background:#fff8e1;border:1px solid #ffc107;border-radius:8px;padding:10px 12px;margin-bottom:8px">
             <div style="font-size:11px;font-weight:600;margin-bottom:6px">New API key — copy it now; it will not be shown again.</div>
@@ -4925,7 +4945,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <small style="display:block;margin-bottom:8px">One link per active advertiser — pre-filled with their username.</small>
       ${db.prepare("SELECT slug,name FROM advertisers WHERE status='active' AND slug!='legacy' ORDER BY name").all()
         .map(a => {
-          const url = `${BASE_URL}/track/${a.slug}?pub=${encodeURIComponent(pub.username||'')}`;
+          const url = `${publisherBase(pub)}/track/${a.slug}?pub=${encodeURIComponent(pub.username||'')}`;
           return `<div style="margin-bottom:6px">
             <div style="font-size:10px;color:#6e6e73;margin-bottom:2px">${H(a.name)}</div>
             <div class="ubox" data-copy="${H(url)}">${H(url)}</div>

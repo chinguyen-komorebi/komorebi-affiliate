@@ -258,6 +258,8 @@ if (!pubCols.includes('registration_note')) db.exec("ALTER TABLE publishers ADD 
 if (!pubCols.includes('minimum_payout'))    db.exec('ALTER TABLE publishers ADD COLUMN minimum_payout REAL NOT NULL DEFAULT 50');
 if (!pubCols.includes('api_key_hash'))      db.exec('ALTER TABLE publishers ADD COLUMN api_key_hash TEXT');
 if (!pubCols.includes('api_key_suffix'))    db.exec('ALTER TABLE publishers ADD COLUMN api_key_suffix TEXT'); // M3 — last 8 chars for UI badge
+// Backlog #12 — per-publisher custom tracking domain. Null = use the platform default.
+if (!pubCols.includes('custom_domain'))     db.exec('ALTER TABLE publishers ADD COLUMN custom_domain TEXT');
 
 // Ensure index exists for api_key_hash on existing databases
 db.exec('CREATE INDEX IF NOT EXISTS idx_pub_api_key_hash ON publishers(api_key_hash)');
