@@ -1126,17 +1126,19 @@ function recordClick(req, slug, pub) {
   const adgroup  = af_adset    || adjust_adgroup  || null;
   const creative = af_ad       || adjust_creative || null;
   const network  = af_siteid   || adjust_network  || null;
+  // Backlog #17 — agency / sub-affiliate dimension carried on the tracking link
+  const af_sub1 = q('af_sub1'), af_sub2 = q('af_sub2');
 
   db.prepare(
     `INSERT INTO clicks (click_id, advertiser_slug, publisher, ip, user_agent, country, device_type, os, browser,
        sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
        af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-       campaign, adgroup, creative, network)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       campaign, adgroup, creative, network, af_sub1, af_sub2)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(clickId, slug, pub, clickIp, clickUa, country, device, os, browser,
     sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
     af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-    campaign, adgroup, creative, network);
+    campaign, adgroup, creative, network, af_sub1, af_sub2);
 
   return { clickId, device, country };
 }
@@ -1342,14 +1344,28 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     }
   }
 
+  // Backlog #15 — CTIT (click-to-conversion time, seconds) + anomaly flag.
+  // clickAgeMs was computed above for the lookback check.
+  const ctitSeconds = Number.isFinite(clickAgeMs) ? Math.max(0, Math.floor(clickAgeMs / 1000)) : null;
+  let fraudFlag = null;
+  if (ctitSeconds != null) {
+    if (ctitSeconds < 10) fraudFlag = 'ctit_too_fast';
+    else if (ctitSeconds > 2592000) fraudFlag = 'ctit_too_slow'; // > 30 days
+  }
+  // Backlog #17 — propagate the sub-affiliate dimension from the click.
+  const afSub1 = click.af_sub1 || null;
+  const afSub2 = click.af_sub2 || null;
+
   let result;
   try {
     db.prepare(
-      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?)`
-    ).run(click_id, slug, pub, event, amount, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)));
+      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?)`
+    ).run(click_id, slug, pub, event, amount, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2);
     result = { status: duplicate ? 'duplicate' : 'ok', click_id, advertiser: slug, publisher: pub, event,
-               payout: amount, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId };
+               payout: amount, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId,
+               ctit_seconds: ctitSeconds };
+    if (fraudFlag) result.fraud_flag = fraudFlag;
     if (note) result.note = note;
   } catch (err) {
     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err.message && err.message.includes('UNIQUE constraint'))) {
@@ -1357,6 +1373,21 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
       return res.json({ status: 'duplicate' });
     }
     throw err;
+  }
+
+  // Backlog #14 — duplicate click_id across distinct events. Once a click_id has 2+
+  // distinct events, flag every conversion for that click_id, preserving any CTIT flag
+  // already set on the row (e.g. 'duplicate_click_id|ctit_too_fast').
+  const distinctEvents = db.prepare('SELECT COUNT(DISTINCT event) AS n FROM conversions WHERE click_id = ?').get(click_id).n;
+  if (distinctEvents >= 2) {
+    const dupRows = db.prepare('SELECT id, fraud_flag FROM conversions WHERE click_id = ?').all(click_id);
+    const setFlag = db.prepare('UPDATE conversions SET fraud_flag = ? WHERE id = ?');
+    for (const r of dupRows) {
+      const ctitPart = (r.fraud_flag || '').split('|').find(p => p.startsWith('ctit_'));
+      setFlag.run(ctitPart ? `duplicate_click_id|${ctitPart}` : 'duplicate_click_id', r.id);
+    }
+    result.fraud_flag = (result.fraud_flag && result.fraud_flag.startsWith('ctit_'))
+      ? `duplicate_click_id|${result.fraud_flag}` : 'duplicate_click_id';
   }
 
   logPostback(req, result);
@@ -1378,6 +1409,50 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     click_id, event, received_at: new Date().toISOString().replace('T', ' ').slice(0, 19),
   }).catch(() => {});
   fireWebhookConversion({ advertiserName: adv.name, publisher: pub, payout: amount, event }).catch(() => {});
+});
+
+// ---------------------------------------------------------------------------
+// Backlog #13 — Protect360 fraud ingest.
+// GET /postback/:slug/protect360?click_id=X&reason=Y
+// Same IP whitelist as the main postback. A flagged click_id is rejected ($0):
+// an existing conversion is overturned, otherwise a rejected row is inserted.
+// ---------------------------------------------------------------------------
+app.get('/postback/:slug/protect360', postbackLimiter, (req, res) => {
+  const ip = getIp(req);
+  if (!isWhitelisted(ip)) {
+    logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted' });
+    return res.status(403).json({ error: 'Forbidden — IP not whitelisted', ip });
+  }
+  const { slug } = req.params;
+  const click_id = (req.query.click_id || '').toString().trim();
+  const rawReason = (req.query.reason || '').toString().trim().slice(0, 120) || 'flagged';
+  const reason = `protect360:${rawReason}`;
+  if (!click_id) return res.status(400).json({ error: 'Missing required param: click_id' });
+
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
+  if (!adv) return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
+
+  const existing = db.prepare('SELECT * FROM conversions WHERE click_id = ? AND advertiser_slug = ?').all(click_id, slug);
+  let action;
+  if (existing.length > 0) {
+    db.prepare("UPDATE conversions SET status='rejected', reason=?, payout=0, fraud_source='protect360' WHERE click_id = ? AND advertiser_slug = ?")
+      .run(reason, click_id, slug);
+    action = 'updated';
+  } else {
+    // No matching conversion — record a rejected protect360 row (publisher from the click if known).
+    const click = db.prepare('SELECT publisher FROM clicks WHERE click_id = ?').get(click_id);
+    const publisher = click?.publisher || 'unknown';
+    db.prepare(`INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, status, reason, fraud_source, raw_params)
+                VALUES (?, ?, ?, 'protect360', 0, 'rejected', ?, 'protect360', ?)`)
+      .run(click_id, slug, publisher, reason, JSON.stringify(maskPII(req.query)));
+    action = 'inserted';
+  }
+
+  const publisher = existing[0]?.publisher || (db.prepare('SELECT publisher FROM clicks WHERE click_id = ?').get(click_id)?.publisher) || 'unknown';
+  logAudit('protect360.flagged', 'conversion', click_id, { advertiser: slug, reason, action, publisher }, req);
+  sendTelegram(`\u{1F6A8} Protect360: ${click_id} flagged [${rawReason}] — ${publisher} / ${slug}`).catch(() => {});
+  logPostback(req, { status: 'rejected', reason, click_id, advertiser: slug });
+  res.json({ status: 'flagged', action, click_id, advertiser: slug, reason });
 });
 
 // ---------------------------------------------------------------------------
@@ -1784,7 +1859,7 @@ app.get('/publisher/conversions', requirePublisher, (req, res) => {
   const pub = req.publisher;
   const conversions = db.prepare(`
     SELECT cv.received_at, cv.advertiser_slug, cv.click_id, cv.event,
-           cv.payout, cv.currency, cv.loan_amount, cv.revenue, cv.status, cv.reason, a.name as adv_name
+           cv.payout, cv.currency, cv.loan_amount, cv.revenue, cv.status, cv.reason, cv.af_sub1, a.name as adv_name
     FROM conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE cv.publisher = ?
@@ -1955,8 +2030,16 @@ app.get('/admin', requireAdmin, (req, res) => {
     ORDER BY payout DESC LIMIT 100
   `).all();
 
+  // Backlog #14/#15/#17 — fraud filter + CTIT + sub-affiliate columns on the recent table
+  const fraudFilter = ['flagged', 'duplicate_click_id', 'ctit', 'protect360'].includes(req.query.fraud) ? req.query.fraud : '';
+  let recentWhere = '';
+  if (fraudFilter === 'flagged')            recentWhere = 'WHERE fraud_flag IS NOT NULL OR fraud_source IS NOT NULL';
+  else if (fraudFilter === 'duplicate_click_id') recentWhere = "WHERE fraud_flag LIKE '%duplicate_click_id%'";
+  else if (fraudFilter === 'ctit')          recentWhere = "WHERE fraud_flag LIKE '%ctit%'";
+  else if (fraudFilter === 'protect360')    recentWhere = "WHERE fraud_source = 'protect360'";
   const recent = db.prepare(
-    'SELECT id, received_at, advertiser_slug, click_id, publisher, event, payout, status, reason FROM conversions ORDER BY received_at DESC LIMIT 50'
+    `SELECT id, received_at, advertiser_slug, click_id, publisher, event, payout, status, reason,
+            ctit_seconds, fraud_flag, fraud_source, af_sub1 FROM conversions ${recentWhere} ORDER BY received_at DESC LIMIT 50`
   ).all();
 
   const publisherCount = db.prepare("SELECT COUNT(*) as n FROM publishers WHERE status='active'").get().n;
@@ -1985,7 +2068,7 @@ app.get('/admin', requireAdmin, (req, res) => {
 
   res.send(renderAdminDashboard({ totalClicks, totalConversions,
     approvedByCurrency, pendingByCurrency, monthlyByCurrency,
-    thisMonth, advStats, pubStats, recent, flash, publisherCount,
+    thisMonth, advStats, pubStats, recent, flash, publisherCount, fraudFilter,
     topCountries, deviceSplit, osSplit, globalConvStatus, csrfToken: req.session.csrfToken }));
 });
 
@@ -3153,8 +3236,16 @@ app.get('/admin/advertisers/:slug/analytics', requireAdmin, (req, res) => {
     FROM conversions WHERE advertiser_slug = ?
   `).get(adv.slug);
 
+  // Backlog #17 — sub-affiliate breakdown (clicks from clicks.af_sub1, conversions + payout from conversions.af_sub1)
+  const subAffClicks = db.prepare("SELECT af_sub1, COUNT(*) AS clicks FROM clicks WHERE advertiser_slug = ? AND af_sub1 IS NOT NULL GROUP BY af_sub1").all(adv.slug);
+  const subAffConv   = db.prepare("SELECT af_sub1, COUNT(*) AS conversions, COALESCE(SUM(payout),0) AS payout FROM conversions WHERE advertiser_slug = ? AND af_sub1 IS NOT NULL GROUP BY af_sub1").all(adv.slug);
+  const subAffMap = {};
+  for (const r of subAffClicks) subAffMap[r.af_sub1] = { af_sub1: r.af_sub1, clicks: r.clicks, conversions: 0, payout: 0 };
+  for (const r of subAffConv) { subAffMap[r.af_sub1] = subAffMap[r.af_sub1] || { af_sub1: r.af_sub1, clicks: 0 }; subAffMap[r.af_sub1].conversions = r.conversions; subAffMap[r.af_sub1].payout = r.payout; }
+  const subAffBreakdown = Object.values(subAffMap).sort((a, b) => b.conversions - a.conversions || b.clicks - a.clicks);
+
   res.send(renderAnalyticsPage({ adv, dailyClicks, dailyConv, geoBreakdown,
-    deviceBreakdown, osBreakdown, browserBreakdown, totalClicksAdv, totalConvAdv, convStatus }));
+    deviceBreakdown, osBreakdown, browserBreakdown, totalClicksAdv, totalConvAdv, convStatus, subAffBreakdown }));
 });
 
 // ---------------------------------------------------------------------------
@@ -3259,7 +3350,7 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
   const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
 
   const rows = db.prepare(
-    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,currency,status,reason FROM conversions ${where} ORDER BY received_at`
+    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,currency,status,reason,af_sub1,af_sub2 FROM conversions ${where} ORDER BY received_at`
   ).all(...params);
 
   const parts = [advertiser, month].filter(Boolean);
@@ -3269,9 +3360,51 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   res.send([
-    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,currency,status,reason',
-    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.currency, r.status, r.reason].map(q).join(',')),
+    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,currency,status,reason,af_sub1,af_sub2',
+    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.currency, r.status, r.reason, r.af_sub1, r.af_sub2].map(q).join(',')),
   ].join('\r\n'));
+});
+
+// ---------------------------------------------------------------------------
+// Backlog #14/#16 — fraud review + publisher traffic-quality scoring
+// ---------------------------------------------------------------------------
+
+// Backlog #16 — on-the-fly traffic-quality score from the last 90 days of conversions.
+function publisherQualityScore(publisher) {
+  const r = db.prepare(`SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected,
+      SUM(CASE WHEN fraud_flag IS NOT NULL THEN 1 ELSE 0 END) AS fraud,
+      SUM(CASE WHEN fraud_flag LIKE '%ctit%' THEN 1 ELSE 0 END) AS ctit
+    FROM conversions WHERE publisher = ? AND received_at >= date('now','-90 days')`).get(publisher);
+  const total = r.total || 0;
+  if (total === 0) return { publisher, total: 0, rejection_rate: 0, fraud_rate: 0, ctit_anomaly_rate: 0, score: 100, grade: 'A' };
+  const rejection_rate = r.rejected / total, fraud_rate = r.fraud / total, ctit_anomaly_rate = r.ctit / total;
+  let score = 100 - (rejection_rate * 40) - (fraud_rate * 40) - (ctit_anomaly_rate * 20);
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const grade = score >= 90 ? 'A' : score >= 75 ? 'B' : score >= 60 ? 'C' : score >= 40 ? 'D' : 'F';
+  return { publisher, total, rejection_rate, fraud_rate, ctit_anomaly_rate, score, grade };
+}
+
+app.get('/admin/publisher-quality', requireAdmin, (req, res) => {
+  const pubs = db.prepare('SELECT username FROM publishers ORDER BY username').all();
+  const rows = pubs.map(p => publisherQualityScore(p.username)).sort((a, b) => a.score - b.score);
+  res.send(renderPublisherQuality({ rows }));
+});
+
+app.get('/admin/fraud', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT click_id, advertiser_slug,
+      MAX(publisher) AS publisher,
+      COUNT(*) AS n,
+      GROUP_CONCAT(DISTINCT event) AS events,
+      MAX(fraud_flag) AS fraud_flag,
+      MAX(fraud_source) AS fraud_source,
+      MAX(received_at) AS last_at
+    FROM conversions
+    WHERE fraud_flag IS NOT NULL OR fraud_source IS NOT NULL
+    GROUP BY click_id, advertiser_slug
+    ORDER BY last_at DESC LIMIT 500`).all();
+  res.send(renderFraudPage({ rows }));
 });
 
 // ---------------------------------------------------------------------------
@@ -3869,6 +4002,8 @@ function adminSidebar() {
     settings:    ic(`<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.2 3.2l1 1M11.8 11.8l1 1M12.8 3.2l-1 1M4.2 11.8l-1 1"/>`),
     postback:    ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M3 6h8l-2-2M13 10H5l2 2"/>`),
     reports:     ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3 2h7l3 3v9H3z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 8.5h5M5.5 11h3M5.5 6h2"/>`),
+    fraud:       ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M8 1.5l5.5 2.2v4.1c0 3.4-2.3 5.6-5.5 6.7-3.2-1.1-5.5-3.3-5.5-6.7V3.7L8 1.5z"/><path stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M8 5.5v3.2M8 10.8v.2"/>`),
+    quality:     ic(`<path stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" d="M8 1.6l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.3 4.3 13.4l.7-4.3-3.1-3 4.3-.6L8 1.6z"/>`),
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
@@ -3883,6 +4018,9 @@ function adminSidebar() {
   <div class="adm-sb-group">REPORTS</div>
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
+  <div class="adm-sb-group">RISK</div>
+  ${nav('/admin/fraud',            'Fraud Review',      'fraud',  '/admin/fraud')}
+  ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/postback-log','Postback Log','postback',    '/admin/postback-log')}
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
@@ -4019,9 +4157,17 @@ function renderAdminLogin(errorMsg) {
 </body></html>`;
 }
 
+// Backlog #15 — format CTIT seconds as "3s" / "2h 14m" / "5d"
+function fmtCtit(s) {
+  if (s == null) return '—';
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d`;
+}
 function renderAdminDashboard({ totalClicks, totalConversions,
   approvedByCurrency = [], pendingByCurrency = [], monthlyByCurrency = [],
-  thisMonth, advStats, pubStats, recent, flash, publisherCount,
+  thisMonth, advStats, pubStats, recent, flash, publisherCount, fraudFilter = '',
   topCountries = [], deviceSplit = [], osSplit = [], globalConvStatus = {}, csrfToken = '' }) {
 
   const advRows = advStats.filter(a => a.slug !== 'legacy' || a.clicks > 0).map(a => {
@@ -4087,13 +4233,17 @@ function renderAdminDashboard({ totalClicks, totalConversions,
            <button class="btn btn-ghost" style="font-size:10px;padding:1px 6px">Override</button>
          </form>`
       : `<span class="badge ${H(st)}">${H(st)}</span>`;
+    const ctitFlagged = (r.fraud_flag || '').includes('ctit');
     return `<tr>
       <td>${H(r.received_at)}</td><td>${H(adv?.name||r.advertiser_slug)}</td>
       <td><code>${H(r.publisher)}</code></td>
       <td><code class="xs">${H(r.click_id)}</code></td>
       <td><span class="badge ev">${H(r.event)}</span></td>
+      <td${ctitFlagged ? ' style="color:#c62828;font-weight:600"' : ''}>${fmtCtit(r.ctit_seconds)}</td>
+      <td>${r.af_sub1 ? `<code class="xs">${H(r.af_sub1)}</code>` : ''}</td>
       <td>$${$(r.payout)}</td>
       <td>${statusCell}</td>
+      <td>${fraudBadge(r.fraud_flag, r.fraud_source)}</td>
     </tr>`;
   }).join('');
 
@@ -4227,11 +4377,16 @@ ${(topCountries.length || deviceSplit.length) ? `
 <section>
   <div class="sh"><h2>Recent Conversions</h2>
     <div class="sh-r"><span class="meta">Last 50</span>
+      <form method="GET" action="/admin" style="display:inline">
+        <select name="fraud" onchange="this.form.submit()" style="font-size:12px;padding:4px 8px;border:1px solid #d2d2d7;border-radius:6px">
+          ${[['', 'All conversions'], ['flagged', 'Flagged only'], ['duplicate_click_id', 'Duplicate click_id'], ['ctit', 'CTIT anomaly'], ['protect360', 'Protect360']].map(([v, l]) => `<option value="${v}" ${fraudFilter === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+      </form>
       <a href="/admin/export.csv" class="btn btn-ghost">All CSV</a>
       <a href="/admin/export.csv?month=${thisMonth}" class="btn btn-ghost">${thisMonth} CSV</a></div>
   </div>
-  ${recentRows.length===0 ? '<div class="empty">No conversions yet.</div>'
-    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>Payout</th><th>Status</th></tr></thead>
+  ${recentRows.length===0 ? '<div class="empty">No conversions match.</div>'
+    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
         <tbody>${recentRows}</tbody></table>`}
 </section>
 </main><script>${CP_JS}</script>`;
@@ -4603,9 +4758,10 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
     const keyBadge = p.api_key_hash
       ? `<code style="font-size:10px;color:#2e7d32">…${H(keySuffix || '')}</code>`
       : `<span style="font-size:10px;color:#c62828">revoked</span>`;
+    const qs = publisherQualityScore(p.username);  // Backlog #16 — traffic-quality badge
     return `<tr>
     <td>
-      <strong>${H(p.username)}</strong>
+      <strong>${H(p.username)}</strong> ${qualityBadge(qs.score, qs.grade)}
       ${p.email   ? `<div style="font-size:11px;color:#6e6e73;margin-top:1px">${H(p.email)}</div>` : ''}
       ${p.company ? `<div style="font-size:11px;color:#8e8e93">${H(p.company)}</div>` : ''}
       <div style="margin-top:3px">API key: ${keyBadge}</div>
@@ -5757,6 +5913,70 @@ function renderPivotReport({ rows, dim1, dim2 }) {
   return adminLayout('Pivot Report', body);
 }
 
+// Backlog #16 — publisher traffic-quality scoreboard
+const GRADE_COLOR = { A: '#2e7d32', B: '#00897b', C: '#f9a825', D: '#ef6c00', F: '#c62828' };
+const GRADE_BG    = { A: '#e8f5e9', B: '#e0f2f1', C: '#fffde7', D: '#fff3e0', F: '#fde8e8' };
+function qualityBadge(score, grade) {
+  return `<span class="badge" style="background:${GRADE_BG[grade]};color:${GRADE_COLOR[grade]};font-weight:700">${grade} · ${N(score)}</span>`;
+}
+function renderPublisherQuality({ rows }) {
+  const pct = x => `${(x * 100).toFixed(1)}%`;
+  const tableRows = rows.map(r => `<tr data-pub="${H(r.publisher)}" data-score="${r.score}" data-grade="${r.grade}" style="background:${GRADE_BG[r.grade]}">
+    <td><strong>${H(r.publisher)}</strong></td>
+    <td style="font-weight:700;color:${GRADE_COLOR[r.grade]}">${N(r.score)}</td>
+    <td><span class="badge" style="background:#fff;color:${GRADE_COLOR[r.grade]};font-weight:700">${r.grade}</span></td>
+    <td>${N(r.total)}</td>
+    <td>${pct(r.rejection_rate)}</td>
+    <td>${pct(r.fraud_rate)}</td>
+    <td>${pct(r.ctit_anomaly_rate)}</td>
+  </tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+<section>
+  <div class="sh"><h2>Publisher Traffic Quality</h2><span class="meta">Last 90 days · score = 100 − rejection×40 − fraud×40 − CTIT×20</span></div>
+  <div style="padding:10px 20px;font-size:12px;color:#6e6e73">Grades: <strong style="color:${GRADE_COLOR.A}">A 90+</strong> · <strong style="color:${GRADE_COLOR.B}">B 75+</strong> · <strong style="color:${GRADE_COLOR.C}">C 60+</strong> · <strong style="color:${GRADE_COLOR.D}">D 40+</strong> · <strong style="color:${GRADE_COLOR.F}">F &lt;40</strong></div>
+  ${rows.length === 0 ? '<div class="empty">No publishers yet.</div>' : `
+  <table><thead><tr>
+    <th>Publisher</th><th>Score</th><th>Grade</th><th>Total Conv</th><th>Rejection</th><th>Fraud</th><th>CTIT Anomaly</th>
+  </tr></thead><tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Publisher Quality', body);
+}
+
+// Backlog #14 — fraud review (flagged conversions grouped by click_id)
+function fraudBadge(flag, source) {
+  const out = [];
+  if (source === 'protect360') out.push('<span class="badge" style="background:#fde8e8;color:#c62828;font-weight:700">P360</span>');
+  for (const f of (flag || '').split('|').filter(Boolean)) {
+    const label = f === 'duplicate_click_id' ? 'DUP' : f === 'ctit_too_fast' ? 'CTIT⚡' : f === 'ctit_too_slow' ? 'CTIT🐌' : f;
+    out.push(`<span class="badge" style="background:#fff3e0;color:#e65100">${H(label)}</span>`);
+  }
+  return out.join(' ');
+}
+function renderFraudPage({ rows }) {
+  const tableRows = rows.map(r => `<tr>
+    <td><code class="xs">${H(r.click_id)}</code></td>
+    <td>${H(r.advertiser_slug)}</td>
+    <td>${H(r.publisher)}</td>
+    <td>${H(r.events || '')}</td>
+    <td>${N(r.n)}</td>
+    <td>${fraudBadge(r.fraud_flag, r.fraud_source)}</td>
+    <td>${H(r.last_at)}</td>
+  </tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+<section>
+  <div class="sh"><h2>Fraud Review</h2><span class="meta">Flagged conversions grouped by click_id</span></div>
+  ${rows.length === 0 ? '<div class="empty">No flagged conversions.</div>' : `
+  <table><thead><tr>
+    <th>Click ID</th><th>Advertiser</th><th>Publisher</th><th>Events</th><th>Rows</th><th>Flags</th><th>Last Seen</th>
+  </tr></thead><tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Fraud Review', body);
+}
+
 // Backlog #11 — Advertiser portal HTML templates (reuse the publisher portal CSS)
 // ---------------------------------------------------------------------------
 function advLayout(title, body, adv = null, activeTab = null) {
@@ -6115,12 +6335,14 @@ function renderPubConversions({ pub, conversions }) {
   // F17 — show loan_amount / revenue columns only when at least one row has them.
   const showLoan    = conversions.some(c => c.loan_amount != null);
   const showRevenue = conversions.some(c => c.revenue != null);
+  const showSub     = conversions.some(c => c.af_sub1 != null);  // Backlog #17 — sub-affiliate column
   const fmtNum = v => v != null ? Number(v).toLocaleString('en-US') : '—';
   const rows = conversions.map(r => `<tr>
     <td style="white-space:nowrap;font-size:11px">${H(r.received_at.slice(0,10))}</td>
     <td>${H(r.adv_name||r.advertiser_slug)}</td>
     <td><code class="xs">${H(r.click_id)}</code></td>
     <td><span class="badge">${H(r.event)}</span></td>
+    ${showSub     ? `<td>${r.af_sub1 ? `<code class="xs">${H(r.af_sub1)}</code>` : ''}</td>` : ''}
     ${showLoan    ? `<td>${fmtNum(r.loan_amount)}</td>` : ''}
     ${showRevenue ? `<td>${fmtNum(r.revenue)}</td>` : ''}
     <td>${fmtCur(r.payout, r.currency)}</td>
@@ -6133,7 +6355,7 @@ function renderPubConversions({ pub, conversions }) {
   <div class="sh"><h2>Conversion History</h2><span class="meta">${N(conversions.length)} conversions (last 500)</span></div>
   ${rows.length===0
     ? '<div class="empty">No conversions recorded yet.</div>'
-    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th>${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Status</th></tr></thead>
+    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th>${showSub?'<th>Sub-Aff</th>':''}${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Status</th></tr></thead>
         <tbody>${rows}</tbody></table>`}
 </section>
 </main>`;
@@ -6373,6 +6595,7 @@ ${checklist}
   <div class="card"><div class="lbl">Pending Earnings</div><div class="val" style="color:#f57f17;font-size:18px">${fmtByCurrency(pendingByCurrency)}</div>${updatedNote}</div>
   <div class="card"><div class="lbl">This Month Approved</div><div class="val blue" style="font-size:18px">${fmtByCurrency(monthlyApprovedByCurrency)}</div>${updatedNote}</div>
   <div class="card"><div class="lbl">This Month Pending</div><div class="val" style="color:#f57f17;font-size:18px">${fmtByCurrency(monthlyPendingByCurrency)}</div>${updatedNote}</div>
+  ${(() => { const qs = publisherQualityScore(pub.username); return `<div class="card"><div class="lbl">Traffic Quality Score</div><div class="val" style="font-size:20px;color:${GRADE_COLOR[qs.grade]}">${N(qs.score)} <span style="font-size:13px">(${qs.grade})</span></div>${updatedNote}</div>`; })()}
 </div>
 
 ${payoutBanner}
@@ -6463,7 +6686,19 @@ function funnelSvg(stages) {
 
 function renderAnalyticsPage({ adv, dailyClicks, dailyConv, geoBreakdown,
   deviceBreakdown, osBreakdown, browserBreakdown, totalClicksAdv, totalConvAdv,
-  convStatus = {} }) {
+  convStatus = {}, subAffBreakdown = [] }) {
+  // Backlog #17 — "By Sub-Affiliate" section
+  const subAffSection = subAffBreakdown.length === 0 ? '' : `
+<section>
+  <div class="sh"><h2>By Sub-Affiliate</h2><span class="meta">af_sub1 · ${subAffBreakdown.length}</span></div>
+  <table><thead><tr><th>Sub-Affiliate (af_sub1)</th><th>Clicks</th><th>Conversions</th><th>Payout</th><th>CVR</th></tr></thead>
+    <tbody>${subAffBreakdown.map(s => `<tr>
+      <td><code class="xs">${H(s.af_sub1)}</code></td>
+      <td>${N(s.clicks)}</td><td>${N(s.conversions)}</td>
+      <td>$${$(s.payout)}</td>
+      <td>${s.clicks > 0 ? ((s.conversions / s.clicks) * 100).toFixed(1) + '%' : '—'}</td>
+    </tr>`).join('')}</tbody></table>
+</section>`;
 
   // Build 30-day array
   const days = [];
@@ -6611,6 +6846,8 @@ function renderAnalyticsPage({ adv, dailyClicks, dailyConv, geoBreakdown,
       ${splitSection('Browser', browserBreakdown, browserColors)}
     </div>
   </section>
+
+  ${subAffSection}
 
 </div>
 

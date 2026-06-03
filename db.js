@@ -113,6 +113,7 @@ const CLICK_EXTRA_COLS = [
   'af_siteid', 'af_campaign', 'af_adset', 'af_ad',                          // F10 raw (AppsFlyer)
   'adjust_network', 'adjust_campaign', 'adjust_adgroup', 'adjust_creative', // F10 raw (Adjust)
   'campaign', 'adgroup', 'creative', 'network',                             // F10 mapped (internal)
+  'af_sub1', 'af_sub2',                                                     // Backlog #17 agency / sub-affiliate
 ];
 const clickColsNow = db.prepare('PRAGMA table_info(clicks)').all().map(c => c.name);
 for (const col of CLICK_EXTRA_COLS) {
@@ -171,6 +172,18 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_conv_user ON conversions(advertiser_slug
 //     overturns a previously-decided conversion, or manually by an admin.
 //   adjustment / adjustment_note — a signed payout adjustment (e.g. clawback) applied
 //     during dispute resolution, kept separate from the original payout for an audit trail.
+// Backlog #13–17 — fraud / quality / sub-affiliate columns (all additive, nullable):
+//   fraud_source  (#13) — 'protect360' when flagged by the Protect360 ingest endpoint
+//   fraud_flag    (#14/#15) — 'duplicate_click_id', 'ctit_too_fast', 'ctit_too_slow' (pipe-joined when multiple)
+//   ctit_seconds  (#15) — click-to-conversion time in seconds
+//   af_sub1/af_sub2 (#17) — agency / sub-affiliate dimension propagated from the click
+if (!convCols2.includes('fraud_source')) db.exec('ALTER TABLE conversions ADD COLUMN fraud_source TEXT');
+if (!convCols2.includes('fraud_flag'))   db.exec('ALTER TABLE conversions ADD COLUMN fraud_flag TEXT');
+if (!convCols2.includes('ctit_seconds')) db.exec('ALTER TABLE conversions ADD COLUMN ctit_seconds INTEGER');
+if (!convCols2.includes('af_sub1'))      db.exec('ALTER TABLE conversions ADD COLUMN af_sub1 TEXT');
+if (!convCols2.includes('af_sub2'))      db.exec('ALTER TABLE conversions ADD COLUMN af_sub2 TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_fraud_flag ON conversions(fraud_flag)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_af_sub1 ON conversions(af_sub1)');
 if (!convCols2.includes('dispute_state'))   db.exec("ALTER TABLE conversions ADD COLUMN dispute_state TEXT NOT NULL DEFAULT 'none'");
 if (!convCols2.includes('adjustment'))      db.exec('ALTER TABLE conversions ADD COLUMN adjustment REAL');
 if (!convCols2.includes('adjustment_note')) db.exec('ALTER TABLE conversions ADD COLUMN adjustment_note TEXT');
