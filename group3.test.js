@@ -95,6 +95,12 @@ const postback = (slug, qs) => fetch(`${BASE}/postback/${slug}?${qs}`, { redirec
   // non-whitelisted IP → 403 (foreign IP via X-Forwarded-For; trust proxy is on)
   const r403 = await fetch(`${BASE}/postback/g3a/protect360?click_id=${cP}&reason=x`, { headers: { 'X-Forwarded-For': '203.0.113.99' }, redirect: 'manual' });
   ok('#13 non-whitelisted IP → 403', r403.status === 403, `status=${r403.status}`);
+  // #13 ordering — Protect360 arrives BEFORE the sale postback
+  const cPre = await track('g3a?pub=g3p');
+  await fetch(`${BASE}/postback/g3a/protect360?click_id=${cPre}&reason=preblock`, { redirect: 'manual' });
+  await postback('g3a', `click_id=${cPre}&event=sale`);
+  const preSale = db.prepare("SELECT status, payout FROM conversions WHERE click_id=? AND event='sale'").get(cPre);
+  ok('#13 ordering: sale after protect360 is rejected + $0', !!preSale && preSale.status === 'rejected' && preSale.payout === 0, JSON.stringify(preSale));
 
   // ===== #14 duplicate click_id (normal CTIT so flag is exactly 'duplicate_click_id') =====
   const cD = await track('g3a?pub=g3p');
