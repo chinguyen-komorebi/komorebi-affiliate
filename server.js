@@ -1120,7 +1120,7 @@ function parseUA(ua = '') {
 // Returns { clickId, device, country }.
 // ---------------------------------------------------------------------------
 
-function recordClick(req, slug, pub) {
+function recordClick(req, slug, pub, smartLinkSlug = null) {
   const clickId = crypto.randomUUID();
   const clickIp = getIp(req);
   const clickUa = req.get('User-Agent') || '';
@@ -1148,12 +1148,12 @@ function recordClick(req, slug, pub) {
     `INSERT INTO clicks (click_id, advertiser_slug, publisher, ip, user_agent, country, device_type, os, browser,
        sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
        af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-       campaign, adgroup, creative, network, af_sub1, af_sub2)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       campaign, adgroup, creative, network, af_sub1, af_sub2, smart_link_slug)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(clickId, slug, pub, clickIp, clickUa, country, device, os, browser,
     sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
     af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-    campaign, adgroup, creative, network, af_sub1, af_sub2);
+    campaign, adgroup, creative, network, af_sub1, af_sub2, smartLinkSlug);
 
   return { clickId, device, country };
 }
@@ -1177,6 +1177,48 @@ app.get('/track/:slug', (req, res) => {
 
   if (!adv.offer_url) return res.json({ click_id: clickId, advertiser: slug, publisher: pub });
 
+  const url = new URL(adv.offer_url);
+  url.searchParams.set('click_id', clickId);
+  res.redirect(302, url.toString());
+});
+
+// ---------------------------------------------------------------------------
+// Group 4 — Smart link  GET /smart/:slug?pub=PUBLISHER
+// Evaluate the link's rules top-down by priority; the first rule whose geo/device/os
+// all match (NULL = any) wins. Record the click (tagged with the smart_link_slug) and
+// redirect to the chosen advertiser's offer URL. No matching rule → 404.
+// ---------------------------------------------------------------------------
+function smartLinkMatch(rule, { country, device, os }) {
+  if (rule.geo) {
+    const geos = rule.geo.split(',').map(g => g.trim().toUpperCase()).filter(Boolean);
+    if (geos.length && !geos.includes((country || '').toUpperCase())) return false;
+  }
+  if (rule.device_type && rule.device_type.toLowerCase() !== (device || '').toLowerCase()) return false;
+  if (rule.os && rule.os.toLowerCase() !== (os || '').toLowerCase()) return false;
+  return true;
+}
+
+app.get('/smart/:slug', (req, res) => {
+  const { slug } = req.params;
+  const link = db.prepare('SELECT * FROM smart_links WHERE slug = ?').get(slug);
+  if (!link) return res.status(404).json({ error: `Unknown smart link: ${slug}` });
+
+  const ctx = {
+    country: geoLookup(getIp(req)),
+    ...parseUA(req.get('User-Agent') || ''),
+  };
+  const rules = db.prepare('SELECT * FROM smartlink_rules WHERE smart_link_id = ? ORDER BY priority ASC, id ASC').all(link.id);
+  const rule  = rules.find(r => smartLinkMatch(r, ctx));
+  if (!rule) return res.status(404).json({ error: 'No matching rule for this smart link' });
+
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(rule.advertiser_slug);
+  if (!adv || adv.status !== 'active') return res.status(404).json({ error: `Advertiser ${rule.advertiser_slug} unavailable` });
+
+  const pub = (rule.publisher || req.query.pub || '').toString().trim();
+  if (!pub) return res.status(400).json({ error: 'Missing publisher: set a rule publisher or pass ?pub=' });
+
+  const { clickId } = recordClick(req, adv.slug, pub, link.slug);
+  if (!adv.offer_url) return res.json({ click_id: clickId, advertiser: adv.slug, publisher: pub, smart_link: link.slug });
   const url = new URL(adv.offer_url);
   url.searchParams.set('click_id', clickId);
   res.redirect(302, url.toString());
@@ -3618,6 +3660,215 @@ app.post('/advertiser/reconcile', requireAdvertiser, (req, res) => {
   });
 });
 
+// ===========================================================================
+// Group 4 — Smart Links admin (CRUD + rules). CSRF handled by the /admin/* guard.
+// ===========================================================================
+app.get('/admin/smart-links', requireAdmin, (req, res) => {
+  const links = db.prepare(`
+    SELECT sl.*,
+      (SELECT COUNT(*) FROM smartlink_rules r WHERE r.smart_link_id = sl.id) AS rule_count,
+      (SELECT COUNT(*) FROM clicks c WHERE c.smart_link_slug = sl.slug AND c.created_at >= datetime('now','-7 days')) AS clicks_7d
+    FROM smart_links sl ORDER BY sl.created_at DESC`).all();
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderSmartLinkList({ links, flash, error }));
+});
+
+app.get('/admin/smart-links/new', requireAdmin, (req, res) => {
+  res.send(renderSmartLinkForm({ csrfToken: req.session.csrfToken }));
+});
+
+app.post('/admin/smart-links', requireAdmin, (req, res) => {
+  const name = (req.body.name || '').trim();
+  let slug = (req.body.slug || '').trim().toLowerCase();
+  if (!slug && name) slug = slugify(name);
+  if (!name || !slug) return res.send(renderSmartLinkForm({ csrfToken: req.session.csrfToken, error: 'Name and slug are required.', values: req.body }));
+  if (!/^[a-z0-9-]+$/.test(slug)) return res.send(renderSmartLinkForm({ csrfToken: req.session.csrfToken, error: 'Slug must be lowercase letters, numbers, hyphens.', values: req.body }));
+  try {
+    const id = db.prepare('INSERT INTO smart_links (slug, name) VALUES (?, ?)').run(slug, name).lastInsertRowid;
+    logAudit('smartlink.created', 'smart_link', slug, { name }, req);
+    res.redirect(`/admin/smart-links/${id}?msg=Smart+link+created`);
+  } catch {
+    res.send(renderSmartLinkForm({ csrfToken: req.session.csrfToken, error: `Slug "${slug}" is already taken.`, values: req.body }));
+  }
+});
+
+app.get('/admin/smart-links/:id', requireAdmin, (req, res) => {
+  const link = db.prepare('SELECT * FROM smart_links WHERE id = ?').get(req.params.id);
+  if (!link) return res.redirect('/admin/smart-links?msg=Smart+link+not+found&ok=0');
+  const rules = db.prepare('SELECT * FROM smartlink_rules WHERE smart_link_id = ? ORDER BY priority ASC, id ASC').all(link.id);
+  const advertisers = db.prepare("SELECT slug, name FROM advertisers WHERE slug != 'legacy' AND status = 'active' ORDER BY name").all();
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderSmartLinkDetail({ link, rules, advertisers, csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/admin/smart-links/:id/rules', requireAdmin, (req, res) => {
+  const link = db.prepare('SELECT * FROM smart_links WHERE id = ?').get(req.params.id);
+  if (!link) return res.redirect('/admin/smart-links?msg=Smart+link+not+found&ok=0');
+  const advSlug = (req.body.advertiser_slug || '').trim();
+  if (!advSlug || !db.prepare('SELECT 1 FROM advertisers WHERE slug = ?').get(advSlug)) {
+    return res.redirect(`/admin/smart-links/${link.id}?msg=A+valid+advertiser+is+required&ok=0`);
+  }
+  const geo       = (req.body.geo || '').trim().toUpperCase() || null;
+  const device    = ['mobile', 'desktop', 'tablet'].includes((req.body.device_type || '').toLowerCase()) ? req.body.device_type.toLowerCase() : null;
+  const os        = (req.body.os || '').trim().toLowerCase() || null;
+  const publisher = (req.body.publisher || '').trim() || null;
+  const prRaw = parseInt(req.body.priority, 10);
+  const priority = Number.isFinite(prRaw) ? prRaw : db.prepare('SELECT COALESCE(MAX(priority),-1)+1 AS n FROM smartlink_rules WHERE smart_link_id = ?').get(link.id).n;
+  db.prepare('INSERT INTO smartlink_rules (smart_link_id, priority, geo, device_type, os, advertiser_slug, publisher) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(link.id, priority, geo, device, os, advSlug, publisher);
+  logAudit('smartlink.rule_added', 'smart_link', link.slug, { advertiser_slug: advSlug, geo, device_type: device, os, priority }, req);
+  res.redirect(`/admin/smart-links/${link.id}?msg=Rule+added`);
+});
+
+app.post('/admin/smart-links/:id/rules/:ruleId/delete', requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM smartlink_rules WHERE id = ? AND smart_link_id = ?').run(req.params.ruleId, req.params.id);
+  logAudit('smartlink.rule_deleted', 'smart_link', req.params.id, { rule_id: req.params.ruleId }, req);
+  res.redirect(`/admin/smart-links/${req.params.id}?msg=Rule+deleted`);
+});
+
+app.post('/admin/smart-links/:id/rules/reorder', requireAdmin, (req, res) => {
+  const linkId = req.params.id;
+  const ruleId = String(req.body.rule_id || '');
+  const dir    = req.body.direction === 'up' ? 'up' : 'down';
+  const rules  = db.prepare('SELECT id, priority FROM smartlink_rules WHERE smart_link_id = ? ORDER BY priority ASC, id ASC').all(linkId);
+  const idx    = rules.findIndex(r => String(r.id) === ruleId);
+  const swap   = dir === 'up' ? idx - 1 : idx + 1;
+  if (idx >= 0 && swap >= 0 && swap < rules.length) {
+    // Normalize to the displayed order, then swap the two neighbours' positions.
+    const upd = db.prepare('UPDATE smartlink_rules SET priority = ? WHERE id = ?');
+    const ordered = rules.map(r => r.id);
+    [ordered[idx], ordered[swap]] = [ordered[swap], ordered[idx]];
+    ordered.forEach((id, i) => upd.run(i, id));
+  }
+  res.redirect(`/admin/smart-links/${linkId}?msg=Reordered`);
+});
+
+// ===========================================================================
+// Group 4 — Marketplace admin (listings + applications). Routes are namespaced as
+// /admin/marketplace-listings to coexist with the F6 marketplace at /admin/marketplace.
+// ===========================================================================
+app.get('/admin/marketplace-listings', requireAdmin, (req, res) => {
+  const listings = db.prepare(`
+    SELECT ml.*, a.name AS adv_name,
+      (SELECT COUNT(*) FROM marketplace_apps ma WHERE ma.listing_id = ml.id) AS app_count,
+      (SELECT COUNT(*) FROM marketplace_apps ma WHERE ma.listing_id = ml.id AND ma.status = 'pending') AS pending_count
+    FROM marketplace_listings ml LEFT JOIN advertisers a ON a.slug = ml.advertiser_slug
+    ORDER BY ml.created_at DESC`).all();
+  const advertisers = db.prepare("SELECT slug, name FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderAdminMarketplaceListings({ listings, advertisers, csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/admin/marketplace-listings', requireAdmin, (req, res) => {
+  const advSlug = (req.body.advertiser_slug || '').trim();
+  const title   = (req.body.title || '').trim();
+  if (!title || !advSlug || !db.prepare('SELECT 1 FROM advertisers WHERE slug = ?').get(advSlug)) {
+    return res.redirect('/admin/marketplace-listings?msg=Title+and+a+valid+advertiser+are+required&ok=0');
+  }
+  const status = req.body.status === 'paused' ? 'paused' : 'active';
+  db.prepare('INSERT INTO marketplace_listings (advertiser_slug, title, description, payout_display, category, geo, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(advSlug, title, (req.body.description || '').trim() || null, (req.body.payout_display || '').trim() || null,
+      (req.body.category || '').trim() || null, (req.body.geo || '').trim().toUpperCase() || null, status);
+  logAudit('marketplace.listing_created', 'listing', advSlug, { title }, req);
+  res.redirect('/admin/marketplace-listings?msg=Listing+created');
+});
+
+app.get('/admin/marketplace-listings/:id/edit', requireAdmin, (req, res) => {
+  const listing = db.prepare('SELECT * FROM marketplace_listings WHERE id = ?').get(req.params.id);
+  if (!listing) return res.redirect('/admin/marketplace-listings?msg=Listing+not+found&ok=0');
+  const advertisers = db.prepare("SELECT slug, name FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  res.send(renderMarketplaceListingForm({ listing, advertisers, csrfToken: req.session.csrfToken }));
+});
+
+app.post('/admin/marketplace-listings/:id', requireAdmin, (req, res) => {
+  const listing = db.prepare('SELECT * FROM marketplace_listings WHERE id = ?').get(req.params.id);
+  if (!listing) return res.redirect('/admin/marketplace-listings?msg=Listing+not+found&ok=0');
+  const title = (req.body.title || '').trim() || listing.title;
+  const status = req.body.status === 'paused' ? 'paused' : 'active';
+  db.prepare('UPDATE marketplace_listings SET title=?, description=?, payout_display=?, category=?, geo=?, status=? WHERE id=?')
+    .run(title, (req.body.description || '').trim() || null, (req.body.payout_display || '').trim() || null,
+      (req.body.category || '').trim() || null, (req.body.geo || '').trim().toUpperCase() || null, status, listing.id);
+  logAudit('marketplace.listing_updated', 'listing', listing.id, { title, status }, req);
+  res.redirect('/admin/marketplace-listings?msg=Listing+updated');
+});
+
+app.get('/admin/marketplace-listings/:id/applications', requireAdmin, (req, res) => {
+  const listing = db.prepare('SELECT * FROM marketplace_listings WHERE id = ?').get(req.params.id);
+  if (!listing) return res.redirect('/admin/marketplace-listings?msg=Listing+not+found&ok=0');
+  const apps = db.prepare('SELECT * FROM marketplace_apps WHERE listing_id = ? ORDER BY created_at DESC').all(listing.id);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  res.send(renderMarketplaceApplications({ listing, apps, csrfToken: req.session.csrfToken, flash }));
+});
+
+app.post('/admin/marketplace-listings/:id/applications/:appId/approve', requireAdmin, (req, res) => {
+  const listing = db.prepare('SELECT * FROM marketplace_listings WHERE id = ?').get(req.params.id);
+  const app = listing && db.prepare('SELECT * FROM marketplace_apps WHERE id = ? AND listing_id = ?').get(req.params.appId, listing.id);
+  if (!app) return res.redirect('/admin/marketplace-listings?msg=Application+not+found&ok=0');
+  // Approve + auto-create publisher↔advertiser access (so postbacks are accepted).
+  const pub = db.prepare('SELECT id FROM publishers WHERE username = ?').get(app.publisher);
+  const adv = db.prepare('SELECT id FROM advertisers WHERE slug = ?').get(listing.advertiser_slug);
+  if (pub && adv) db.prepare('INSERT OR IGNORE INTO publisher_advertisers (publisher_id, advertiser_id) VALUES (?, ?)').run(pub.id, adv.id);
+  db.prepare("UPDATE marketplace_apps SET status='approved', note=NULL WHERE id=?").run(app.id);
+  logAudit('marketplace.app_approved', 'application', app.id, { publisher: app.publisher, advertiser: listing.advertiser_slug }, req);
+  res.redirect(`/admin/marketplace-listings/${listing.id}/applications?msg=Approved+%E2%80%94+access+granted`);
+});
+
+app.post('/admin/marketplace-listings/:id/applications/:appId/reject', requireAdmin, (req, res) => {
+  const listing = db.prepare('SELECT * FROM marketplace_listings WHERE id = ?').get(req.params.id);
+  const app = listing && db.prepare('SELECT * FROM marketplace_apps WHERE id = ? AND listing_id = ?').get(req.params.appId, listing.id);
+  if (!app) return res.redirect('/admin/marketplace-listings?msg=Application+not+found&ok=0');
+  db.prepare("UPDATE marketplace_apps SET status='rejected', note=? WHERE id=?").run((req.body.note || '').trim() || null, app.id);
+  logAudit('marketplace.app_rejected', 'application', app.id, { publisher: app.publisher }, req);
+  res.redirect(`/admin/marketplace-listings/${listing.id}/applications?msg=Application+rejected`);
+});
+
+// ---------------------------------------------------------------------------
+// Group 4 — Publisher marketplace (browse / apply / my applications)
+// ---------------------------------------------------------------------------
+app.get('/publisher/marketplace', requirePublisher, (req, res) => {
+  const pub = req.publisher;
+  // Active listings the publisher does NOT already have access to.
+  const listings = db.prepare(`
+    SELECT ml.*, a.name AS adv_name
+    FROM marketplace_listings ml
+    JOIN advertisers a ON a.slug = ml.advertiser_slug
+    WHERE ml.status = 'active'
+      AND a.id NOT IN (SELECT advertiser_id FROM publisher_advertisers WHERE publisher_id = ?)
+    ORDER BY ml.created_at DESC`).all(pub.id);
+  const myApps = db.prepare('SELECT listing_id, status FROM marketplace_apps WHERE publisher = ?').all(pub.username);
+  const appMap = Object.fromEntries(myApps.map(a => [a.listing_id, a.status]));
+  res.send(renderPublisherMarketplace({ pub, listings, appMap, csrfToken: req.session.csrfToken,
+    flash: req.query.msg && req.query.ok !== '0' ? req.query.msg : null,
+    error: req.query.msg && req.query.ok === '0' ? req.query.msg : null }));
+});
+
+app.post('/publisher/marketplace/:id/apply', requirePublisher, verifyCsrf, (req, res) => {
+  const pub = req.publisher;
+  const listing = db.prepare("SELECT * FROM marketplace_listings WHERE id = ? AND status = 'active'").get(req.params.id);
+  if (!listing) return res.redirect('/publisher/marketplace?msg=Listing+unavailable&ok=0');
+  try {
+    db.prepare('INSERT INTO marketplace_apps (listing_id, publisher) VALUES (?, ?)').run(listing.id, pub.username);
+    logAudit('marketplace.applied', 'application', listing.id, { publisher: pub.username }, req);
+  } catch (err) {
+    if (!((err.message || '').includes('UNIQUE'))) throw err;  // already applied — idempotent
+  }
+  res.redirect('/publisher/marketplace?msg=Application+submitted');
+});
+
+app.get('/publisher/marketplace/my-applications', requirePublisher, (req, res) => {
+  const pub = req.publisher;
+  const apps = db.prepare(`
+    SELECT ma.*, ml.title, ml.payout_display, a.name AS adv_name
+    FROM marketplace_apps ma
+    JOIN marketplace_listings ml ON ml.id = ma.listing_id
+    LEFT JOIN advertisers a ON a.slug = ml.advertiser_slug
+    WHERE ma.publisher = ? ORDER BY ma.created_at DESC`).all(pub.username);
+  res.send(renderMyApplications({ pub, apps }));
+});
+
 // HTML templates — shared helpers
 // ---------------------------------------------------------------------------
 
@@ -4015,6 +4266,8 @@ function adminSidebar() {
     reports:     ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3 2h7l3 3v9H3z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 8.5h5M5.5 11h3M5.5 6h2"/>`),
     fraud:       ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M8 1.5l5.5 2.2v4.1c0 3.4-2.3 5.6-5.5 6.7-3.2-1.1-5.5-3.3-5.5-6.7V3.7L8 1.5z"/><path stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M8 5.5v3.2M8 10.8v.2"/>`),
     quality:     ic(`<path stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" d="M8 1.6l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.3 4.3 13.4l.7-4.3-3.1-3 4.3-.6L8 1.6z"/>`),
+    smartlink:   ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M6.5 9.5l3-3M5 8L3.5 9.5a2.5 2.5 0 0 0 3.5 3.5L8.5 11.5M11 8l1.5-1.5a2.5 2.5 0 0 0-3.5-3.5L7.5 4.5"/>`),
+    market:      ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M2 6h12l-1 8H3L2 6zM5 6V4.5a3 3 0 0 1 6 0V6"/>`),
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
@@ -4022,10 +4275,12 @@ function adminSidebar() {
   <div class="adm-sb-group">OVERVIEW</div>
   ${nav('/admin',             'Dashboard',   'dashboard',   '/admin')}
   ${nav('/admin/analytics',   'Analytics',   'analytics',   '/admin/analytics')}
+  ${nav('/admin/smart-links', 'Smart Links', 'smartlink',   '/admin/smart-links')}
   <div class="adm-sb-group">MANAGEMENT</div>
   ${nav('/admin/advertisers', 'Advertisers', 'advertisers', '/admin/advertisers')}
   ${nav('/admin/publishers',  'Publishers',  'publishers',  '/admin/publishers')}
   ${nav('/admin/invoices',    'Invoices',    'invoices',    '/admin/invoices')}
+  ${nav('/admin/marketplace-listings', 'Marketplace', 'market', '/admin/marketplace-listings')}
   <div class="adm-sb-group">REPORTS</div>
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
@@ -6140,6 +6395,212 @@ function renderAdvReconcile({ adv, runs, csrfToken, flash, error }) {
   return advLayout('Reconciliation', body, adv, 'reconcile');
 }
 
+// Group 4 — Smart Links admin templates
+// ---------------------------------------------------------------------------
+function renderSmartLinkList({ links, flash, error }) {
+  const rows = links.map(l => `<tr>
+    <td><strong>${H(l.name)}</strong><div style="font-size:11px;color:#6e6e73">/smart/${H(l.slug)}</div></td>
+    <td><div class="ubox" data-copy="${H(BASE_URL)}/smart/${H(l.slug)}?pub=PUBLISHER">${H(BASE_URL)}/smart/${H(l.slug)}?pub=PUBLISHER</div></td>
+    <td>${N(l.rule_count)}</td>
+    <td>${N(l.clicks_7d)}</td>
+    <td><a href="/admin/smart-links/${l.id}" class="btn btn-primary">Manage</a></td>
+  </tr>`).join('');
+  const body = `${adminHeader('<a href="/admin/smart-links/new" class="hbtn">+ New Smart Link</a>')}
+<main>
+${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div class="form-err">${H(error)}</div>` : ''}
+<section>
+  <div class="sh"><h2>Smart Links</h2><span class="meta">GEO / device / OS routing</span></div>
+  ${links.length === 0 ? '<div class="empty">No smart links yet. Create one to route traffic by GEO, device, or OS.</div>' :
+    `<table><thead><tr><th>Name</th><th>URL</th><th>Rules</th><th>Clicks (7d)</th><th></th></tr></thead><tbody>${rows}</tbody></table>`}
+</section>
+</main><script>${CP_JS}</script>`;
+  return adminLayout('Smart Links', body);
+}
+
+function renderSmartLinkForm({ csrfToken = '', error, values = {} }) {
+  const body = `${adminHeader('<a href="/admin/smart-links" class="hbtn ghost">← Smart Links</a>')}
+<main><div class="fw">
+  <h2>New Smart Link</h2>
+  ${error ? `<div class="form-err">${H(error)}</div>` : ''}
+  <form method="POST" action="/admin/smart-links">${csrfField(csrfToken)}
+    <div class="fg"><label>Name *</label><input type="text" name="name" value="${H(values.name || '')}" required data-autoslug></div>
+    <div class="fg"><label>Slug (used in /smart/&lt;slug&gt;) *</label>
+      <input type="text" name="slug" id="slug" value="${H(values.slug || '')}" pattern="[a-z0-9-]+" placeholder="e.g. vn-loans">
+      <small>Lowercase letters, numbers, hyphens. Auto-filled from the name.</small></div>
+    <div class="form-act"><button type="submit" class="btn btn-primary btn-lg">Create</button>
+      <a href="/admin/smart-links" class="btn btn-ghost btn-lg">Cancel</a></div>
+  </form>
+</div></main>
+<script>function autoSlug(n){const s=document.getElementById('slug');if(s&&!s.value)s.value=n.value.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');}
+document.querySelector('[data-autoslug]')?.addEventListener('input',e=>autoSlug(e.target));</script>`;
+  return adminLayout('New Smart Link', body);
+}
+
+function renderSmartLinkDetail({ link, rules, advertisers, csrfToken = '', flash, error }) {
+  const cell = v => v ? `<code class="xs">${H(v)}</code>` : '<span style="color:#9ca3af">any</span>';
+  const ruleRows = rules.map((r, i) => `<tr>
+    <td style="white-space:nowrap">
+      <form method="POST" action="/admin/smart-links/${link.id}/rules/reorder" style="display:inline">${csrfField(csrfToken)}
+        <input type="hidden" name="rule_id" value="${r.id}">
+        <button name="direction" value="up" class="btn btn-ghost" style="padding:2px 6px" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button name="direction" value="down" class="btn btn-ghost" style="padding:2px 6px" ${i === rules.length - 1 ? 'disabled' : ''}>↓</button>
+      </form>
+    </td>
+    <td>${r.priority}</td>
+    <td>${cell(r.geo)}</td><td>${cell(r.device_type)}</td><td>${cell(r.os)}</td>
+    <td><code class="xs">${H(r.advertiser_slug)}</code></td>
+    <td>${r.publisher ? `<code class="xs">${H(r.publisher)}</code>` : '<span style="color:#9ca3af">?pub=</span>'}</td>
+    <td><form method="POST" action="/admin/smart-links/${link.id}/rules/${r.id}/delete" style="display:inline" data-confirm="Delete this rule?">${csrfField(csrfToken)}<button class="btn btn-danger">Delete</button></form></td>
+  </tr>`).join('');
+  const advOpts = advertisers.map(a => `<option value="${H(a.slug)}">${H(a.name)} (${H(a.slug)})</option>`).join('');
+  const body = `${adminHeader('<a href="/admin/smart-links" class="hbtn ghost">← Smart Links</a>')}
+<main>
+${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div class="form-err">${H(error)}</div>` : ''}
+<section>
+  <div class="sh"><h2>${H(link.name)}</h2><span class="meta">/smart/${H(link.slug)}</span></div>
+  <div style="padding:14px 20px"><div class="ubox" data-copy="${H(BASE_URL)}/smart/${H(link.slug)}?pub=PUBLISHER">${H(BASE_URL)}/smart/${H(link.slug)}?pub=PUBLISHER</div>
+    <small style="color:#6e6e73">First matching rule (top → bottom) wins; <code>any</code> matches everything.</small></div>
+  ${rules.length === 0 ? '<div class="empty">No rules yet — add one below. With no rules, the link returns 404.</div>' :
+    `<table><thead><tr><th></th><th>Priority</th><th>GEO</th><th>Device</th><th>OS</th><th>Advertiser</th><th>Publisher</th><th></th></tr></thead><tbody>${ruleRows}</tbody></table>`}
+</section>
+<section>
+  <div class="sh"><h2>Add Rule</h2></div>
+  <form method="POST" action="/admin/smart-links/${link.id}/rules" style="padding:16px 20px;display:grid;grid-template-columns:repeat(6,1fr) auto;gap:8px;align-items:end">${csrfField(csrfToken)}
+    <div class="fg" style="margin:0"><label>GEO</label><input type="text" name="geo" placeholder="VN,SG (blank=any)"></div>
+    <div class="fg" style="margin:0"><label>Device</label><select name="device_type"><option value="">any</option><option value="mobile">mobile</option><option value="desktop">desktop</option><option value="tablet">tablet</option></select></div>
+    <div class="fg" style="margin:0"><label>OS</label><select name="os"><option value="">any</option><option value="android">android</option><option value="ios">ios</option><option value="windows">windows</option></select></div>
+    <div class="fg" style="margin:0"><label>Advertiser *</label><select name="advertiser_slug" required><option value="">—</option>${advOpts}</select></div>
+    <div class="fg" style="margin:0"><label>Publisher</label><input type="text" name="publisher" placeholder="blank = ?pub="></div>
+    <div class="fg" style="margin:0"><label>Priority</label><input type="number" name="priority" placeholder="auto"></div>
+    <button type="submit" class="btn btn-primary">Add</button>
+  </form>
+</section>
+</main><script>${CP_JS}</script>`;
+  return adminLayout(`Smart Link — ${link.name}`, body);
+}
+
+// Group 4 — Marketplace templates (admin + publisher)
+// ---------------------------------------------------------------------------
+function renderAdminMarketplaceListings({ listings, advertisers, csrfToken = '', flash, error }) {
+  const advOpts = advertisers.map(a => `<option value="${H(a.slug)}">${H(a.name)} (${H(a.slug)})</option>`).join('');
+  const rows = listings.map(l => `<tr>
+    <td><strong>${H(l.title)}</strong>${l.category ? `<div style="font-size:11px;color:#6e6e73">${H(l.category)}</div>` : ''}</td>
+    <td>${H(l.adv_name || l.advertiser_slug)}</td>
+    <td>${H(l.payout_display || '—')}</td>
+    <td>${H(l.geo || 'any')}</td>
+    <td><span class="badge ${l.status === 'active' ? 'active' : 'paused'}">${H(l.status)}</span></td>
+    <td>${N(l.app_count)}${l.pending_count ? ` <span class="badge" style="background:#fff3e0;color:#e65100">${N(l.pending_count)} pending</span>` : ''}</td>
+    <td><a href="/admin/marketplace-listings/${l.id}/applications" class="btn btn-primary">Applications</a>
+        <a href="/admin/marketplace-listings/${l.id}/edit" class="btn btn-ghost">Edit</a></td>
+  </tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div class="form-err">${H(error)}</div>` : ''}
+<section>
+  <div class="sh"><h2>Marketplace Listings</h2></div>
+  <form method="POST" action="/admin/marketplace-listings" style="padding:16px 20px;display:grid;grid-template-columns:1.4fr 1fr 1fr .7fr .7fr auto;gap:8px;align-items:end;border-bottom:1px solid #f0f0f0">${csrfField(csrfToken)}
+    <div class="fg" style="margin:0"><label>Title *</label><input type="text" name="title" required placeholder="e.g. ACB Loans"></div>
+    <div class="fg" style="margin:0"><label>Advertiser *</label><select name="advertiser_slug" required><option value="">—</option>${advOpts}</select></div>
+    <div class="fg" style="margin:0"><label>Payout</label><input type="text" name="payout_display" placeholder="3.5% CPS"></div>
+    <div class="fg" style="margin:0"><label>Category</label><input type="text" name="category" placeholder="fintech"></div>
+    <div class="fg" style="margin:0"><label>GEO</label><input type="text" name="geo" placeholder="VN"></div>
+    <button type="submit" class="btn btn-primary">Add</button>
+  </form>
+  ${listings.length === 0 ? '<div class="empty">No listings yet.</div>' :
+    `<table><thead><tr><th>Title</th><th>Advertiser</th><th>Payout</th><th>GEO</th><th>Status</th><th>Applications</th><th></th></tr></thead><tbody>${rows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Marketplace Listings', body);
+}
+
+function renderMarketplaceListingForm({ listing, advertisers, csrfToken = '' }) {
+  const advOpts = advertisers.map(a => `<option value="${H(a.slug)}" ${a.slug === listing.advertiser_slug ? 'selected' : ''}>${H(a.name)} (${H(a.slug)})</option>`).join('');
+  const statusOpts = ['active', 'paused'].map(s => `<option value="${s}" ${listing.status === s ? 'selected' : ''}>${s}</option>`).join('');
+  const body = `${adminHeader('<a href="/admin/marketplace-listings" class="hbtn ghost">← Listings</a>')}
+<main><div class="fw">
+  <h2>Edit Listing</h2>
+  <form method="POST" action="/admin/marketplace-listings/${listing.id}">${csrfField(csrfToken)}
+    <div class="fg"><label>Title *</label><input type="text" name="title" value="${H(listing.title)}" required></div>
+    <div class="fg"><label>Advertiser</label><select name="advertiser_slug" disabled>${advOpts}</select><small>Advertiser can't be changed after creation.</small></div>
+    <div class="fg-row">
+      <div class="fg"><label>Payout</label><input type="text" name="payout_display" value="${H(listing.payout_display || '')}"></div>
+      <div class="fg"><label>Category</label><input type="text" name="category" value="${H(listing.category || '')}"></div>
+      <div class="fg"><label>GEO</label><input type="text" name="geo" value="${H(listing.geo || '')}"></div>
+      <div class="fg"><label>Status</label><select name="status">${statusOpts}</select></div>
+    </div>
+    <div class="fg"><label>Description</label><textarea name="description" rows="3" style="width:100%;padding:8px 10px;border:1px solid #d2d2d7;border-radius:7px">${H(listing.description || '')}</textarea></div>
+    <div class="form-act"><button type="submit" class="btn btn-primary btn-lg">Save</button>
+      <a href="/admin/marketplace-listings" class="btn btn-ghost btn-lg">Cancel</a></div>
+  </form>
+</div></main>`;
+  return adminLayout('Edit Listing', body);
+}
+
+function renderMarketplaceApplications({ listing, apps, csrfToken = '', flash }) {
+  const rows = apps.map(a => `<tr>
+    <td><strong>${H(a.publisher)}</strong></td>
+    <td>${H(a.created_at)}</td>
+    <td><span class="badge ${a.status === 'approved' ? 'active' : a.status === 'rejected' ? 'paused' : ''}">${H(a.status)}</span>${a.note ? `<div style="font-size:11px;color:#6e6e73">${H(a.note)}</div>` : ''}</td>
+    <td>${a.status === 'pending' ? `
+      <form method="POST" action="/admin/marketplace-listings/${listing.id}/applications/${a.id}/approve" style="display:inline">${csrfField(csrfToken)}<button class="btn btn-primary">Approve</button></form>
+      <form method="POST" action="/admin/marketplace-listings/${listing.id}/applications/${a.id}/reject" style="display:inline-flex;gap:4px">${csrfField(csrfToken)}<input type="text" name="note" placeholder="reason" style="font-size:11px;padding:3px 6px"><button class="btn btn-danger">Reject</button></form>` : '—'}</td>
+  </tr>`).join('');
+  const body = `${adminHeader('<a href="/admin/marketplace-listings" class="hbtn ghost">← Listings</a>')}
+<main>
+${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
+<section>
+  <div class="sh"><h2>Applications — ${H(listing.title)}</h2><span class="meta">${H(listing.advertiser_slug)}</span></div>
+  ${apps.length === 0 ? '<div class="empty">No applications yet.</div>' :
+    `<table><thead><tr><th>Publisher</th><th>Applied</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout(`Applications — ${listing.title}`, body);
+}
+
+function renderPublisherMarketplace({ pub, listings, appMap, csrfToken = '', flash, error }) {
+  const cards = listings.map(l => {
+    const st = appMap[l.id];
+    const action = st === 'pending'  ? '<span class="badge" style="background:#fff3e0;color:#e65100">Application pending</span>'
+                 : st === 'rejected' ? '<span class="badge paused">Rejected</span>'
+                 : `<form method="POST" action="/publisher/marketplace/${l.id}/apply" data-confirm="Apply to ${H(l.title)}?">${csrfField(csrfToken)}<button class="btn btn-primary">Apply</button></form>`;
+    return `<div class="mk-card" style="border:1px solid #e5e7eb;border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:8px">
+        <strong style="font-size:15px">${H(l.title)}</strong>
+        ${l.geo ? `<span class="badge" style="background:#eef2ff;color:#4338ca">${H(l.geo)}</span>` : ''}
+      </div>
+      ${l.payout_display ? `<div style="color:#0F6E56;font-weight:600">${H(l.payout_display)}</div>` : ''}
+      ${l.category ? `<div style="font-size:11px;color:#6e6e73">${H(l.category)}</div>` : ''}
+      ${l.description ? `<div style="font-size:13px;color:#3a3a3c">${H(l.description)}</div>` : ''}
+      <div style="margin-top:auto;padding-top:8px">${action}</div>
+    </div>`;
+  }).join('');
+  const body = `<main>
+  <h1 style="font-size:22px;margin-bottom:6px">Marketplace</h1>
+  <p style="color:#6e6e73;font-size:13px;margin-bottom:16px">Browse offers you don't run yet and apply for access. <a href="/publisher/marketplace/my-applications">My Applications →</a></p>
+  ${flash ? `<div class="flash success" style="margin-bottom:14px">${H(flash)}</div>` : ''}${error ? `<div style="background:#fde8e8;color:#c62828;padding:10px 14px;border-radius:8px;margin-bottom:14px">${H(error)}</div>` : ''}
+  ${listings.length === 0 ? '<div class="empty">No new offers available right now.</div>' :
+    `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px">${cards}</div>`}
+</main>`;
+  return pubLayout(`${pub.username} — Marketplace`, body, pub, 'market');
+}
+
+function renderMyApplications({ pub, apps }) {
+  const rows = apps.map(a => `<tr>
+    <td><strong>${H(a.title)}</strong><div style="font-size:11px;color:#6e6e73">${H(a.adv_name || '')}</div></td>
+    <td>${H(a.payout_display || '—')}</td>
+    <td>${H((a.created_at || '').slice(0, 10))}</td>
+    <td><span class="badge ${a.status === 'approved' ? 'active' : a.status === 'rejected' ? 'paused' : ''}">${H(a.status)}</span></td>
+    <td style="font-size:11px;color:#6e6e73">${a.status === 'rejected' && a.note ? H(a.note) : ''}</td>
+  </tr>`).join('');
+  const body = `<main>
+  <h1 style="font-size:22px;margin-bottom:6px">My Applications</h1>
+  <p style="color:#6e6e73;font-size:13px;margin-bottom:16px"><a href="/publisher/marketplace">← Back to Marketplace</a></p>
+  ${apps.length === 0 ? '<div class="empty">You have not applied to any offers yet.</div>' :
+    `<section><table><thead><tr><th>Offer</th><th>Payout</th><th>Applied</th><th>Status</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table></section>`}
+</main>`;
+  return pubLayout(`${pub.username} — My Applications`, body, pub, 'market');
+}
+
 // Publisher portal HTML templates
 // ---------------------------------------------------------------------------
 
@@ -6161,6 +6622,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     api:         ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M5 5L2 8l3 3M11 5l3 3-3 3M8 3v10"/>`),
     profile:     ic(`<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 14c0-2.8 2.5-4.5 5.5-4.5s5.5 1.7 5.5 4.5"/>`),
     docs:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3.5 1h9a.5.5 0 0 1 .5.5v13a.5.5 0 0 1-.5.5h-9A.5.5 0 0 1 3 14.5v-13A.5.5 0 0 1 3.5 1z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 5h5M5.5 8h5M5.5 11h3"/>`),
+    market:      ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M2 6h12l-1 8H3L2 6zM5 6V4.5a3 3 0 0 1 6 0V6"/>`),
   };
   const navItem = (href, key, label, external = false) =>
     `<a href="${href}" class="pub-nav-a${activeTab===key?' active':''}"${external?' target="_blank" rel="noopener noreferrer"':''}>${PICONS[key]||''}<span>${label}</span>${external?'<svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" style="margin-left:auto;opacity:.35"><path d="M6 3h7v7l-2-2-4 4-2-2 4-4L6 3z"/></svg>':''}</a>`;
@@ -6193,6 +6655,8 @@ function pubLayout(title, body, pub = null, activeTab = null) {
       ${navItem('/publisher/conversions', 'conversions', 'Conversions')}
       ${navItem('/publisher/payments',    'payments',    'Payments')}
       ${navItem('/marketplace',           'marketplace', 'Browse Offers')}
+      ${navItem('/publisher/marketplace', 'market',      'Marketplace')}
+      ${navItem('/publisher/marketplace/my-applications', 'market', 'My Applications')}
       <div class="pub-sb-group">ACCOUNT</div>
       ${navItem('/publisher/profile',     'profile',     'Profile')}
       <div class="pub-sb-group">DEVELOPER</div>
