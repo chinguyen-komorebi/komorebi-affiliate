@@ -3084,12 +3084,8 @@ app.post('/admin/settings/password', requireAdmin, (req, res) => {
   // Persist the new hash to the DB so it survives restarts (DB is the source of truth
   // on boot). This is what makes a UI password change permanent without an env update.
   db.prepare("INSERT OR REPLACE INTO admin_settings (key, value) VALUES ('admin_pass_hash', ?)").run(ADMIN_PASS_HASH);
-
-  try {
-    updateEnvFile('ADMIN_PASS', new_password);
-  } catch (e) {
-    console.error('[settings] Failed to persist password to .env:', e.message);
-  }
+  // Note: the new password is NOT written to .env — the DB hash is the source of truth on boot.
+  // Writing plaintext to .env would expose the live admin password to anyone who can read the file.
 
   logAudit('admin.password.changed', 'admin', ADMIN_USER, {}, req);
   res.redirect('/admin/settings?msg=Password+changed+successfully');
