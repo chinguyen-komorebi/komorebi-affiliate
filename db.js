@@ -558,6 +558,17 @@ db.exec(`
 const mmpLogCols = db.prepare('PRAGMA table_info(mmp_sync_log)').all().map(c => c.name);
 if (!mmpLogCols.includes('flagged')) db.exec('ALTER TABLE mmp_sync_log ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0');
 
+// Sessions table — sessions live in affiliate.db (one file, always present), served by
+// better-sqlite3-session-store with this `db` (node:sqlite) as its client. See server.js.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    sid    TEXT PRIMARY KEY,
+    sess   TEXT NOT NULL,
+    expire INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
+`);
+
 // Seed a legacy advertiser so pre-migration rows have a valid foreign key target
 db.prepare(`
   INSERT OR IGNORE INTO advertisers (slug, name, offer_url, status)

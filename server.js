@@ -6,7 +6,6 @@ const os          = require('node:os');
 const path        = require('node:path');
 const express     = require('express');
 const session     = require('express-session');
-const Database     = require('better-sqlite3');
 const SQLiteStore  = require('better-sqlite3-session-store')(session);
 const multer      = require('multer');
 const nodemailer  = require('nodemailer');
@@ -119,18 +118,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Persist sessions in their own SQLite file (not affiliate.db, to avoid WAL
-// contention with the app DB). Replaces the default in-memory MemoryStore,
-// which leaked RAM and dropped every session on each PM2 restart. Uses
-// better-sqlite3 (prebuilt binary, clean audit) — no native sqlite3 build.
-// Anchored to __dirname so the path is stable regardless of the process's cwd;
-// WAL mode for better read/write concurrency.
-const sessionDb = new Database(path.join(__dirname, 'sessions.db'));
-sessionDb.pragma('journal_mode = WAL');
-
+// Persist sessions in the main application database (affiliate.db) rather than a
+// separate sessions.db file. One file means it always exists and can't be deleted
+// out from under the store (the old separate sessions.db could go missing, causing
+// "no such column: expire" on a fresh start). `db` (node:sqlite, from db.js) is a
+// valid client for better-sqlite3-session-store — the store is pure JS and only uses
+// prepare/run/get/all/exec, so this also drops the native better-sqlite3 dependency.
+// The `sessions` table + index are created in db.js so they exist before the store runs.
 app.use(session({
-  // Prune expired rows every 15 min so sessions.db doesn't grow unbounded.
-  store: new SQLiteStore({ client: sessionDb, expired: { clear: true, intervalMs: 15 * 60 * 1000 } }),
+  // Prune expired rows every 15 min so the sessions table doesn't grow unbounded.
+  store: new SQLiteStore({ client: db, expired: { clear: true, intervalMs: 15 * 60 * 1000 } }),
   secret: process.env.SESSION_SECRET || 'komorebi-dev-secret-change-in-prod',
   resave: false,
   saveUninitialized: false,
