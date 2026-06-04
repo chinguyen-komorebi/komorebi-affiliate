@@ -351,6 +351,18 @@ for (const [key, value] of [
 }
 
 // ---------------------------------------------------------------------------
+// Admin settings  (key-value store for admin credentials that must survive restarts)
+// Holds 'admin_pass_hash' so a password changed via the UI persists across reboots
+// instead of reverting to the ADMIN_PASS env var. See server.js boot sequence.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+`);
+
+// ---------------------------------------------------------------------------
 // Audit log
 // ---------------------------------------------------------------------------
 db.exec(`
