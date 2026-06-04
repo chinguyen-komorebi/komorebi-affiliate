@@ -3055,20 +3055,6 @@ app.post('/admin/settings/test-slack', requireAdmin, (req, res) => {
     .catch(e  => res.redirect('/admin/settings?msg=' + encodeURIComponent('Slack failed: ' + e.message) + '&ok=0'));
 });
 
-function updateEnvFile(key, value) {
-  const envPath = path.join(__dirname, '.env');
-  let content = '';
-  try { content = fs.readFileSync(envPath, 'utf8'); } catch { /* file may not exist yet */ }
-  const regex = new RegExp(`^${key}=.*$`, 'm');
-  const line  = `${key}=${value}`;
-  if (regex.test(content)) {
-    content = content.replace(regex, line);
-  } else {
-    content = content + (content && !content.endsWith('\n') ? '\n' : '') + line + '\n';
-  }
-  fs.writeFileSync(envPath, content, 'utf8');
-}
-
 app.post('/admin/settings/password', requireAdmin, (req, res) => {
   const { current_password, new_password, confirm_password } = req.body;
 
