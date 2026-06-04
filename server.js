@@ -90,9 +90,31 @@ app.use((req, res, next) => {
       body = body
         .replace(/<script>/g, `<script nonce="${n}">`)
         .replace('</body>', `<script nonce="${n}">${BEHAVIORS_JS}</script></body>`);
+      // Group 5 #2 — white-label: when the request arrived on an advertiser's custom
+      // domain, inject its branding (primary color CSS var + company name) into the page.
+      if (req.branding && body.includes('</head>')) {
+        const b = req.branding;
+        const colour = /^#[0-9a-fA-F]{3,8}$/.test(b.primary_color || '') ? b.primary_color : '#00bfa5';
+        const inject = `<style nonce="${n}">:root{--brand-primary:${colour};}</style>`
+          + `<meta name="x-brand-company" content="${H(b.company_name || '')}">`
+          + `<meta name="x-brand-color" content="${colour}">`
+          + (b.logo_url ? `<meta name="x-brand-logo" content="${H(b.logo_url)}">` : '');
+        body = body.replace('</head>', `${inject}</head>`);
+      }
     }
     return send(body);
   };
+  next();
+});
+
+// Group 5 #2 — white-label: detect an advertiser's custom domain from the request host.
+// req.hostname honors X-Forwarded-Host behind a trusted proxy, else the Host header.
+app.use((req, res, next) => {
+  const host = normalizeDomain((req.hostname || '').split(':')[0]);
+  if (host) {
+    const b = db.prepare('SELECT * FROM advertiser_branding WHERE custom_domain = ?').get(host);
+    if (b) req.branding = b;
+  }
   next();
 });
 
@@ -1155,6 +1177,12 @@ function recordClick(req, slug, pub, smartLinkSlug = null) {
     af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
     campaign, adgroup, creative, network, af_sub1, af_sub2, smartLinkSlug);
 
+  // Group 5 #4 — record an attribution touchpoint for this click. user_id (when the
+  // tracking link carries one) is the journey key linking multiple clicks together.
+  const journeyUser = q('user_id') || q('uid');
+  db.prepare('INSERT INTO attribution_touchpoints (click_id, advertiser_slug, publisher, user_id) VALUES (?, ?, ?, ?)')
+    .run(clickId, slug, pub, journeyUser);
+
   return { clickId, device, country };
 }
 
@@ -1208,16 +1236,32 @@ app.get('/smart/:slug', (req, res) => {
     ...parseUA(req.get('User-Agent') || ''),
   };
   const rules = db.prepare('SELECT * FROM smartlink_rules WHERE smart_link_id = ? ORDER BY priority ASC, id ASC').all(link.id);
-  const rule  = rules.find(r => smartLinkMatch(r, ctx));
-  if (!rule) return res.status(404).json({ error: 'No matching rule for this smart link' });
 
-  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(rule.advertiser_slug);
-  if (!adv || adv.status !== 'active') return res.status(404).json({ error: `Advertiser ${rule.advertiser_slug} unavailable` });
+  // Group 5 #3 — AI mode ignores manual ordering and distributes by performance
+  // (weighted random on revenue-per-click), with a <10-clicks-per-advertiser exploration phase.
+  let advSlug, rulePublisher = null;
+  if (link.ai_mode) {
+    const candidates = [...new Set(rules.map(r => r.advertiser_slug))]
+      .filter(s => db.prepare("SELECT 1 FROM advertisers WHERE slug = ? AND status = 'active'").get(s));
+    if (candidates.length === 0) return res.status(404).json({ error: 'No active advertisers for this smart link' });
+    advSlug = pickAiAdvertiser(link.id, candidates);
+    const r = rules.find(rr => rr.advertiser_slug === advSlug && rr.publisher) || rules.find(rr => rr.advertiser_slug === advSlug);
+    rulePublisher = r ? r.publisher : null;
+  } else {
+    const rule = rules.find(r => smartLinkMatch(r, ctx));
+    if (!rule) return res.status(404).json({ error: 'No matching rule for this smart link' });
+    advSlug = rule.advertiser_slug;
+    rulePublisher = rule.publisher;
+  }
 
-  const pub = (rule.publisher || req.query.pub || '').toString().trim();
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(advSlug);
+  if (!adv || adv.status !== 'active') return res.status(404).json({ error: `Advertiser ${advSlug} unavailable` });
+
+  const pub = (rulePublisher || req.query.pub || '').toString().trim();
   if (!pub) return res.status(400).json({ error: 'Missing publisher: set a rule publisher or pass ?pub=' });
 
   const { clickId } = recordClick(req, adv.slug, pub, link.slug);
+  bumpSmartLinkStat(link.id, adv.slug, { clicks: 1 });   // Group 5 #3 — track per-advertiser clicks
   if (!adv.offer_url) return res.json({ click_id: clickId, advertiser: adv.slug, publisher: pub, smart_link: link.slug });
   const url = new URL(adv.offer_url);
   url.searchParams.set('click_id', clickId);
@@ -1266,6 +1310,83 @@ app.get('/go/:publisher_slug', (req, res) => {
   url.searchParams.set('click_id', clickId);
   res.redirect(302, url.toString());
 });
+
+// ---------------------------------------------------------------------------
+// Group 5 #1 — currency helpers. Rates are read live so admin edits take effect.
+// rate(base) = value of 1 unit of `base` in USD. USD = 1.
+// ---------------------------------------------------------------------------
+function usdRate(cur) {
+  if (!cur || cur === 'USD') return 1;
+  const r = db.prepare("SELECT rate FROM exchange_rates WHERE base = ? AND target = 'USD'").get(cur);
+  // Fail closed: an unknown currency must NOT default to 1:1 with USD (that would mis-state
+  // payout_usd by ~24,000x for VND, etc.). Return null so the value is left uncalculated.
+  if (!r) { console.warn(`[WARN] no USD exchange rate for currency "${cur}" — payout_usd left NULL`); return null; }
+  return r.rate;
+}
+function toUsd(amount, cur) {
+  if (amount == null) return null;
+  const rate = usdRate(cur);
+  return rate == null ? null : +(amount * rate).toFixed(6);
+}
+function knownCurrency(cur) { return cur === 'USD' || !!(cur && db.prepare('SELECT 1 FROM exchange_rates WHERE base = ?').get(cur)); }
+const CURRENCY_SYMBOL = { USD: '$', VND: '₫', SGD: 'S$', THB: '฿', EUR: '€', GBP: '£' };
+function fmtMoney(amount, cur) {
+  const n = Number(amount || 0).toLocaleString('en-US', { maximumFractionDigits: cur === 'VND' ? 0 : 2 });
+  const sym = CURRENCY_SYMBOL[cur] || '';
+  return cur === 'USD' ? `$${n}` : `${n} ${sym || cur}`;
+}
+
+// ---------------------------------------------------------------------------
+// Group 5 #4 — multi-touch attribution helpers
+// ---------------------------------------------------------------------------
+function attributionCredits(touchpoints, model) {
+  const n = touchpoints.length;
+  if (n === 0) return [];
+  if (model === 'first_click') return touchpoints.map((_, i) => i === 0 ? 1 : 0);
+  if (model === 'linear')      return touchpoints.map(() => 1 / n);
+  if (model === 'time_decay') {
+    const HL = 7 * 86400000, now = Date.now();
+    const w = touchpoints.map(t => Math.pow(0.5, Math.max(0, now - Date.parse((t.touched_at || '').replace(' ', 'T') + 'Z')) / HL));
+    const tot = w.reduce((a, b) => a + b, 0) || 1;
+    return w.map(x => x / tot);
+  }
+  return touchpoints.map((_, i) => i === n - 1 ? 1 : 0); // last_click (default)
+}
+function applyAttribution(conversionId, clickId, userId, advSlug, model) {
+  const journey = userId
+    ? db.prepare('SELECT * FROM attribution_touchpoints WHERE user_id = ? AND advertiser_slug = ? AND conversion_id IS NULL ORDER BY touched_at, id').all(userId, advSlug)
+    : db.prepare('SELECT * FROM attribution_touchpoints WHERE click_id = ? AND conversion_id IS NULL ORDER BY touched_at, id').all(clickId);
+  if (journey.length === 0) return 0;
+  const credits = attributionCredits(journey, model);
+  const upd = db.prepare('UPDATE attribution_touchpoints SET conversion_id = ?, position = ?, credit = ? WHERE id = ?');
+  journey.forEach((t, i) => upd.run(conversionId, i + 1, +(credits[i]).toFixed(6), t.id));
+  return journey.length;
+}
+
+// ---------------------------------------------------------------------------
+// Group 5 #3 — smart-link AI: per-advertiser stats + weighted-random selection
+// ---------------------------------------------------------------------------
+function bumpSmartLinkStat(linkId, advSlug, { clicks = 0, conversions = 0, revenue = 0 }) {
+  const ex = db.prepare('SELECT id FROM smart_link_stats WHERE smart_link_id = ? AND advertiser_slug = ?').get(linkId, advSlug);
+  if (ex) db.prepare("UPDATE smart_link_stats SET clicks = clicks + ?, conversions = conversions + ?, revenue = revenue + ?, updated_at = datetime('now') WHERE id = ?").run(clicks, conversions, revenue, ex.id);
+  else    db.prepare('INSERT INTO smart_link_stats (smart_link_id, advertiser_slug, clicks, conversions, revenue) VALUES (?, ?, ?, ?, ?)').run(linkId, advSlug, clicks, conversions, revenue);
+}
+function pickAiAdvertiser(linkId, candidateSlugs) {
+  const stats = {};
+  for (const s of candidateSlugs) {
+    stats[s] = db.prepare('SELECT clicks, conversions, revenue FROM smart_link_stats WHERE smart_link_id = ? AND advertiser_slug = ?').get(linkId, s) || { clicks: 0, conversions: 0, revenue: 0 };
+  }
+  // Exploration phase — route to any advertiser with < 10 clicks first.
+  const under = candidateSlugs.filter(s => (stats[s].clicks || 0) < 10);
+  if (under.length) return under[Math.floor(Math.random() * under.length)];
+  // Weighted random by EPC (revenue / clicks) ≈ conversion_rate × avg payout.
+  const w = candidateSlugs.map(s => Math.max(0, stats[s].clicks > 0 ? stats[s].revenue / stats[s].clicks : 0));
+  const tot = w.reduce((a, b) => a + b, 0);
+  if (tot <= 0) return candidateSlugs[Math.floor(Math.random() * candidateSlugs.length)];
+  let r = Math.random() * tot;
+  for (let i = 0; i < candidateSlugs.length; i++) { r -= w[i]; if (r <= 0) return candidateSlugs[i]; }
+  return candidateSlugs[candidateSlugs.length - 1];
+}
 
 // ---------------------------------------------------------------------------
 // Postback  GET /postback/:slug?click_id=X&payout=Y[&event=sale][&publisher=Z]
@@ -1380,8 +1501,11 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const payoutType = (assignment.payout_override == null)
     ? (goal ? goal.payout_type : adv.payout_type) : 'fixed';
   let currency = String(req.query.currency || '').trim().toUpperCase();
-  if (currency !== 'USD' && currency !== 'VND') {
-    currency = (payoutType === 'percent' && loanAmount != null && loanAmount > 1000) ? 'VND' : 'USD';
+  if (!knownCurrency(currency)) {
+    // Group 5 #1 — default to the advertiser's configured currency; fall back to the
+    // legacy VND-for-large-percent-loan heuristic only when no known currency applies.
+    currency = (adv.currency && knownCurrency(adv.currency)) ? adv.currency
+             : (payoutType === 'percent' && loanAmount != null && loanAmount > 1000) ? 'VND' : 'USD';
   }
 
   // F15 — duplicate-user detection. If this user_id already converted for this advertiser
@@ -1423,14 +1547,18 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const afSub1 = click.af_sub1 || null;
   const afSub2 = click.af_sub2 || null;
 
-  let result;
+  // Group 5 #1 — local-currency amount (mirrors `payout`) + USD-normalized amount.
+  const payoutLocal = amount;
+  const payoutUsd   = toUsd(amount, currency);
+
+  let result, conversionId;
   try {
-    db.prepare(
-      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?)`
-    ).run(click_id, slug, pub, event, amount, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2);
+    conversionId = db.prepare(
+      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, payout_local, payout_usd, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?)`
+    ).run(click_id, slug, pub, event, amount, payoutLocal, payoutUsd, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2).lastInsertRowid;
     result = { status: duplicate ? 'duplicate' : 'ok', click_id, advertiser: slug, publisher: pub, event,
-               payout: amount, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId,
+               payout: amount, payout_local: payoutLocal, payout_usd: payoutUsd, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId,
                ctit_seconds: ctitSeconds };
     if (fraudFlag) result.fraud_flag = fraudFlag;
     if (note) result.note = note;
@@ -1455,6 +1583,21 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     }
     result.fraud_flag = (result.fraud_flag && result.fraud_flag.startsWith('ctit_'))
       ? `duplicate_click_id|${result.fraud_flag}` : 'duplicate_click_id';
+  }
+
+  // Group 5 #4 — multi-touch attribution. Resolve the journey (touchpoints sharing the
+  // user_id when present, else just this click), assign positions, apply the model.
+  const attribModel = ['last_click', 'first_click', 'linear', 'time_decay'].includes(req.query.attribution_model)
+    ? req.query.attribution_model
+    : (db.prepare("SELECT value FROM settings WHERE key = 'default_attribution_model'").get()?.value || 'last_click');
+  const tps = applyAttribution(conversionId, click_id, userId, slug, attribModel);
+  db.prepare('UPDATE conversions SET attribution_model = ? WHERE id = ?').run(attribModel, conversionId);
+  result.attribution = { model: attribModel, touchpoints: tps };
+
+  // Group 5 #3 — smart-link AI stats: count this conversion + revenue for the link/advertiser.
+  if (click.smart_link_slug) {
+    const link = db.prepare('SELECT id FROM smart_links WHERE slug = ?').get(click.smart_link_slug);
+    if (link) bumpSmartLinkStat(link.id, slug, { conversions: 1, revenue: revenue != null ? revenue : (payoutUsd || 0) });
   }
 
   logPostback(req, result);
@@ -1931,7 +2074,7 @@ app.get('/publisher/conversions', requirePublisher, (req, res) => {
   const pub = req.publisher;
   const conversions = db.prepare(`
     SELECT cv.received_at, cv.advertiser_slug, cv.click_id, cv.event,
-           cv.payout, cv.currency, cv.loan_amount, cv.revenue, cv.status, cv.reason, cv.af_sub1, a.name as adv_name
+           cv.payout, cv.payout_local, cv.currency, cv.loan_amount, cv.revenue, cv.status, cv.reason, cv.af_sub1, cv.attribution_model, a.name as adv_name
     FROM conversions cv
     LEFT JOIN advertisers a ON a.slug = cv.advertiser_slug
     WHERE cv.publisher = ?
@@ -2110,7 +2253,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   else if (fraudFilter === 'ctit')          recentWhere = "WHERE fraud_flag LIKE '%ctit%'";
   else if (fraudFilter === 'protect360')    recentWhere = "WHERE fraud_source = 'protect360'";
   const recent = db.prepare(
-    `SELECT id, received_at, advertiser_slug, click_id, publisher, event, payout, status, reason,
+    `SELECT id, received_at, advertiser_slug, click_id, publisher, event, payout, currency, status, reason,
             ctit_seconds, fraud_flag, fraud_source, af_sub1 FROM conversions ${recentWhere} ORDER BY received_at DESC LIMIT 50`
   ).all();
 
@@ -3408,7 +3551,7 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
   const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
 
   const rows = db.prepare(
-    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,currency,status,reason,af_sub1,af_sub2 FROM conversions ${where} ORDER BY received_at`
+    `SELECT received_at,advertiser_slug,click_id,transaction_id,publisher,event,payout,payout_local,payout_usd,currency,status,reason,af_sub1,af_sub2 FROM conversions ${where} ORDER BY received_at`
   ).all(...params);
 
   const parts = [advertiser, month].filter(Boolean);
@@ -3418,8 +3561,8 @@ app.get('/admin/export.csv', requireAdmin, (req, res) => {
 
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   res.send([
-    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,currency,status,reason,af_sub1,af_sub2',
-    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.currency, r.status, r.reason, r.af_sub1, r.af_sub2].map(q).join(',')),
+    'received_at,advertiser,click_id,transaction_id,publisher,event,payout,payout_local,payout_usd,currency,status,reason,af_sub1,af_sub2',
+    ...rows.map(r => [r.received_at, r.advertiser_slug, r.click_id, r.transaction_id, r.publisher, r.event, r.payout, r.payout_local, r.payout_usd, r.currency, r.status, r.reason, r.af_sub1, r.af_sub2].map(q).join(',')),
   ].join('\r\n'));
 });
 
@@ -3703,9 +3846,10 @@ app.get('/admin/smart-links/:id', requireAdmin, (req, res) => {
   if (!link) return res.redirect('/admin/smart-links?msg=Smart+link+not+found&ok=0');
   const rules = db.prepare('SELECT * FROM smartlink_rules WHERE smart_link_id = ? ORDER BY priority ASC, id ASC').all(link.id);
   const advertisers = db.prepare("SELECT slug, name FROM advertisers WHERE slug != 'legacy' AND status = 'active' ORDER BY name").all();
+  const stats = db.prepare('SELECT * FROM smart_link_stats WHERE smart_link_id = ? ORDER BY revenue DESC, clicks DESC').all(link.id);
   const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
-  res.send(renderSmartLinkDetail({ link, rules, advertisers, csrfToken: req.session.csrfToken, flash, error }));
+  res.send(renderSmartLinkDetail({ link, rules, advertisers, stats, csrfToken: req.session.csrfToken, flash, error }));
 });
 
 app.post('/admin/smart-links/:id/rules', requireAdmin, (req, res) => {
@@ -3872,6 +4016,84 @@ app.get('/publisher/marketplace/my-applications', requirePublisher, (req, res) =
     LEFT JOIN advertisers a ON a.slug = ml.advertiser_slug
     WHERE ma.publisher = ? ORDER BY ma.created_at DESC`).all(pub.username);
   res.send(renderMyApplications({ pub, apps }));
+});
+
+// ===========================================================================
+// Group 5 admin routes (CSRF handled by the /admin/* guard)
+// ===========================================================================
+
+// #1 — exchange rates
+app.get('/admin/exchange-rates', requireAdmin, (req, res) => {
+  const rates = db.prepare('SELECT * FROM exchange_rates ORDER BY base').all();
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderExchangeRates({ rates, csrfToken: req.session.csrfToken, flash, error }));
+});
+app.post('/admin/exchange-rates', requireAdmin, (req, res) => {
+  const base = (req.body.base || '').trim().toUpperCase().slice(0, 8);
+  const rate = parseFloat(req.body.rate);
+  if (!base || !(rate > 0)) return res.redirect('/admin/exchange-rates?msg=Currency+code+and+a+positive+rate+are+required&ok=0');
+  const ex = db.prepare("SELECT id FROM exchange_rates WHERE base = ? AND target = 'USD'").get(base);
+  if (ex) db.prepare("UPDATE exchange_rates SET rate = ?, updated_at = datetime('now') WHERE id = ?").run(rate, ex.id);
+  else    db.prepare("INSERT INTO exchange_rates (base, target, rate) VALUES (?, 'USD', ?)").run(base, rate);
+  logAudit('exchange_rate.updated', 'currency', base, { rate }, req);
+  res.redirect('/admin/exchange-rates?msg=Rate+for+' + encodeURIComponent(base) + '+updated');
+});
+
+// #2 — per-advertiser white-label branding
+app.get('/admin/advertisers/:slug/branding', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const branding = db.prepare('SELECT * FROM advertiser_branding WHERE advertiser_slug = ?').get(adv.slug) || {};
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderBranding({ adv, branding, csrfToken: req.session.csrfToken, flash, error }));
+});
+app.post('/admin/advertisers/:slug/branding', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const logo    = (req.body.logo_url || '').trim().slice(0, 500) || null;
+  const color   = /^#[0-9a-fA-F]{3,8}$/.test((req.body.primary_color || '').trim()) ? req.body.primary_color.trim() : '#00bfa5';
+  const company = (req.body.company_name || '').trim().slice(0, 120) || null;
+  const domain  = normalizeDomain(req.body.custom_domain);
+  const ex = db.prepare('SELECT id FROM advertiser_branding WHERE advertiser_slug = ?').get(adv.slug);
+  try {
+    if (ex) db.prepare('UPDATE advertiser_branding SET logo_url=?, primary_color=?, company_name=?, custom_domain=? WHERE id=?').run(logo, color, company, domain, ex.id);
+    else    db.prepare('INSERT INTO advertiser_branding (advertiser_slug, logo_url, primary_color, company_name, custom_domain) VALUES (?, ?, ?, ?, ?)').run(adv.slug, logo, color, company, domain);
+  } catch (err) {
+    if ((err.message || '').includes('UNIQUE')) return res.redirect(`/admin/advertisers/${adv.slug}/branding?msg=That+custom+domain+is+already+in+use&ok=0`);
+    throw err;
+  }
+  logAudit('advertiser.branding_saved', 'advertiser', adv.slug, { custom_domain: domain }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/branding?msg=Branding+saved`);
+});
+
+// #3 — toggle smart-link AI mode
+app.post('/admin/smart-links/:id/toggle-ai', requireAdmin, (req, res) => {
+  const link = db.prepare('SELECT * FROM smart_links WHERE id = ?').get(req.params.id);
+  if (!link) return res.redirect('/admin/smart-links?msg=Smart+link+not+found&ok=0');
+  const next = link.ai_mode ? 0 : 1;
+  db.prepare('UPDATE smart_links SET ai_mode = ? WHERE id = ?').run(next, link.id);
+  logAudit('smartlink.ai_toggled', 'smart_link', link.slug, { ai_mode: next }, req);
+  res.redirect(`/admin/smart-links/${link.id}?msg=AI+mode+${next ? 'enabled' : 'disabled'}`);
+});
+
+// #4 — attribution overview + default model
+app.get('/admin/attribution', requireAdmin, (req, res) => {
+  const model = db.prepare("SELECT value FROM settings WHERE key = 'default_attribution_model'").get()?.value || 'last_click';
+  const breakdown = db.prepare('SELECT attribution_model, COUNT(*) AS n, COALESCE(SUM(payout_usd),0) AS usd FROM conversions GROUP BY attribution_model ORDER BY n DESC').all();
+  const journeys = db.prepare(`SELECT c.id, c.click_id, c.advertiser_slug, c.attribution_model,
+      (SELECT COUNT(*) FROM attribution_touchpoints t WHERE t.conversion_id = c.id) AS touchpoints
+    FROM conversions c
+    WHERE EXISTS (SELECT 1 FROM attribution_touchpoints t WHERE t.conversion_id = c.id)
+    ORDER BY c.id DESC LIMIT 50`).all();
+  res.send(renderAttribution({ model, breakdown, journeys, csrfToken: req.session.csrfToken, flash: req.query.msg || null }));
+});
+app.post('/admin/attribution/default', requireAdmin, (req, res) => {
+  const m = ['last_click', 'first_click', 'linear', 'time_decay'].includes(req.body.model) ? req.body.model : 'last_click';
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('default_attribution_model', ?)").run(m);
+  logAudit('attribution.default_set', 'settings', m, {}, req);
+  res.redirect('/admin/attribution?msg=Default+attribution+model+set+to+' + encodeURIComponent(m));
 });
 
 // HTML templates — shared helpers
@@ -4289,10 +4511,12 @@ function adminSidebar() {
   <div class="adm-sb-group">REPORTS</div>
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
+  ${nav('/admin/attribution',   'Attribution',       'reports','/admin/attribution')}
   <div class="adm-sb-group">RISK</div>
   ${nav('/admin/fraud',            'Fraud Review',      'fraud',  '/admin/fraud')}
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   <div class="adm-sb-group">SYSTEM</div>
+  ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
   ${nav('/admin/postback-log','Postback Log','postback',    '/admin/postback-log')}
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
   ${nav('/admin/settings',    'Settings',    'settings',    '/admin/settings')}
@@ -4511,6 +4735,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
       <td><code class="xs">${H(r.click_id)}</code></td>
       <td><span class="badge ev">${H(r.event)}</span></td>
       <td${ctitFlagged ? ' style="color:#c62828;font-weight:600"' : ''}>${fmtCtit(r.ctit_seconds)}</td>
+      <td>${r.currency && r.currency !== 'USD' ? `<span class="badge" style="background:#eef2ff;color:#4338ca">${H(r.currency)}</span>` : '<span style="color:#9ca3af;font-size:11px">USD</span>'}</td>
       <td>${r.af_sub1 ? `<code class="xs">${H(r.af_sub1)}</code>` : ''}</td>
       <td>$${$(r.payout)}</td>
       <td>${statusCell}</td>
@@ -4657,7 +4882,7 @@ ${(topCountries.length || deviceSplit.length) ? `
       <a href="/admin/export.csv?month=${thisMonth}" class="btn btn-ghost">${thisMonth} CSV</a></div>
   </div>
   ${recentRows.length===0 ? '<div class="empty">No conversions match.</div>'
-    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
+    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Cur</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
         <tbody>${recentRows}</tbody></table>`}
 </section>
 </main><script>${CP_JS}</script>`;
@@ -4969,6 +5194,8 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
       <small style="display:block;margin-top:6px;color:#8e8e93">Save credentials before testing — the test uses the saved token.</small>` : ''}
     </fieldset>
     ${isEdit && adv.slug ? `
+    <div class="fg"><label>White-label Branding <span style="font-size:11px;color:#6e6e73">(Group 5)</span></label>
+      <a href="/admin/advertisers/${H(adv.slug)}/branding" class="btn btn-ghost">Branding settings →</a></div>
     <div class="fg"><label>Tracking URL format</label>
       <div class="ubox" data-copy="${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME">
         ${H(BASE_URL)}/track/${H(adv.slug)}?pub=PUBLISHER_NAME</div></div>
@@ -6441,8 +6668,27 @@ document.querySelector('[data-autoslug]')?.addEventListener('input',e=>autoSlug(
   return adminLayout('New Smart Link', body);
 }
 
-function renderSmartLinkDetail({ link, rules, advertisers, csrfToken = '', flash, error }) {
+function renderSmartLinkDetail({ link, rules, advertisers, stats = [], csrfToken = '', flash, error }) {
   const cell = v => v ? `<code class="xs">${H(v)}</code>` : '<span style="color:#9ca3af">any</span>';
+  const aiOn = !!link.ai_mode;
+  const aiSection = `
+<section>
+  <div class="sh"><h2>Traffic AI ${aiOn ? '<span class="badge active" style="margin-left:6px">ON</span>' : '<span class="badge paused" style="margin-left:6px">OFF</span>'}</h2></div>
+  <div style="padding:14px 20px;font-size:12px;color:#6e6e73">
+    ${aiOn ? 'Manual rules are ignored — traffic is distributed across the candidate advertisers by performance (revenue per click), with a &lt;10-clicks exploration phase.' : 'Manual rules (above) decide routing. Enable AI to distribute by performance instead.'}
+    <form method="POST" action="/admin/smart-links/${link.id}/toggle-ai" style="display:inline;margin-left:8px">${csrfField(csrfToken)}
+      <button class="btn ${aiOn ? 'btn-danger' : 'btn-primary'}">${aiOn ? 'Disable AI' : 'Enable AI'}</button></form>
+  </div>
+  ${stats.length === 0 ? '<div class="empty">No performance data yet.</div>' : `
+  <table><thead><tr><th>Advertiser</th><th>Clicks</th><th>Conversions</th><th>CVR</th><th>Revenue</th><th>EPC</th></tr></thead>
+  <tbody>${stats.map(s => `<tr>
+    <td><code class="xs">${H(s.advertiser_slug)}</code></td>
+    <td>${N(s.clicks)}</td><td>${N(s.conversions)}</td>
+    <td>${s.clicks > 0 ? ((s.conversions / s.clicks) * 100).toFixed(1) + '%' : '—'}</td>
+    <td>$${$(s.revenue)}</td>
+    <td>$${s.clicks > 0 ? (s.revenue / s.clicks).toFixed(4) : '0.0000'}</td>
+  </tr>`).join('')}</tbody></table>`}
+</section>`;
   const ruleRows = rules.map((r, i) => `<tr>
     <td style="white-space:nowrap">
       <form method="POST" action="/admin/smart-links/${link.id}/rules/reorder" style="display:inline">${csrfField(csrfToken)}
@@ -6468,6 +6714,7 @@ ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div cl
   ${rules.length === 0 ? '<div class="empty">No rules yet — add one below. With no rules, the link returns 404.</div>' :
     `<table><thead><tr><th></th><th>Priority</th><th>GEO</th><th>Device</th><th>OS</th><th>Advertiser</th><th>Publisher</th><th></th></tr></thead><tbody>${ruleRows}</tbody></table>`}
 </section>
+${aiSection}
 <section>
   <div class="sh"><h2>Add Rule</h2></div>
   <form method="POST" action="/admin/smart-links/${link.id}/rules" style="padding:16px 20px;display:grid;grid-template-columns:repeat(6,1fr) auto;gap:8px;align-items:end">${csrfField(csrfToken)}
@@ -6604,6 +6851,91 @@ function renderMyApplications({ pub, apps }) {
     `<section><table><thead><tr><th>Offer</th><th>Payout</th><th>Applied</th><th>Status</th><th>Note</th></tr></thead><tbody>${rows}</tbody></table></section>`}
 </main>`;
   return pubLayout(`${pub.username} — My Applications`, body, pub, 'market');
+}
+
+// Group 5 admin templates
+// ---------------------------------------------------------------------------
+function renderExchangeRates({ rates, csrfToken = '', flash, error }) {
+  const rows = rates.map(r => `<tr>
+    <td><strong>${H(r.base)}</strong> → ${H(r.target)}</td>
+    <td>
+      <form method="POST" action="/admin/exchange-rates" style="display:flex;gap:6px;align-items:center">${csrfField(csrfToken)}
+        <input type="hidden" name="base" value="${H(r.base)}">
+        <input type="number" name="rate" value="${r.rate}" step="any" min="0" style="width:160px;font-family:monospace">
+        <button class="btn btn-ghost">Save</button>
+      </form>
+    </td>
+    <td><small style="color:#6e6e73">${H(r.updated_at || '')}</small></td>
+  </tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div class="form-err">${H(error)}</div>` : ''}
+<section>
+  <div class="sh"><h2>Exchange Rates</h2><span class="meta">value of 1 unit in USD</span></div>
+  <table><thead><tr><th>Pair</th><th>Rate (→ USD)</th><th>Updated</th></tr></thead><tbody>${rows}</tbody></table>
+  <div style="padding:16px 20px;border-top:1px solid #f0f0f0">
+    <form method="POST" action="/admin/exchange-rates" style="display:flex;gap:8px;align-items:end">${csrfField(csrfToken)}
+      <div class="fg" style="margin:0"><label>Add / update currency</label><input type="text" name="base" placeholder="e.g. SGD" style="text-transform:uppercase"></div>
+      <div class="fg" style="margin:0"><label>Rate → USD</label><input type="number" name="rate" step="any" min="0" placeholder="0.74"></div>
+      <button class="btn btn-primary">Save</button>
+    </form>
+  </div>
+</section>
+</main>`;
+  return adminLayout('Exchange Rates', body);
+}
+
+function renderBranding({ adv, branding, csrfToken = '', flash, error }) {
+  const color = branding.primary_color || '#00bfa5';
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">← Edit advertiser</a>`)}
+<main><div class="fw">
+  <h2>White-label Branding — ${H(adv.name)}</h2>
+  ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div class="form-err">${H(error)}</div>` : ''}
+  <p style="font-size:12px;color:#6e6e73;margin-bottom:14px">When a publisher reaches the portal via this advertiser's custom domain, the portal shows this branding.</p>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/branding">${csrfField(csrfToken)}
+    <div class="fg"><label>Company Name</label><input type="text" name="company_name" value="${H(branding.company_name || '')}" placeholder="e.g. ACB Partners"></div>
+    <div class="fg"><label>Logo URL</label><input type="text" name="logo_url" value="${H(branding.logo_url || '')}" placeholder="https://…/logo.png"></div>
+    <div class="fg-row">
+      <div class="fg"><label>Primary Color</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="color" name="primary_color" value="${H(/^#[0-9a-fA-F]{6}$/.test(color) ? color : '#00bfa5')}" style="width:48px;height:36px;padding:2px">
+          <input type="text" value="${H(color)}" disabled style="width:120px;font-family:monospace;color:#6e6e73">
+        </div></div>
+      <div class="fg"><label>Custom Domain</label><input type="text" name="custom_domain" value="${H(branding.custom_domain || '')}" placeholder="portal.partner.com"></div>
+    </div>
+    <div class="form-act"><button class="btn btn-primary btn-lg">Save Branding</button>
+      <a href="/admin/advertisers/${H(adv.slug)}/edit" class="btn btn-ghost btn-lg">Cancel</a></div>
+  </form>
+</div></main>`;
+  return adminLayout(`Branding — ${adv.name}`, body);
+}
+
+function renderAttribution({ model, breakdown, journeys, csrfToken = '', flash }) {
+  const MODELS = ['last_click', 'first_click', 'linear', 'time_decay'];
+  const opts = MODELS.map(m => `<option value="${m}" ${model === m ? 'selected' : ''}>${m}</option>`).join('');
+  const bRows = breakdown.map(b => `<tr><td><code class="xs">${H(b.attribution_model)}</code></td><td>${N(b.n)}</td><td>$${$(b.usd)}</td></tr>`).join('');
+  const jRows = journeys.map(j => `<tr><td><code class="xs">${H(j.click_id)}</code></td><td>${H(j.advertiser_slug)}</td><td>${H(j.attribution_model)}</td><td>${N(j.touchpoints)}</td></tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
+<section>
+  <div class="sh"><h2>Attribution</h2><span class="meta">multi-touch journey credit</span></div>
+  <div style="padding:16px 20px;border-bottom:1px solid #f0f0f0">
+    <form method="POST" action="/admin/attribution/default" style="display:flex;gap:8px;align-items:end">${csrfField(csrfToken)}
+      <div class="fg" style="margin:0"><label>Default attribution model</label><select name="model">${opts}</select></div>
+      <button class="btn btn-primary">Set Default</button>
+    </form>
+    <p style="font-size:11px;color:#6e6e73;margin-top:8px">Models: <code>last_click</code> (default), <code>first_click</code>, <code>linear</code> (equal split), <code>time_decay</code> (7-day half-life).</p>
+  </div>
+  <div style="padding:8px 20px"><h3 style="font-size:13px;font-weight:600">Conversions by model</h3></div>
+  ${breakdown.length === 0 ? '<div class="empty">No conversions yet.</div>' : `<table><thead><tr><th>Model</th><th>Conversions</th><th>USD</th></tr></thead><tbody>${bRows}</tbody></table>`}
+</section>
+<section>
+  <div class="sh"><h2>Multi-touch Journeys</h2><span class="meta">conversions with recorded touchpoints</span></div>
+  ${journeys.length === 0 ? '<div class="empty">No multi-touch journeys recorded yet.</div>' : `<table><thead><tr><th>Click ID</th><th>Advertiser</th><th>Model</th><th>Touchpoints</th></tr></thead><tbody>${jRows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Attribution', body);
 }
 
 // Publisher portal HTML templates
@@ -6825,9 +7157,10 @@ function renderPubConversions({ pub, conversions }) {
     ${showSub     ? `<td>${r.af_sub1 ? `<code class="xs">${H(r.af_sub1)}</code>` : ''}</td>` : ''}
     ${showLoan    ? `<td>${fmtNum(r.loan_amount)}</td>` : ''}
     ${showRevenue ? `<td>${fmtNum(r.revenue)}</td>` : ''}
-    <td>${fmtCur(r.payout, r.currency)}</td>
+    <td>${fmtMoney(r.payout_local != null ? r.payout_local : r.payout, r.currency)}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
         ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
+    <td><small style="color:#6e6e73">${H(r.attribution_model || 'last_click')}</small></td>
   </tr>`).join('');
 
   const body = `<main>
@@ -6835,7 +7168,7 @@ function renderPubConversions({ pub, conversions }) {
   <div class="sh"><h2>Conversion History</h2><span class="meta">${N(conversions.length)} conversions (last 500)</span></div>
   ${rows.length===0
     ? '<div class="empty">No conversions recorded yet.</div>'
-    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th>${showSub?'<th>Sub-Aff</th>':''}${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Status</th></tr></thead>
+    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th>${showSub?'<th>Sub-Aff</th>':''}${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Status</th><th>Attribution</th></tr></thead>
         <tbody>${rows}</tbody></table>`}
 </section>
 </main>`;

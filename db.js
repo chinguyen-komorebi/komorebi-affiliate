@@ -183,6 +183,13 @@ if (!convCols2.includes('fraud_flag'))   db.exec('ALTER TABLE conversions ADD CO
 if (!convCols2.includes('ctit_seconds')) db.exec('ALTER TABLE conversions ADD COLUMN ctit_seconds INTEGER');
 if (!convCols2.includes('af_sub1'))      db.exec('ALTER TABLE conversions ADD COLUMN af_sub1 TEXT');
 if (!convCols2.includes('af_sub2'))      db.exec('ALTER TABLE conversions ADD COLUMN af_sub2 TEXT');
+// Group 5 #1 — multi-currency. `payout` stays in the conversion currency (existing
+// per-currency invoicing/earnings rely on that); payout_local mirrors it explicitly and
+// payout_usd is the USD-normalized amount (via exchange_rates) for cross-currency totals.
+if (!convCols2.includes('payout_local')) db.exec('ALTER TABLE conversions ADD COLUMN payout_local REAL');
+if (!convCols2.includes('payout_usd'))   db.exec('ALTER TABLE conversions ADD COLUMN payout_usd REAL');
+// Group 5 #4 — attribution model applied to this conversion.
+if (!convCols2.includes('attribution_model')) db.exec("ALTER TABLE conversions ADD COLUMN attribution_model TEXT NOT NULL DEFAULT 'last_click'");
 db.exec('CREATE INDEX IF NOT EXISTS idx_conv_fraud_flag ON conversions(fraud_flag)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_conv_af_sub1 ON conversions(af_sub1)');
 if (!convCols2.includes('dispute_state'))   db.exec("ALTER TABLE conversions ADD COLUMN dispute_state TEXT NOT NULL DEFAULT 'none'");
@@ -603,6 +610,80 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_mktapps_listing ON marketplace_apps(listing_id);
   CREATE INDEX IF NOT EXISTS idx_mktapps_pub     ON marketplace_apps(publisher);
 `);
+
+// ===========================================================================
+// Group 5 — multi-currency, white-label, traffic AI, multi-touch attribution
+// ===========================================================================
+
+// #1 — exchange rates (rate = value of 1 unit of `base` in `target`). Seeded base→USD.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS exchange_rates (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    base       TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    rate       REAL NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(base, target)
+  );
+`);
+for (const [base, rate] of [['USD', 1], ['VND', 0.000040], ['SGD', 0.74]]) {
+  db.prepare('INSERT OR IGNORE INTO exchange_rates (base, target, rate) VALUES (?, ?, ?)').run(base, 'USD', rate);
+}
+
+// #2 — per-advertiser white-label branding.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS advertiser_branding (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL REFERENCES advertisers(slug) ON DELETE CASCADE,
+    logo_url        TEXT,
+    primary_color   TEXT DEFAULT '#00bfa5',
+    company_name    TEXT,
+    custom_domain   TEXT UNIQUE,
+    created_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(advertiser_slug)
+  );
+  CREATE INDEX IF NOT EXISTS idx_brand_domain ON advertiser_branding(custom_domain);
+`);
+
+// #3 — traffic-distribution AI: per-smart-link mode + per-advertiser stats.
+const smartLinkCols = db.prepare('PRAGMA table_info(smart_links)').all().map(c => c.name);
+if (!smartLinkCols.includes('ai_mode')) db.exec('ALTER TABLE smart_links ADD COLUMN ai_mode INTEGER NOT NULL DEFAULT 0');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS smart_link_stats (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    smart_link_id   INTEGER NOT NULL REFERENCES smart_links(id) ON DELETE CASCADE,
+    advertiser_slug TEXT NOT NULL,
+    clicks          INTEGER NOT NULL DEFAULT 0,
+    conversions     INTEGER NOT NULL DEFAULT 0,
+    revenue         REAL NOT NULL DEFAULT 0,
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(smart_link_id, advertiser_slug)
+  );
+`);
+
+// #4 — multi-touch attribution touchpoints (one row per click in a journey).
+// Spec columns + two additive extras to make multi-touch real & testable: `user_id`
+// is the journey/identity key (the platform has no other cross-click identity), and
+// `credit` stores the per-touchpoint share once the model is applied at conversion.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS attribution_touchpoints (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversion_id   INTEGER,
+    click_id        TEXT,
+    advertiser_slug TEXT,
+    publisher       TEXT,
+    user_id         TEXT,
+    position        INTEGER,
+    credit          REAL,
+    touched_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_touch_click ON attribution_touchpoints(click_id);
+  CREATE INDEX IF NOT EXISTS idx_touch_conv  ON attribution_touchpoints(conversion_id);
+  CREATE INDEX IF NOT EXISTS idx_touch_user  ON attribution_touchpoints(user_id, advertiser_slug);
+`);
+
+// Default attribution model (admin-settable). Stored in the existing settings table.
+db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('default_attribution_model', 'last_click');
 
 // ---------------------------------------------------------------------------
 // MMP sync log (F20) — one row per manual AppsFlyer sync run
