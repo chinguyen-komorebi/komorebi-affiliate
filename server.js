@@ -1591,12 +1591,17 @@ app.get('/marketplace', (req, res) => {
     pendingIds  = new Set(db.prepare("SELECT advertiser_id FROM marketplace_applications WHERE publisher_id = ? AND status = 'pending'").all(pubId).map(r => r.advertiser_id));
   }
   const flash = req.query.msg || null;
-  res.send(renderMarketplace({ campaigns, loggedIn: !!pubId, assignedIds, pendingIds, flash }));
+  if (!req.session.csrfToken) req.session.csrfToken = generateCsrfToken();
+  res.send(renderMarketplace({ campaigns, loggedIn: !!pubId, assignedIds, pendingIds, flash, csrfToken: req.session.csrfToken }));
 });
 
-app.post('/marketplace/apply', applyLimiter, (req, res) => {
-  const pubId = req.session?.pubId;
-  if (!pubId) return res.redirect('/publisher/login?next=' + encodeURIComponent('/marketplace'));
+app.post('/marketplace/apply', applyLimiter, (req, res, next) => {
+  // Logged-out users are redirected to login (unchanged). For an authenticated apply we
+  // enforce CSRF so this public form matches the /publisher/marketplace route's protection.
+  if (!req.session?.pubId) return res.redirect('/publisher/login?next=' + encodeURIComponent('/marketplace'));
+  verifyCsrf(req, res, next);
+}, (req, res) => {
+  const pubId = req.session.pubId;
   const advId = parseInt(req.body.advertiser_id, 10);
   const adv = advId ? db.prepare("SELECT id, name FROM advertisers WHERE id = ? AND is_public = 1 AND status = 'active'").get(advId) : null;
   if (!adv) return res.redirect('/marketplace?msg=' + encodeURIComponent('Campaign not available'));
@@ -5370,7 +5375,7 @@ function renderSmartLinks({ pub, rules, advertisers, csrfToken = '', flash, erro
   return adminLayout(`Smart Links — ${pub.username}`, body);
 }
 
-function renderMarketplace({ campaigns, loggedIn, assignedIds, pendingIds, flash }) {
+function renderMarketplace({ campaigns, loggedIn, assignedIds, pendingIds, flash, csrfToken = '' }) {
   const cards = campaigns.map(a => {
     const assigned = assignedIds.has(a.id);
     const pending  = pendingIds.has(a.id);
@@ -5380,7 +5385,7 @@ function renderMarketplace({ campaigns, loggedIn, assignedIds, pendingIds, flash
       ? `<button class="campaign-apply" disabled>✓ Already running</button>`
       : pending
         ? `<button class="campaign-apply" disabled>Application pending</button>`
-        : `<form method="POST" action="/marketplace/apply" style="margin:0">
+        : `<form method="POST" action="/marketplace/apply" style="margin:0">${csrfField(csrfToken)}
              <input type="hidden" name="advertiser_id" value="${H(a.id)}">
              <button type="submit" class="campaign-apply">Apply to Campaign${loggedIn ? '' : ' — log in'}</button>
            </form>`;
