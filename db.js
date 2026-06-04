@@ -114,6 +114,7 @@ const CLICK_EXTRA_COLS = [
   'adjust_network', 'adjust_campaign', 'adjust_adgroup', 'adjust_creative', // F10 raw (Adjust)
   'campaign', 'adgroup', 'creative', 'network',                             // F10 mapped (internal)
   'af_sub1', 'af_sub2',                                                     // Backlog #17 agency / sub-affiliate
+  'smart_link_slug',                                                        // Group 4 — smart link that generated this click
 ];
 const clickColsNow = db.prepare('PRAGMA table_info(clicks)').all().map(c => c.name);
 for (const col of CLICK_EXTRA_COLS) {
@@ -544,6 +545,63 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_mktapp_status ON marketplace_applications(status);
   CREATE INDEX IF NOT EXISTS idx_mktapp_pub    ON marketplace_applications(publisher_id);
+`);
+
+// ---------------------------------------------------------------------------
+// Group 4 — Smart Links (named multi-rule routing links).
+// NOTE: table is `smartlink_rules` (not `smart_link_rules`, which already exists for
+// the F5 per-publisher /go routing) so the two features coexist.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS smart_links (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug       TEXT UNIQUE NOT NULL,
+    name       TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS smartlink_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    smart_link_id   INTEGER NOT NULL REFERENCES smart_links(id) ON DELETE CASCADE,
+    priority        INTEGER NOT NULL DEFAULT 0,
+    geo             TEXT,        -- comma-separated country codes (e.g. "VN,SG"); NULL = any
+    device_type     TEXT,       -- mobile / desktop / tablet; NULL = any
+    os              TEXT,        -- android / ios / windows; NULL = any
+    advertiser_slug TEXT NOT NULL REFERENCES advertisers(slug),
+    publisher       TEXT,        -- override publisher; NULL = use ?pub= from the query
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_slrules_link ON smartlink_rules(smart_link_id, priority);
+`);
+
+// ---------------------------------------------------------------------------
+// Group 4 — Marketplace listings + applications.
+// NOTE: applications table is `marketplace_apps` (not `marketplace_applications`,
+// which already exists for the F6 marketplace) so the two features coexist.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS marketplace_listings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL REFERENCES advertisers(slug),
+    title           TEXT NOT NULL,
+    description     TEXT,
+    payout_display  TEXT,        -- e.g. "3.5% CPS" or "150,000 VND per account"
+    category        TEXT,        -- fintech / ecom / finance ...
+    geo             TEXT,        -- target GEO e.g. "VN"
+    status          TEXT NOT NULL DEFAULT 'active',  -- active / paused
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS marketplace_apps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id  INTEGER NOT NULL REFERENCES marketplace_listings(id) ON DELETE CASCADE,
+    publisher   TEXT NOT NULL REFERENCES publishers(username),
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected
+    note        TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    UNIQUE(listing_id, publisher)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mktlist_status ON marketplace_listings(status);
+  CREATE INDEX IF NOT EXISTS idx_mktapps_listing ON marketplace_apps(listing_id);
+  CREATE INDEX IF NOT EXISTS idx_mktapps_pub     ON marketplace_apps(publisher);
 `);
 
 // ---------------------------------------------------------------------------

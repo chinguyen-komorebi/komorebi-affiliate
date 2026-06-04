@@ -279,7 +279,7 @@ async function postback(slug, qs) {
   // p2 logs in and applies (p2 not assigned to adv-pct)
   const p2jar = makeJar();
   await p2jar.req('POST', '/publisher/login', { form: { username: 'p2', password: 'p2password' } });
-  await p2jar.req('POST', '/marketplace/apply', { form: { advertiser_id: advs.pct.id } });
+  await p2jar.req('POST', '/marketplace/apply', { form: { advertiser_id: advs.pct.id, _csrf: await csrf(p2jar, '/marketplace') } });
   ok('F6 apply creates pending application', db.prepare("SELECT COUNT(*) n FROM marketplace_applications WHERE publisher_id=? AND status='pending'").get(p2).n === 1);
   const mpPending = await text(await p2jar.req('GET', '/marketplace'));
   ok('F6 shows Application pending', mpPending.includes('Application pending'));
