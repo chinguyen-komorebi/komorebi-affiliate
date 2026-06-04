@@ -174,6 +174,12 @@ let ADMIN_PASS_HASH = null;
   const storedHash = db.prepare("SELECT value FROM admin_settings WHERE key = 'admin_pass_hash'").get()?.value;
   if (storedHash) {
     ADMIN_PASS_HASH = storedHash;                       // DB wins — UI-changed password persists
+    // Warn if an ADMIN_PASS env is also set but no longer matches the stored hash — it's being
+    // ignored. Verify with checkPassword (not by re-hashing): hashPassword uses a random salt, so
+    // re-hashing the env password would never equal the stored hash even when the passwords match.
+    if (ADMIN_PASS && !checkPassword(ADMIN_PASS, storedHash)) {
+      console.warn('[WARN] ADMIN_PASS env var is being ignored — DB hash takes priority. To reset admin password via env, delete the admin_settings.admin_pass_hash row first.');
+    }
   } else if (ADMIN_PASS) {
     ADMIN_PASS_HASH = hashPassword(ADMIN_PASS);         // first boot — migrate env password into the DB
     db.prepare("INSERT OR REPLACE INTO admin_settings (key, value) VALUES ('admin_pass_hash', ?)").run(ADMIN_PASS_HASH);
