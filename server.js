@@ -166,7 +166,19 @@ if (process.env.NODE_ENV === 'production' && !ADMIN_PASS) {
 
 // M1 — hash the admin password once at startup; login compares in constant time
 // (timingSafeEqual via checkPassword), never a plaintext === comparison.
-let ADMIN_PASS_HASH = ADMIN_PASS ? hashPassword(ADMIN_PASS) : null; // rotated on admin password change
+// Persisted in the DB (admin_settings.admin_pass_hash) so a password changed via the
+// admin UI survives restarts instead of reverting to the ADMIN_PASS env var. The DB
+// value takes priority over env; the first boot migrates the env hash into the DB.
+let ADMIN_PASS_HASH = null;
+{
+  const storedHash = db.prepare("SELECT value FROM admin_settings WHERE key = 'admin_pass_hash'").get()?.value;
+  if (storedHash) {
+    ADMIN_PASS_HASH = storedHash;                       // DB wins — UI-changed password persists
+  } else if (ADMIN_PASS) {
+    ADMIN_PASS_HASH = hashPassword(ADMIN_PASS);         // first boot — migrate env password into the DB
+    db.prepare("INSERT OR REPLACE INTO admin_settings (key, value) VALUES ('admin_pass_hash', ?)").run(ADMIN_PASS_HASH);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // F20 — MMP (AppsFlyer) config + token encryption (AES-256-GCM)
@@ -3069,11 +3081,11 @@ app.post('/admin/settings/password', requireAdmin, (req, res) => {
   ADMIN_PASS_HASH        = hashPassword(new_password); // M1 — rotate the in-memory login hash
   process.env.ADMIN_PASS = new_password;
 
-  try {
-    updateEnvFile('ADMIN_PASS', new_password);
-  } catch (e) {
-    console.error('[settings] Failed to persist password to .env:', e.message);
-  }
+  // Persist the new hash to the DB so it survives restarts (DB is the source of truth
+  // on boot). This is what makes a UI password change permanent without an env update.
+  db.prepare("INSERT OR REPLACE INTO admin_settings (key, value) VALUES ('admin_pass_hash', ?)").run(ADMIN_PASS_HASH);
+  // Note: the new password is NOT written to .env — the DB hash is the source of truth on boot.
+  // Writing plaintext to .env would expose the live admin password to anyone who can read the file.
 
   logAudit('admin.password.changed', 'admin', ADMIN_USER, {}, req);
   res.redirect('/admin/settings?msg=Password+changed+successfully');
