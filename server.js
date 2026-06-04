@@ -1318,9 +1318,16 @@ app.get('/go/:publisher_slug', (req, res) => {
 function usdRate(cur) {
   if (!cur || cur === 'USD') return 1;
   const r = db.prepare("SELECT rate FROM exchange_rates WHERE base = ? AND target = 'USD'").get(cur);
-  return r ? r.rate : 1;
+  // Fail closed: an unknown currency must NOT default to 1:1 with USD (that would mis-state
+  // payout_usd by ~24,000x for VND, etc.). Return null so the value is left uncalculated.
+  if (!r) { console.warn(`[WARN] no USD exchange rate for currency "${cur}" — payout_usd left NULL`); return null; }
+  return r.rate;
 }
-function toUsd(amount, cur) { return amount == null ? null : +(amount * usdRate(cur)).toFixed(6); }
+function toUsd(amount, cur) {
+  if (amount == null) return null;
+  const rate = usdRate(cur);
+  return rate == null ? null : +(amount * rate).toFixed(6);
+}
 function knownCurrency(cur) { return cur === 'USD' || !!(cur && db.prepare('SELECT 1 FROM exchange_rates WHERE base = ?').get(cur)); }
 const CURRENCY_SYMBOL = { USD: '$', VND: '₫', SGD: 'S$', THB: '฿', EUR: '€', GBP: '£' };
 function fmtMoney(amount, cur) {
