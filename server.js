@@ -1014,6 +1014,18 @@ function computePayout(assignment, adv, goal, loanAmount, campaign = null) {
   return { amount: src.value > 0 ? src.value : 0, note: null };
 }
 
+// G7-3 — resolve the highest commission tier a publisher has reached for an
+// advertiser, by their approved-conversion count with that advertiser. Returns the
+// tier row (with payout_rate + currency) or null when no tier qualifies.
+function resolveTier(advertiserSlug, publisher) {
+  const approvedCount = db.prepare(
+    "SELECT COUNT(*) AS n FROM conversions WHERE publisher = ? AND advertiser_slug = ? AND status = 'approved'"
+  ).get(publisher, advertiserSlug).n;
+  return db.prepare(
+    'SELECT * FROM commission_tiers WHERE advertiser_slug = ? AND min_conversions <= ? ORDER BY min_conversions DESC LIMIT 1'
+  ).get(advertiserSlug, approvedCount) || null;
+}
+
 // Enforce an assignment's validity window and monthly cap at postback time.
 // Returns { reason, message } when the conversion must be blocked, else null.
 //   - valid_from / valid_until: inclusive UTC date window (YYYY-MM-DD)
@@ -1566,6 +1578,15 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const goal = matchGoal(adv.id, event);
   let { amount, note } = computePayout(assignment, adv, goal, loanAmount, campaign);
 
+  // G7-3 — commission tiers replace the advertiser's flat default payout for this
+  // publisher (only when the payout came from that default — assignment overrides,
+  // campaign payouts and conversion goals still take precedence).
+  let tierCurrency = null;
+  if (assignment.payout_override == null && !campaign && !goal) {
+    const tier = resolveTier(slug, pub);
+    if (tier) { amount = tier.payout_rate; tierCurrency = tier.currency; note = note || 'commission_tier'; }
+  }
+
   // QA2 — currency for this conversion. Explicit ?currency= wins; otherwise a
   // percent-of-loan payout with a large loan_amount (>1000) is treated as VND.
   const payoutType = (assignment.payout_override == null)
@@ -1575,7 +1596,8 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     // Group 6 — a campaign's currency wins for campaign-attributed conversions.
     // Group 5 #1 — else the advertiser's configured currency; fall back to the
     // legacy VND-for-large-percent-loan heuristic only when no known currency applies.
-    currency = (campaign && knownCurrency(campaign.currency)) ? campaign.currency
+    currency = (tierCurrency && knownCurrency(tierCurrency)) ? tierCurrency
+             : (campaign && knownCurrency(campaign.currency)) ? campaign.currency
              : (adv.currency && knownCurrency(adv.currency)) ? adv.currency
              : (payoutType === 'percent' && loanAmount != null && loanAmount > 1000) ? 'VND' : 'USD';
   }
@@ -2494,6 +2516,15 @@ app.post('/admin/conversions/:id/status', requireAdmin, (req, res) => {
     .run(next, next === conv.status ? conv.reason : `manual_override_from_${conv.status}`, conv.id);
   logAudit('conversion.status_override', 'conversion', conv.id,
     { from: conv.status, to: next, click_id: conv.click_id, advertiser: conv.advertiser_slug }, req);
+  // G7-4 — notify the publisher when a conversion is newly approved.
+  if (next === 'approved' && conv.status !== 'approved' && notifyEnabled('notify_conversion_approved')) {
+    const adv = db.prepare('SELECT name FROM advertisers WHERE slug = ?').get(conv.advertiser_slug);
+    sendPublisherEmail(conv.publisher,
+      '[Komorebi] A conversion was approved',
+      `Good news — a conversion has been approved.\n\nAdvertiser: ${adv?.name || conv.advertiser_slug}\nClick ID: ${conv.click_id}\nPayout: $${$(conv.payout)}\n`,
+      `<div style="font-family:sans-serif"><h2>Conversion approved</h2><p>Advertiser: <strong>${H(adv?.name || conv.advertiser_slug)}</strong><br>Click ID: <code>${H(conv.click_id)}</code><br>Payout: <strong>$${$(conv.payout)}</strong></p></div>`,
+      'conversion_approved');
+  }
   res.redirect('/admin?msg=Conversion+status+updated');
 });
 
@@ -3258,6 +3289,15 @@ app.post('/admin/invoices/:id/status', requireAdmin, (req, res) => {
 
   db.prepare("UPDATE invoices SET status = ?, updated_at = datetime('now') WHERE id = ?").run(next, inv.id);
   logAudit('invoice.status_changed', 'invoice', inv.id, { from: inv.status, to: next, publisher: inv.publisher_name }, req);
+  // G7-4 — notify the publisher when an invoice is published (status → sent).
+  if (next === 'sent' && inv.status !== 'sent' && notifyEnabled('notify_invoice_ready')) {
+    const p = db.prepare('SELECT username FROM publishers WHERE id = ?').get(inv.publisher_id);
+    if (p) sendPublisherEmail(p.username,
+      '[Komorebi] Your invoice is ready',
+      `Your invoice for ${inv.year}-${String(inv.month).padStart(2, '0')} is ready. Total: $${$(inv.total_amount)}.`,
+      `<div style="font-family:sans-serif"><h2>Invoice ready</h2><p>Your invoice for <strong>${inv.year}-${String(inv.month).padStart(2, '0')}</strong> is ready.<br>Total: <strong>$${$(inv.total_amount)}</strong></p></div>`,
+      'invoice_ready');
+  }
   res.redirect(`/admin/publishers/${inv.publisher_id}/invoice/${inv.year}/${inv.month}?msg=Status+updated+to+${next}`);
 });
 
@@ -3280,9 +3320,20 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   setSetting('daily_summary',         summaryOn    ? 'true' : 'false');
   setSetting('webhook_notifications', webhookOn    ? 'true' : 'false');
   setSetting('webhook_daily_summary', webhookSumOn ? 'true' : 'false');
+  // G7-4 / G7-6 — publisher notification + weekly report toggles.
+  const convApprovedOn = req.body.notify_conversion_approved  === 'on';
+  const mktApprovedOn  = req.body.notify_marketplace_approved === 'on';
+  const invoiceOn      = req.body.notify_invoice_ready        === 'on';
+  const weeklyOn       = req.body.weekly_report               === 'on';
+  setSetting('notify_conversion_approved',  convApprovedOn ? 'true' : 'false');
+  setSetting('notify_marketplace_approved', mktApprovedOn  ? 'true' : 'false');
+  setSetting('notify_invoice_ready',        invoiceOn      ? 'true' : 'false');
+  setSetting('weekly_report',               weeklyOn       ? 'true' : 'false');
   logAudit('settings.changed', 'settings', null,
     { email_notifications: emailOn, daily_summary: summaryOn,
-      webhook_notifications: webhookOn, webhook_daily_summary: webhookSumOn }, req);
+      webhook_notifications: webhookOn, webhook_daily_summary: webhookSumOn,
+      notify_conversion_approved: convApprovedOn, notify_marketplace_approved: mktApprovedOn,
+      notify_invoice_ready: invoiceOn, weekly_report: weeklyOn }, req);
   res.redirect('/admin/settings?msg=Settings+saved');
 });
 
@@ -4034,6 +4085,14 @@ app.post('/admin/marketplace-listings/:id/applications/:appId/approve', requireA
   if (pub && adv) db.prepare('INSERT OR IGNORE INTO publisher_advertisers (publisher_id, advertiser_id) VALUES (?, ?)').run(pub.id, adv.id);
   db.prepare("UPDATE marketplace_apps SET status='approved', note=NULL WHERE id=?").run(app.id);
   logAudit('marketplace.app_approved', 'application', app.id, { publisher: app.publisher, advertiser: listing.advertiser_slug }, req);
+  // G7-4 — notify the publisher their marketplace application was approved.
+  if (notifyEnabled('notify_marketplace_approved')) {
+    sendPublisherEmail(app.publisher,
+      '[Komorebi] Your marketplace application was approved',
+      `Your application to run "${listing.title}" has been approved. You can now start sending traffic.`,
+      `<div style="font-family:sans-serif"><h2>Application approved</h2><p>Your application to run <strong>${H(listing.title)}</strong> has been approved. You can now start sending traffic.</p></div>`,
+      'marketplace_approved');
+  }
   res.redirect(`/admin/marketplace-listings/${listing.id}/applications?msg=Approved+%E2%80%94+access+granted`);
 });
 
@@ -5023,7 +5082,9 @@ function adminSidebar() {
   ${nav('/admin/advertisers', 'Advertisers', 'advertisers', '/admin/advertisers')}
   ${nav('/admin/publishers',  'Publishers',  'publishers',  '/admin/publishers')}
   ${nav('/admin/invoices',    'Invoices',    'invoices',    '/admin/invoices')}
-  ${nav('/admin/marketplace-listings', 'Marketplace', 'market', '/admin/marketplace-listings')}
+  ${nav('/admin/marketplace-listings', 'Marketplace Listings', 'market', '/admin/marketplace-listings')}
+  ${nav('/admin/marketplace',          'Marketplace Apps',     'market', '/admin/marketplace')}
+  ${nav('/admin/advertiser-applications', 'Advertiser Applications', 'advertisers', '/admin/advertiser-applications')}
   <div class="adm-sb-group">REPORTS</div>
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
@@ -5209,6 +5270,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -5479,6 +5541,7 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -6487,6 +6550,10 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
   const summaryOn    = getSetting('daily_summary')         === 'true';
   const webhookOn    = getSetting('webhook_notifications') === 'true';
   const webhookSumOn = getSetting('webhook_daily_summary') === 'true';
+  const notifConvOn  = getSetting('notify_conversion_approved')  === 'true';
+  const notifMktOn   = getSetting('notify_marketplace_approved') === 'true';
+  const notifInvOn   = getSetting('notify_invoice_ready')        === 'true';
+  const weeklyOn     = getSetting('weekly_report')              === 'true';
   const gmailOk      = !!(GMAIL_USER && GMAIL_PASS);
   const tgOk         = telegramOk();
   const slOk         = slackOk();
@@ -6581,6 +6648,18 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
         ${toggle('webhook_daily_summary', webhookSumOn,
           'Daily summary webhook',
           'Send daily totals at 8:00 AM Singapore time via Telegram/Slack')}
+        ${toggle('notify_conversion_approved', notifConvOn,
+          'Publisher: conversion approved',
+          'Email the publisher when one of their conversions is approved')}
+        ${toggle('notify_marketplace_approved', notifMktOn,
+          'Publisher: marketplace application approved',
+          'Email the publisher when their marketplace application is approved')}
+        ${toggle('notify_invoice_ready', notifInvOn,
+          'Publisher: invoice ready',
+          'Email the publisher when their invoice is published')}
+        ${toggle('weekly_report', weeklyOn,
+          'Weekly reports',
+          'Send each active publisher a 7-day summary every Monday 08:00 SGT, plus a platform summary to admin')}
         <div style="padding:16px 0">
           <button type="submit" class="btn btn-primary btn-lg">Save Settings</button>
           <span style="font-size:12px;color:#6e6e73;margin-left:12px">Toggles auto-save — clicking a toggle saves immediately</span>
@@ -7718,17 +7797,19 @@ function renderPubConversions({ pub, conversions }) {
   const showRevenue = conversions.some(c => c.revenue != null);
   const showSub     = conversions.some(c => c.af_sub1 != null);  // Backlog #17 — sub-affiliate column
   const fmtNum = v => v != null ? Number(v).toLocaleString('en-US') : '—';
+  // G7-2 — STATUS column moved ahead of CLICK ID (most-scanned status visible without
+  // horizontal scroll on mobile).
   const rows = conversions.map(r => `<tr>
     <td style="white-space:nowrap;font-size:11px">${H(r.received_at.slice(0,10))}</td>
     <td>${H(r.adv_name||r.advertiser_slug)}</td>
+    <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
+        ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
     <td><code class="xs">${H(r.click_id)}</code></td>
     <td><span class="badge">${H(r.event)}</span></td>
     ${showSub     ? `<td>${r.af_sub1 ? `<code class="xs">${H(r.af_sub1)}</code>` : ''}</td>` : ''}
     ${showLoan    ? `<td>${fmtNum(r.loan_amount)}</td>` : ''}
     ${showRevenue ? `<td>${fmtNum(r.revenue)}</td>` : ''}
     <td>${fmtMoney(r.payout_local != null ? r.payout_local : r.payout, r.currency)}</td>
-    <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
-        ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
     <td><small style="color:#6e6e73">${H(r.attribution_model || 'last_click')}</small></td>
   </tr>`).join('');
 
@@ -7737,10 +7818,38 @@ function renderPubConversions({ pub, conversions }) {
   <div class="sh"><h2>Conversion History</h2><span class="meta">${N(conversions.length)} conversions (last 500)</span></div>
   ${rows.length===0
     ? '<div class="empty">No conversions recorded yet.</div>'
-    : `<table><thead><tr><th>Date</th><th>Advertiser</th><th>Click ID</th><th>Event</th>${showSub?'<th>Sub-Aff</th>':''}${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Status</th><th>Attribution</th></tr></thead>
-        <tbody>${rows}</tbody></table>`}
+    : `<div class="table-scroll-wrap">
+        <table><thead><tr><th>Date</th><th>Advertiser</th><th>Status</th><th>Click ID</th><th>Event</th>${showSub?'<th>Sub-Aff</th>':''}${showLoan?'<th>Loan Amount</th>':''}${showRevenue?'<th>Revenue</th>':''}<th>Payout</th><th>Attribution</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div>
+      <p class="scroll-hint">scroll to see more →</p>`}
 </section>
-</main>`;
+</main>
+<style>
+  /* G7-2 — horizontal scroll affordance for the conversions table on narrow screens */
+  .table-scroll-wrap{overflow-x:auto;position:relative;-webkit-overflow-scrolling:touch}
+  .table-scroll-wrap::after{content:"";position:absolute;top:0;right:0;width:36px;height:100%;
+    pointer-events:none;background:linear-gradient(to right,rgba(255,255,255,0),rgba(255,255,255,.9));
+    opacity:1;transition:opacity .2s}
+  .table-scroll-wrap.scrolled-end::after{opacity:0}
+  .scroll-hint{display:none;text-align:right;font-size:12px;color:#6e6e73;margin:6px 2px 0}
+  @media (max-width:768px){ .scroll-hint{display:block} }
+  .scroll-hint.hide{display:none}
+</style>
+<script>
+  (function(){
+    var wrap = document.querySelector('.table-scroll-wrap');
+    var hint = document.querySelector('.scroll-hint');
+    if(!wrap) return;
+    function atEnd(){ return wrap.scrollLeft + wrap.clientWidth >= wrap.scrollWidth - 2; }
+    function paint(){ wrap.classList.toggle('scrolled-end', wrap.scrollWidth <= wrap.clientWidth || atEnd()); }
+    paint();
+    window.addEventListener('resize', paint);
+    wrap.addEventListener('scroll', paint);
+    // Hide the "scroll to see more" hint after the first horizontal scroll.
+    wrap.addEventListener('scroll', function(){ if(hint) hint.classList.add('hide'); }, { once: true });
+  })();
+</script>`;
   return pubLayout(`${pub.username} — Conversions`, body, pub, 'conversions');
 }
 
@@ -8881,6 +8990,265 @@ sections.forEach(s => observer.observe(s));
 
 </body>
 </html>`;
+}
+
+// ===========================================================================
+// Group 7 — commission tiers UI · publisher notifications · advertiser
+// self-onboarding · scheduled weekly reports
+// ===========================================================================
+
+// G7-4 — send an email to a publisher (looked up by username) and record the
+// dispatch in the notification outbox. The per-type toggle is checked by the
+// caller; this helper performs the lookup, the best-effort send, and the log.
+function sendPublisherEmail(publisherUsername, subject, text, html, type = 'general') {
+  const pub = db.prepare('SELECT email FROM publishers WHERE username = ?').get(publisherUsername);
+  const email = (pub && pub.email) ? String(pub.email).trim() : '';
+  let sent = 0;
+  if (transporter && email) {
+    transporter.sendMail({ from: `"Komorebi Tracker" <${GMAIL_USER}>`, to: email, subject, text, html })
+      .catch(e => console.error('Publisher email error:', e.message));
+    sent = 1;
+  }
+  db.prepare('INSERT INTO publisher_notifications (publisher, email, type, subject, sent) VALUES (?, ?, ?, ?, ?)')
+    .run(publisherUsername, email, type, subject, sent);
+  return { email, sent };
+}
+function notifyEnabled(key) { return getSetting(key, 'true') === 'true'; }
+
+// ---- G7-3 commission tiers — admin CRUD ----------------------------------
+app.get('/admin/advertisers/:slug/tiers', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const tiers = db.prepare('SELECT * FROM commission_tiers WHERE advertiser_slug = ? ORDER BY min_conversions').all(adv.slug);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderTiers({ adv, tiers, csrfToken: req.session.csrfToken, flash, error }));
+});
+app.post('/admin/advertisers/:slug/tiers', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const minConv  = parseInt(req.body.min_conversions, 10);
+  const rate     = parseFloat(req.body.payout_rate);
+  const currency = ((req.body.currency || 'USD').trim().toUpperCase().slice(0, 8)) || 'USD';
+  if (!Number.isInteger(minConv) || minConv < 0 || isNaN(rate) || rate < 0) {
+    return res.redirect(`/admin/advertisers/${adv.slug}/tiers?msg=Valid+min+conversions+and+payout+rate+are+required&ok=0`);
+  }
+  db.prepare('INSERT INTO commission_tiers (advertiser_slug, min_conversions, payout_rate, currency) VALUES (?, ?, ?, ?)')
+    .run(adv.slug, minConv, rate, currency);
+  logAudit('tier.created', 'advertiser', adv.slug, { min_conversions: minConv, payout_rate: rate, currency }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/tiers?msg=Tier+added`);
+});
+app.post('/admin/advertisers/:slug/tiers/:id/delete', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  db.prepare('DELETE FROM commission_tiers WHERE id = ? AND advertiser_slug = ?').run(req.params.id, adv.slug);
+  logAudit('tier.deleted', 'advertiser', adv.slug, { tier_id: req.params.id }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/tiers?msg=Tier+deleted`);
+});
+
+// ---- G7-5 advertiser self-onboarding -------------------------------------
+app.get('/advertiser/apply', (req, res) => {
+  res.send(renderAdvertiserApply({ submitted: req.query.submitted === '1' }));
+});
+app.post('/advertiser/apply', (req, res) => {
+  const name    = (req.body.name || '').trim();
+  const email   = (req.body.email || '').trim();
+  const website = (req.body.website || '').trim();
+  const notes   = (req.body.notes || '').trim();
+  if (!name || !email) {
+    return res.send(renderAdvertiserApply({ error: 'Name and email are required.', values: { name, email, website, notes } }));
+  }
+  db.prepare('INSERT INTO advertiser_applications (name, email, website, notes) VALUES (?, ?, ?, ?)')
+    .run(name, email, website, notes);
+  res.redirect('/advertiser/apply?submitted=1');
+});
+app.get('/admin/advertiser-applications', requireAdmin, (req, res) => {
+  const filter = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : 'all';
+  const apps = filter === 'all'
+    ? db.prepare('SELECT * FROM advertiser_applications ORDER BY datetime(created_at) DESC, id DESC').all()
+    : db.prepare('SELECT * FROM advertiser_applications WHERE status = ? ORDER BY datetime(created_at) DESC, id DESC').all(filter);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderAdvertiserApplications({ apps, filter, csrfToken: req.session.csrfToken, flash, error }));
+});
+app.post('/admin/advertiser-applications/:id/approve', requireAdmin, (req, res) => {
+  const a = db.prepare('SELECT * FROM advertiser_applications WHERE id = ?').get(req.params.id);
+  if (!a) return res.redirect('/admin/advertiser-applications?msg=Application+not+found&ok=0');
+  db.prepare("UPDATE advertiser_applications SET status = 'approved' WHERE id = ?").run(a.id);
+  // Auto-create the advertiser: slug from name, email stored as the description.
+  let slug = slugify(a.name) || ('advertiser-' + a.id);
+  if (db.prepare('SELECT 1 FROM advertisers WHERE slug = ?').get(slug)) slug = `${slug}-${a.id}`;
+  try {
+    db.prepare("INSERT INTO advertisers (slug, name, offer_url, description, status) VALUES (?, ?, '', ?, 'active')")
+      .run(slug, a.name, a.email);
+  } catch (e) { console.error('Advertiser auto-create error:', e.message); }
+  logAudit('advertiser_application.approved', 'application', a.id, { name: a.name, slug }, req);
+  res.redirect('/admin/advertiser-applications?msg=Approved+%E2%80%94+advertiser+created');
+});
+app.post('/admin/advertiser-applications/:id/reject', requireAdmin, (req, res) => {
+  const a = db.prepare('SELECT * FROM advertiser_applications WHERE id = ?').get(req.params.id);
+  if (!a) return res.redirect('/admin/advertiser-applications?msg=Application+not+found&ok=0');
+  db.prepare("UPDATE advertiser_applications SET status = 'rejected' WHERE id = ?").run(a.id);
+  logAudit('advertiser_application.rejected', 'application', a.id, { name: a.name }, req);
+  res.redirect('/admin/advertiser-applications?msg=Application+rejected');
+});
+
+// ---- G7-6 weekly reports -------------------------------------------------
+// Per-publisher 7-day summary (clicks, conversions, approved earnings, pending
+// payout) + a platform summary to the admin. SGT (UTC+8) day window.
+async function sendWeeklyReports() {
+  const pubs = db.prepare("SELECT username, email FROM publishers WHERE status = 'active'").all();
+  let publisherEmails = 0;
+  for (const p of pubs) {
+    const clicks = db.prepare(
+      "SELECT COUNT(*) AS n FROM clicks WHERE publisher = ? AND datetime(created_at, '+8 hours') >= datetime('now', '+8 hours', '-7 days')"
+    ).get(p.username).n;
+    const cv = db.prepare(`
+      SELECT COUNT(*) AS conversions,
+             COALESCE(SUM(CASE WHEN status='approved' THEN COALESCE(payout_usd, payout) ELSE 0 END), 0) AS earnings,
+             COALESCE(SUM(CASE WHEN status='pending'  THEN COALESCE(payout_usd, payout) ELSE 0 END), 0) AS pending
+      FROM conversions
+      WHERE publisher = ? AND datetime(received_at, '+8 hours') >= datetime('now', '+8 hours', '-7 days')
+    `).get(p.username);
+    if (clicks === 0 && cv.conversions === 0) continue; // only publishers with activity
+    const rows = [
+      ['Clicks', N(clicks)],
+      ['Conversions', N(cv.conversions)],
+      ['Approved earnings', `$${$(cv.earnings)}`],
+      ['Pending payout', `$${$(cv.pending)}`],
+    ];
+    const text = `Your Komorebi weekly report (last 7 days)\n\n` + rows.map(([k, v]) => `${k}: ${v}`).join('\n');
+    const html = `<div style="font-family:sans-serif;max-width:520px">
+      <h2 style="margin-bottom:4px">Your weekly report</h2>
+      <p style="color:#6e6e73;font-size:13px">Komorebi Affiliate Network — last 7 days</p>
+      <table style="border-collapse:collapse;width:100%">${rows.map(([k, v]) => `<tr>
+        <td style="padding:8px 12px;background:#f5f5f7;font-weight:600;font-size:13px;width:160px">${k}</td>
+        <td style="padding:8px 12px;font-size:13px;border-bottom:1px solid #f0f0f0">${v}</td></tr>`).join('')}</table></div>`;
+    sendPublisherEmail(p.username, '[Komorebi] Your weekly report', text, html, 'weekly_report');
+    publisherEmails++;
+  }
+  // Platform summary to the admin.
+  const tot = db.prepare(`
+    SELECT (SELECT COUNT(*) FROM clicks WHERE datetime(created_at,'+8 hours') >= datetime('now','+8 hours','-7 days')) AS clicks,
+           (SELECT COUNT(*) FROM conversions WHERE datetime(received_at,'+8 hours') >= datetime('now','+8 hours','-7 days')) AS conversions,
+           (SELECT COALESCE(SUM(COALESCE(payout_usd,payout)),0) FROM conversions WHERE status='approved' AND datetime(received_at,'+8 hours') >= datetime('now','+8 hours','-7 days')) AS earnings
+  `).get();
+  await sendMail({
+    subject: '[Komorebi] Weekly platform summary',
+    text: `Komorebi weekly platform summary (last 7 days)\n\nClicks: ${N(tot.clicks)}\nConversions: ${N(tot.conversions)}\nApproved earnings: $${$(tot.earnings)}\nPublisher reports sent: ${publisherEmails}\n`,
+    html: `<div style="font-family:sans-serif;max-width:520px"><h2>Weekly platform summary</h2>
+      <p style="color:#6e6e73;font-size:13px">Last 7 days</p>
+      <ul style="font-size:14px"><li>Clicks: ${N(tot.clicks)}</li><li>Conversions: ${N(tot.conversions)}</li>
+      <li>Approved earnings: $${$(tot.earnings)}</li><li>Publisher reports sent: ${publisherEmails}</li></ul></div>`,
+  });
+  return { publisherEmails, platform: tot };
+}
+
+// Admin "run now" trigger (also makes the report observable for tests).
+app.post('/admin/reports/weekly/run', requireAdmin, (req, res) => {
+  sendWeeklyReports().catch(e => console.error('Weekly report (manual) error:', e.message));
+  res.redirect('/admin/settings?msg=Weekly+report+triggered');
+});
+
+// G7-6 — Monday 01:00 UTC (08:00 SGT). Gated by the weekly_report toggle.
+cron.schedule('0 1 * * 1', () => {
+  if (getSetting('weekly_report', 'true') !== 'true') return;
+  sendWeeklyReports().catch(e => console.error('Weekly report error:', e.message));
+}, { timezone: 'UTC' });
+
+// ---- G7-3 / G7-5 render helpers ------------------------------------------
+function renderTiers({ adv, tiers, csrfToken, flash, error }) {
+  const rows = tiers.map(t => `<tr>
+    <td>${N(t.min_conversions)}+</td>
+    <td>${fmtCur(t.payout_rate, t.currency)}</td>
+    <td>${H(t.currency)}</td>
+    <td><form method="POST" action="/admin/advertisers/${H(adv.slug)}/tiers/${t.id}/delete" style="display:inline" data-confirm="Delete this tier?">${csrfField(csrfToken)}
+      <button class="btn btn-danger">Delete</button></form></td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}
+<main>
+<div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
+${flashHtml(flash ? { type: 'success', text: flash } : (error ? { type: 'error', text: error } : null))}
+<section>
+  <div class="sh"><h2>Commission Tiers — ${H(adv.name)}</h2><span class="meta">${tiers.length} tier(s)</span></div>
+  <p style="font-size:13px;color:#6e6e73;margin:0 0 12px">A publisher's payout uses the highest tier whose <strong>min conversions</strong> ≤ their approved conversions with this advertiser. Default payout: ${fmtCur(adv.payout_amount, adv.currency || 'USD')}.</p>
+  ${tiers.length === 0 ? '<div class="empty">No tiers yet — the advertiser default payout applies to everyone.</div>' : `<table>
+    <thead><tr><th>Min approved conversions</th><th>Payout rate</th><th>Currency</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`}
+</section>
+<section>
+  <div class="sh"><h2>Add Tier</h2></div>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/tiers" style="display:grid;grid-template-columns:1fr 1fr .8fr auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px">${csrfField(csrfToken)}
+    <label>Min conversions<input name="min_conversions" type="number" min="0" required placeholder="10"></label>
+    <label>Payout rate<input name="payout_rate" type="number" step="0.01" min="0" required placeholder="7.50"></label>
+    <label>Currency<input name="currency" value="USD" maxlength="8"></label>
+    <button class="btn btn-primary">Add Tier</button>
+  </form>
+</section>
+</main>`;
+  return adminLayout(`Tiers — ${adv.name}`, body);
+}
+
+function renderAdvertiserApplications({ apps, filter, csrfToken, flash, error }) {
+  const tab = (key, label) => `<a href="/admin/advertiser-applications${key === 'all' ? '' : `?status=${key}`}" class="btn ${filter === key ? 'btn-primary' : 'btn-ghost'}">${label}</a>`;
+  const rows = apps.map(a => `<tr>
+    <td><strong>${H(a.name)}</strong></td>
+    <td>${H(a.email)}</td>
+    <td>${a.website ? `<a href="${H(a.website)}" target="_blank" rel="noopener noreferrer" style="color:#0071e3">${H(a.website.slice(0, 40))}</a>` : '<span style="color:#9ca3af">—</span>'}</td>
+    <td style="max-width:220px;font-size:12px;color:#6e6e73">${H((a.notes || '').slice(0, 120))}</td>
+    <td><span class="badge ${a.status === 'approved' ? 'active' : a.status === 'rejected' ? 'rejected' : 'pending'}">${H(a.status)}</span></td>
+    <td><small style="color:#86868b">${H((a.created_at || '').slice(0, 16))}</small></td>
+    <td><div class="act">${a.status === 'pending' ? `
+      <form method="POST" action="/admin/advertiser-applications/${a.id}/approve" style="display:inline">${csrfField(csrfToken)}<button class="btn btn-primary">Approve</button></form>
+      <form method="POST" action="/admin/advertiser-applications/${a.id}/reject" style="display:inline" data-confirm="Reject ${H(a.name)}?">${csrfField(csrfToken)}<button class="btn btn-danger">Reject</button></form>
+    ` : '<span style="color:#9ca3af;font-size:12px">decided</span>'}</div></td>
+  </tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+${flashHtml(flash ? { type: 'success', text: flash } : (error ? { type: 'error', text: error } : null))}
+<section>
+  <div class="sh"><h2>Advertiser Applications</h2><span class="meta">${apps.length} shown</span></div>
+  <div style="display:flex;gap:6px;margin-bottom:14px">${tab('all', 'All')}${tab('pending', 'Pending')}${tab('approved', 'Approved')}${tab('rejected', 'Rejected')}</div>
+  ${apps.length === 0 ? '<div class="empty">No applications.</div>' : `<table>
+    <thead><tr><th>Name</th><th>Email</th><th>Website</th><th>Notes</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Advertiser Applications', body);
+}
+
+function renderAdvertiserApply({ submitted = false, error = null, values = {} } = {}) {
+  const v = (k) => H(values[k] || '');
+  const inner = submitted
+    ? `<div style="text-align:center;padding:20px 0">
+         <div style="font-size:40px">✓</div>
+         <h2 style="margin:8px 0">Application received</h2>
+         <p style="color:#6e6e73;font-size:14px">Thanks — the Komorebi team will review your application and be in touch by email.</p>
+         <a href="/advertiser/apply" style="color:#0071e3;font-size:13px">Submit another</a>
+       </div>`
+    : `<h2 style="margin:0 0 4px">Become a Komorebi advertiser</h2>
+       <p style="color:#6e6e73;font-size:14px;margin:0 0 18px">Tell us about your offer and we'll get you set up.</p>
+       ${error ? `<div style="background:#fdecea;color:#c62828;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:14px">${H(error)}</div>` : ''}
+       <form method="POST" action="/advertiser/apply">
+         <label class="fld">Company / advertiser name *<input name="name" value="${v('name')}" required></label>
+         <label class="fld">Email *<input name="email" type="email" value="${v('email')}" required></label>
+         <label class="fld">Website<input name="website" value="${v('website')}" placeholder="https://"></label>
+         <label class="fld">Notes<textarea name="notes" rows="4" placeholder="Vertical, GEOs, payout model, traffic requirements…">${v('notes')}</textarea></label>
+         <button type="submit" class="apply-btn">Submit application</button>
+       </form>`;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Advertiser Application — Komorebi</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box} body{font-family:Inter,system-ui,sans-serif;background:#0a3d2d;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+  .card{background:#fff;border-radius:14px;max-width:460px;width:100%;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+  .fld{display:block;font-size:13px;font-weight:600;color:#1d1d1f;margin-bottom:14px}
+  .fld input,.fld textarea{display:block;width:100%;margin-top:5px;padding:9px 11px;border:1px solid #d2d2d7;border-radius:8px;font-size:14px;font-family:inherit}
+  .apply-btn{width:100%;padding:11px;background:#00bfa5;color:#062a20;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;margin-top:4px}
+  .apply-btn:hover{background:#00a892}
+</style></head>
+<body><div class="card">${inner}</div></body></html>`;
 }
 
 // Daily summary — 8:00 AM Singapore time (UTC+8 = 00:00 UTC)
