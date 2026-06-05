@@ -685,6 +685,37 @@ db.exec(`
 // Default attribution model (admin-settable). Stored in the existing settings table.
 db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('default_attribution_model', 'last_click');
 
+// ===========================================================================
+// Group 6 — Operational & Campaign Management
+//   #1 multi-campaign per advertiser  ·  #3 per-campaign monthly conversion cap
+// One advertiser can host many campaigns (offers), each with its own offer URL,
+// payout, currency, event token and monthly cap. Clicks and conversions carry an
+// optional campaign_id so traffic and payouts can be attributed per campaign.
+// ===========================================================================
+db.exec(`
+  CREATE TABLE IF NOT EXISTS campaigns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL REFERENCES advertisers(slug),
+    name            TEXT NOT NULL,
+    offer_url       TEXT NOT NULL,
+    payout          REAL DEFAULT 0,
+    currency        TEXT DEFAULT 'USD',
+    event           TEXT DEFAULT 'sale',
+    cap_monthly     INTEGER,
+    status          TEXT DEFAULT 'active',
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_campaigns_adv ON campaigns(advertiser_slug, status);
+`);
+
+// Additive, guarded — campaign_id on clicks + conversions (NULL = no specific campaign).
+const clickColsG6 = db.prepare('PRAGMA table_info(clicks)').all().map(c => c.name);
+if (!clickColsG6.includes('campaign_id')) db.exec('ALTER TABLE clicks ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)');
+const convColsG6 = db.prepare('PRAGMA table_info(conversions)').all().map(c => c.name);
+if (!convColsG6.includes('campaign_id')) db.exec('ALTER TABLE conversions ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_clicks_campaign ON clicks(campaign_id)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_campaign   ON conversions(campaign_id)');
+
 // ---------------------------------------------------------------------------
 // MMP sync log (F20) — one row per manual AppsFlyer sync run
 // ---------------------------------------------------------------------------

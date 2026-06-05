@@ -119,6 +119,7 @@ app.use((req, res, next) => {
 });
 
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
+app.use(express.json({ limit: '20kb' })); // Group 6 — JSON bodies for bulk conversion actions
 
 // F19(F) — input hardening on POST bodies: strip null bytes, reject oversized fields.
 app.use((req, res, next) => {
@@ -993,9 +994,14 @@ function mapEvent(advertiserId, event) {
 //   3. advertiser default      — fixed dollars, or percent of loan_amount
 // Percentage with a missing/zero loan_amount yields 0 (note: 'missing_loan_amount');
 // it never falls back to a fixed default. Returns { amount, note }.
-function computePayout(assignment, adv, goal, loanAmount) {
+function computePayout(assignment, adv, goal, loanAmount, campaign = null) {
   if (assignment.payout_override != null) {
     return { amount: assignment.payout_override, note: null };
+  }
+  // Group 6 — a click attributed to a specific campaign uses that campaign's flat
+  // payout, ahead of goal/advertiser defaults.
+  if (campaign && campaign.payout != null && campaign.payout > 0) {
+    return { amount: campaign.payout, note: null };
   }
   const src = goal
     ? { type: goal.payout_type, value: goal.payout }
@@ -1142,7 +1148,7 @@ function parseUA(ua = '') {
 // Returns { clickId, device, country }.
 // ---------------------------------------------------------------------------
 
-function recordClick(req, slug, pub, smartLinkSlug = null) {
+function recordClick(req, slug, pub, smartLinkSlug = null, campaignId = null) {
   const clickId = crypto.randomUUID();
   const clickIp = getIp(req);
   const clickUa = req.get('User-Agent') || '';
@@ -1170,12 +1176,12 @@ function recordClick(req, slug, pub, smartLinkSlug = null) {
     `INSERT INTO clicks (click_id, advertiser_slug, publisher, ip, user_agent, country, device_type, os, browser,
        sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
        af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-       campaign, adgroup, creative, network, af_sub1, af_sub2, smart_link_slug)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       campaign, adgroup, creative, network, af_sub1, af_sub2, smart_link_slug, campaign_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(clickId, slug, pub, clickIp, clickUa, country, device, os, browser,
     sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
     af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-    campaign, adgroup, creative, network, af_sub1, af_sub2, smartLinkSlug);
+    campaign, adgroup, creative, network, af_sub1, af_sub2, smartLinkSlug, campaignId);
 
   // Group 5 #4 — record an attribution touchpoint for this click. user_id (when the
   // tracking link carries one) is the journey key linking multiple clicks together.
@@ -1201,11 +1207,48 @@ app.get('/track/:slug', (req, res) => {
   if (!adv)                    return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
   if (adv.status !== 'active') return res.status(404).json({ error: `Advertiser ${slug} is paused` });
 
-  const { clickId } = recordClick(req, slug, pub);
+  // Group 6 — no campaign specified → use the advertiser's first active campaign
+  // (if any exist), otherwise fall back to the advertiser's default offer URL.
+  const campaign = db.prepare(
+    "SELECT * FROM campaigns WHERE advertiser_slug = ? AND status = 'active' ORDER BY id ASC LIMIT 1"
+  ).get(slug);
 
-  if (!adv.offer_url) return res.json({ click_id: clickId, advertiser: slug, publisher: pub });
+  const { clickId } = recordClick(req, slug, pub, null, campaign ? campaign.id : null);
 
-  const url = new URL(adv.offer_url);
+  const dest = (campaign && campaign.offer_url) ? campaign.offer_url : adv.offer_url;
+  if (!dest) return res.json({ click_id: clickId, advertiser: slug, publisher: pub, ...(campaign ? { campaign_id: campaign.id } : {}) });
+
+  const url = new URL(dest);
+  url.searchParams.set('click_id', clickId);
+  res.redirect(302, url.toString());
+});
+
+// ---------------------------------------------------------------------------
+// Group 6 — Tracking with a specific campaign  GET /track/:slug/:campaign_id?pub=X
+// Records the click against the named campaign and redirects to that campaign's
+// offer URL. A paused/unknown campaign is rejected.
+// ---------------------------------------------------------------------------
+app.get('/track/:slug/:campaign_id', (req, res) => {
+  const { slug, campaign_id } = req.params;
+  const { pub } = req.query;
+  if (!pub) return res.status(400).json({ error: 'Missing required param: pub' });
+  if (pub.length > 200) return res.status(400).json({ error: 'Invalid publisher' });
+  if (/[\x00-\x1f]/.test(pub)) return res.status(400).json({ error: 'Invalid publisher' });
+
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
+  if (!adv)                    return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
+  if (adv.status !== 'active') return res.status(404).json({ error: `Advertiser ${slug} is paused` });
+
+  const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND advertiser_slug = ?').get(campaign_id, slug);
+  if (!campaign)                    return res.status(404).json({ error: `Unknown campaign: ${campaign_id}` });
+  if (campaign.status !== 'active') return res.status(404).json({ error: `Campaign ${campaign_id} is ${campaign.status}` });
+
+  const { clickId } = recordClick(req, slug, pub, null, campaign.id);
+
+  const dest = campaign.offer_url || adv.offer_url;
+  if (!dest) return res.json({ click_id: clickId, advertiser: slug, publisher: pub, campaign_id: campaign.id });
+
+  const url = new URL(dest);
   url.searchParams.set('click_id', clickId);
   res.redirect(302, url.toString());
 });
@@ -1446,6 +1489,10 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
 
   const pub = click.publisher;
 
+  // Group 6 — campaign the click was attributed to (NULL = no specific campaign).
+  const campaign = click.campaign_id
+    ? db.prepare('SELECT * FROM campaigns WHERE id = ?').get(click.campaign_id) : null;
+
   // Backlog #7 — map advertiser SDK event name to Komorebi event before goal matching
   const event = mapEvent(adv.id, rawEvent);
 
@@ -1491,10 +1538,33 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     if (used >= Math.floor(cap * 0.8)) maybeAlertAdvertiserCap(adv, used, cap, 80);
   }
 
-  // Payout precedence: assignment override → matching conversion goal → advertiser default.
+  // Group 6 #3 — campaign-level monthly conversion cap + realtime auto-pause.
+  // A paused campaign rejects all postbacks (429). An active campaign whose monthly
+  // conversion count has reached its cap is auto-paused, alerted, and rejected (429).
+  if (campaign) {
+    if (campaign.status !== 'active') {
+      logPostback(req, { status: 'rejected', reason: 'campaign_cap_reached', advertiser: slug, campaign: campaign.name });
+      return res.status(429).json({ error: 'campaign_cap_reached' });
+    }
+    if (campaign.cap_monthly != null) {
+      const used = db.prepare(
+        "SELECT COUNT(*) AS n FROM conversions WHERE campaign_id = ? AND strftime('%Y-%m', received_at) = strftime('%Y-%m', 'now')"
+      ).get(campaign.id).n;
+      if (used >= campaign.cap_monthly) {
+        db.prepare("UPDATE campaigns SET status = 'paused' WHERE id = ?").run(campaign.id);
+        logAudit('campaign.auto_paused', 'campaign', campaign.id,
+          { reason: 'campaign_cap_reached', used, cap: campaign.cap_monthly, advertiser: slug }, req);
+        sendTelegram(`\u{1F6A8} Cap reached: ${campaign.name} (${adv.name}) — ${used}/${campaign.cap_monthly} conversions this month. Campaign auto-paused.`).catch(() => {});
+        logPostback(req, { status: 'rejected', reason: 'campaign_cap_reached', advertiser: slug, campaign: campaign.name, used, cap: campaign.cap_monthly });
+        return res.status(429).json({ error: 'campaign_cap_reached' });
+      }
+    }
+  }
+
+  // Payout precedence: assignment override → campaign payout → matching conversion goal → advertiser default.
   // Percent payouts use loan_amount; revenue is recorded for margin reporting.
   const goal = matchGoal(adv.id, event);
-  let { amount, note } = computePayout(assignment, adv, goal, loanAmount);
+  let { amount, note } = computePayout(assignment, adv, goal, loanAmount, campaign);
 
   // QA2 — currency for this conversion. Explicit ?currency= wins; otherwise a
   // percent-of-loan payout with a large loan_amount (>1000) is treated as VND.
@@ -1502,9 +1572,11 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     ? (goal ? goal.payout_type : adv.payout_type) : 'fixed';
   let currency = String(req.query.currency || '').trim().toUpperCase();
   if (!knownCurrency(currency)) {
-    // Group 5 #1 — default to the advertiser's configured currency; fall back to the
+    // Group 6 — a campaign's currency wins for campaign-attributed conversions.
+    // Group 5 #1 — else the advertiser's configured currency; fall back to the
     // legacy VND-for-large-percent-loan heuristic only when no known currency applies.
-    currency = (adv.currency && knownCurrency(adv.currency)) ? adv.currency
+    currency = (campaign && knownCurrency(campaign.currency)) ? campaign.currency
+             : (adv.currency && knownCurrency(adv.currency)) ? adv.currency
              : (payoutType === 'percent' && loanAmount != null && loanAmount > 1000) ? 'VND' : 'USD';
   }
 
@@ -1554,9 +1626,9 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   let result, conversionId;
   try {
     conversionId = db.prepare(
-      `INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, payout_local, payout_usd, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?)`
-    ).run(click_id, slug, pub, event, amount, payoutLocal, payoutUsd, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2).lastInsertRowid;
+      `INSERT INTO conversions (click_id, advertiser_slug, campaign_id, publisher, event, payout, payout_local, payout_usd, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?)`
+    ).run(click_id, slug, click.campaign_id || null, pub, event, amount, payoutLocal, payoutUsd, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2).lastInsertRowid;
     result = { status: duplicate ? 'duplicate' : 'ok', click_id, advertiser: slug, publisher: pub, event,
                payout: amount, payout_local: payoutLocal, payout_usd: payoutUsd, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId,
                ctit_seconds: ctitSeconds };
@@ -4096,6 +4168,449 @@ app.post('/admin/attribution/default', requireAdmin, (req, res) => {
   res.redirect('/admin/attribution?msg=Default+attribution+model+set+to+' + encodeURIComponent(m));
 });
 
+// ===========================================================================
+// Group 6 — Operational & Campaign Management
+//   #1 multi-campaign CRUD  #2 publisher↔campaign mapping  #4 bulk approve/reject
+//   #5 publisher tracking-link generator
+// ===========================================================================
+
+// Per-campaign helpers.
+function campaignCapUsed(campaignId) {
+  return db.prepare(
+    "SELECT COUNT(*) AS n FROM conversions WHERE campaign_id = ? AND strftime('%Y-%m', received_at) = strftime('%Y-%m', 'now')"
+  ).get(campaignId).n;
+}
+function campaignsWithStats(slug) {
+  const campaigns = db.prepare("SELECT * FROM campaigns WHERE advertiser_slug = ? AND status != 'deleted' ORDER BY id").all(slug);
+  return campaigns.map(c => {
+    const clicks = db.prepare('SELECT COUNT(*) AS n FROM clicks WHERE campaign_id = ?').get(c.id).n;
+    const conversions = db.prepare('SELECT COUNT(*) AS n FROM conversions WHERE campaign_id = ?').get(c.id).n;
+    return { ...c, clicks, conversions, cap_used: c.cap_monthly != null ? campaignCapUsed(c.id) : null };
+  });
+}
+function parseCampaignBody(b) {
+  const name      = (b.name || '').trim();
+  const offer_url = (b.offer_url || '').trim();
+  const payout    = parseFloat(b.payout) >= 0 ? parseFloat(b.payout) : 0;
+  const currency  = ((b.currency || 'USD').trim().toUpperCase().slice(0, 8)) || 'USD';
+  const event     = (b.event || 'sale').trim() || 'sale';
+  const cap = (b.cap_monthly !== '' && b.cap_monthly != null && parseInt(b.cap_monthly, 10) >= 0)
+    ? parseInt(b.cap_monthly, 10) : null;
+  const status = ['active', 'paused'].includes(b.status) ? b.status : 'active';
+  return { name, offer_url, payout, currency, event, cap, status };
+}
+
+// ---- Item 1 — multi-campaign per advertiser (CRUD) ------------------------
+app.get('/admin/advertisers/:slug/campaigns', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderCampaignList({ adv, campaigns: campaignsWithStats(adv.slug), csrfToken: req.session.csrfToken, flash, error }));
+});
+
+app.post('/admin/advertisers/:slug/campaigns', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const c = parseCampaignBody(req.body);
+  if (!c.name || !c.offer_url) {
+    return res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=Campaign+name+and+offer+URL+are+required&ok=0`);
+  }
+  const info = db.prepare(
+    'INSERT INTO campaigns (advertiser_slug, name, offer_url, payout, currency, event, cap_monthly, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(adv.slug, c.name, c.offer_url, c.payout, c.currency, c.event, c.cap, c.status);
+  logAudit('campaign.created', 'campaign', info.lastInsertRowid, { advertiser: adv.slug, name: c.name, payout: c.payout, cap_monthly: c.cap }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=${encodeURIComponent(`Campaign "${c.name}" created`)}`);
+});
+
+app.get('/admin/advertisers/:slug/campaigns/:id/edit', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND advertiser_slug = ?').get(req.params.id, adv.slug);
+  if (!campaign) return res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=Campaign+not+found&ok=0`);
+  res.send(renderCampaignForm({ adv, campaign, csrfToken: req.session.csrfToken }));
+});
+
+app.post('/admin/advertisers/:slug/campaigns/:id', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND advertiser_slug = ?').get(req.params.id, adv.slug);
+  if (!campaign) return res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=Campaign+not+found&ok=0`);
+  const c = parseCampaignBody(req.body);
+  if (!c.name || !c.offer_url) {
+    return res.redirect(`/admin/advertisers/${adv.slug}/campaigns/${campaign.id}/edit?msg=Campaign+name+and+offer+URL+are+required&ok=0`);
+  }
+  db.prepare('UPDATE campaigns SET name=?, offer_url=?, payout=?, currency=?, event=?, cap_monthly=?, status=? WHERE id=?')
+    .run(c.name, c.offer_url, c.payout, c.currency, c.event, c.cap, c.status, campaign.id);
+  logAudit('campaign.updated', 'campaign', campaign.id, { advertiser: adv.slug, name: c.name }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=${encodeURIComponent(`Campaign "${c.name}" updated`)}`);
+});
+
+app.post('/admin/advertisers/:slug/campaigns/:id/pause', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND advertiser_slug = ?').get(req.params.id, adv.slug);
+  if (!campaign) return res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=Campaign+not+found&ok=0`);
+  const next = campaign.status === 'active' ? 'paused' : 'active';
+  db.prepare('UPDATE campaigns SET status = ? WHERE id = ?').run(next, campaign.id);
+  logAudit('campaign.status_toggle', 'campaign', campaign.id, { advertiser: adv.slug, from: campaign.status, to: next }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=${encodeURIComponent(`Campaign "${campaign.name}" ${next === 'paused' ? 'paused' : 'reactivated'}`)}`);
+});
+
+app.post('/admin/advertisers/:slug/campaigns/:id/delete', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND advertiser_slug = ?').get(req.params.id, adv.slug);
+  if (!campaign) return res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=Campaign+not+found&ok=0`);
+  db.prepare("UPDATE campaigns SET status = 'deleted' WHERE id = ?").run(campaign.id); // soft delete — history kept
+  logAudit('campaign.deleted', 'campaign', campaign.id, { advertiser: adv.slug, name: campaign.name }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/campaigns?msg=${encodeURIComponent(`Campaign "${campaign.name}" deleted`)}`);
+});
+
+// ---- Item 2 — publisher ↔ campaign mapping views --------------------------
+app.get('/admin/advertisers/:slug/publishers', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const clickRows = db.prepare(`
+    SELECT publisher, campaign_id, COUNT(*) AS clicks, MAX(created_at) AS last_active
+    FROM clicks WHERE advertiser_slug = ? GROUP BY publisher, campaign_id
+  `).all(adv.slug);
+  const convRows = db.prepare(`
+    SELECT publisher, campaign_id, COUNT(*) AS conversions
+    FROM conversions WHERE advertiser_slug = ? GROUP BY publisher, campaign_id
+  `).all(adv.slug);
+  const convMap = {};
+  for (const r of convRows) convMap[`${r.publisher}|${r.campaign_id ?? ''}`] = r.conversions;
+  const campNames = Object.fromEntries(
+    db.prepare('SELECT id, name FROM campaigns WHERE advertiser_slug = ?').all(adv.slug).map(c => [c.id, c.name])
+  );
+  const rows = clickRows.map(r => ({
+    publisher: r.publisher,
+    campaign: r.campaign_id ? (campNames[r.campaign_id] || `#${r.campaign_id}`) : '(advertiser default)',
+    clicks: r.clicks,
+    conversions: convMap[`${r.publisher}|${r.campaign_id ?? ''}`] || 0,
+    last_active: r.last_active,
+  })).sort((a, b) => b.clicks - a.clicks);
+  res.send(renderAdvPublishers({ adv, rows }));
+});
+
+app.get('/admin/publishers/:username/campaigns', requireAdmin, (req, res) => {
+  const username = req.params.username;
+  const pub = db.prepare('SELECT * FROM publishers WHERE username = ?').get(username);
+  if (!pub) return res.redirect('/admin/publishers?msg=Publisher+not+found&ok=0');
+  const clickRows = db.prepare(`
+    SELECT advertiser_slug, campaign_id, COUNT(*) AS clicks, MAX(created_at) AS last_active
+    FROM clicks WHERE publisher = ? GROUP BY advertiser_slug, campaign_id
+  `).all(username);
+  const convRows = db.prepare(`
+    SELECT advertiser_slug, campaign_id, COUNT(*) AS conversions, COALESCE(SUM(payout),0) AS payout, COALESCE(MAX(currency),'USD') AS currency
+    FROM conversions WHERE publisher = ? GROUP BY advertiser_slug, campaign_id
+  `).all(username);
+  const convMap = {};
+  for (const r of convRows) convMap[`${r.advertiser_slug}|${r.campaign_id ?? ''}`] = r;
+  const campNames = Object.fromEntries(db.prepare('SELECT id, name FROM campaigns').all().map(c => [c.id, c.name]));
+  const advNames  = Object.fromEntries(db.prepare('SELECT slug, name FROM advertisers').all().map(a => [a.slug, a.name]));
+  const rows = clickRows.map(r => {
+    const cv = convMap[`${r.advertiser_slug}|${r.campaign_id ?? ''}`] || {};
+    return {
+      advertiser: advNames[r.advertiser_slug] || r.advertiser_slug,
+      campaign: r.campaign_id ? (campNames[r.campaign_id] || `#${r.campaign_id}`) : '(advertiser default)',
+      clicks: r.clicks,
+      conversions: cv.conversions || 0,
+      payout: cv.payout || 0,
+      currency: cv.currency || 'USD',
+      last_active: r.last_active,
+    };
+  }).sort((a, b) => b.clicks - a.clicks);
+  res.send(renderPublisherCampaigns({ username, rows }));
+});
+
+// ---- Item 4 — bulk approve / reject conversions ---------------------------
+function bulkIds(body) {
+  let ids = body.ids;
+  if (typeof ids === 'string') { try { ids = JSON.parse(ids); } catch { ids = ids.split(','); } }
+  if (!Array.isArray(ids)) return [];
+  return [...new Set(ids.map(Number).filter(Number.isInteger))];
+}
+app.post('/admin/conversions/bulk-approve', requireAdmin, verifyCsrf, (req, res) => {
+  const ids = bulkIds(req.body);
+  if (!ids.length) return res.status(400).json({ error: 'no_ids' });
+  const ph = ids.map(() => '?').join(',');
+  const info = db.prepare(`UPDATE conversions SET status='approved', reason='bulk_approved' WHERE id IN (${ph})`).run(...ids);
+  logAudit('conversion.bulk_approve', 'conversion', null, { ids, count: info.changes }, req);
+  res.json({ ok: true, approved: info.changes });
+});
+app.post('/admin/conversions/bulk-reject', requireAdmin, verifyCsrf, (req, res) => {
+  const ids = bulkIds(req.body);
+  if (!ids.length) return res.status(400).json({ error: 'no_ids' });
+  const reason = (req.body.reason || 'bulk_rejected').toString().slice(0, 200) || 'bulk_rejected';
+  const ph = ids.map(() => '?').join(',');
+  const info = db.prepare(`UPDATE conversions SET status='rejected', reason=? WHERE id IN (${ph})`).run(reason, ...ids);
+  logAudit('conversion.bulk_reject', 'conversion', null, { ids, count: info.changes, reason }, req);
+  res.json({ ok: true, rejected: info.changes });
+});
+
+// ---- Item 5 — publisher tracking-link generator ---------------------------
+app.get('/publisher/link-generator', requirePublisher, (req, res) => {
+  const pub = req.publisher;
+  const advertisers = assignedAdvertisers(pub.id).filter(a => a.status === 'active');
+  const campaigns = {};
+  for (const a of advertisers) {
+    campaigns[a.slug] = db.prepare("SELECT id, name, event FROM campaigns WHERE advertiser_slug = ? AND status = 'active' ORDER BY name").all(a.slug);
+  }
+  res.send(renderLinkGenerator({ pub, advertisers, campaigns, baseUrl: BASE_URL }));
+});
+
+// Same-origin QR endpoint (imgSrc 'self'). Lazy-require so a missing module degrades
+// gracefully to a placeholder instead of crashing the server.
+function qrPlaceholder(label) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="220" height="220" viewBox="0 0 220 220">`
+    + `<rect width="220" height="220" fill="#f5f5f7"/><text x="110" y="110" text-anchor="middle" dominant-baseline="middle" font-family="Inter,sans-serif" font-size="13" fill="#86868b">${H(label)}</text></svg>`;
+}
+app.get('/publisher/qr', requirePublisher, (req, res) => {
+  const text = (req.query.text || '').toString().slice(0, 2000);
+  res.type('image/svg+xml');
+  if (!text) return res.send(qrPlaceholder('No link yet'));
+  let QR;
+  try { QR = require('qrcode'); } catch { return res.send(qrPlaceholder('QR unavailable')); }
+  QR.toString(text, { type: 'svg', margin: 1, width: 220 }, (err, svg) => {
+    res.send(err ? qrPlaceholder('QR error') : svg);
+  });
+});
+
+// ---- Group 6 render helpers ----------------------------------------------
+function campaignCapBar(c) {
+  if (c.cap_monthly == null) return '<span style="color:#86868b;font-size:12px">no cap</span>';
+  const used = c.cap_used || 0;
+  const pct = c.cap_monthly > 0 ? Math.min(100, Math.round((used / c.cap_monthly) * 100)) : 0;
+  const danger = pct >= 90;
+  const colour = danger ? '#c62828' : pct >= 70 ? '#f57f17' : '#2e7d32';
+  return `<div style="min-width:120px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">
+      <span>${N(used)}/${N(c.cap_monthly)}</span>
+      ${danger ? '<span class="badge" style="background:#fdecea;color:#c62828">≥90%</span>' : ''}
+    </div>
+    <div style="height:6px;background:#e5e5ea;border-radius:3px;overflow:hidden">
+      <div style="height:100%;width:${pct}%;background:${colour}"></div>
+    </div>
+  </div>`;
+}
+function renderCampaignList({ adv, campaigns, csrfToken, flash, error }) {
+  const rows = campaigns.map(c => `<tr>
+    <td><strong>${H(c.name)}</strong><div style="font-size:11px;color:#86868b;margin-top:2px"><code class="xs">/track/${H(adv.slug)}/${c.id}?pub=PUBLISHER</code></div></td>
+    <td><code class="xs">${H((c.offer_url || '').slice(0, 46))}${(c.offer_url || '').length > 46 ? '…' : ''}</code></td>
+    <td>${fmtCur(c.payout, c.currency)}</td>
+    <td><span class="badge ev">${H(c.event)}</span></td>
+    <td>${campaignCapBar(c)}</td>
+    <td><span class="badge ${c.status === 'active' ? 'active' : 'paused'}">${H(c.status)}</span></td>
+    <td>${N(c.clicks)}</td>
+    <td>${N(c.conversions)}</td>
+    <td><div class="act">
+      <a href="/admin/advertisers/${H(adv.slug)}/campaigns/${c.id}/edit" class="btn btn-ghost">Edit</a>
+      <form method="POST" action="/admin/advertisers/${H(adv.slug)}/campaigns/${c.id}/pause" style="display:inline">${csrfField(csrfToken)}
+        <button class="btn ${c.status === 'active' ? 'btn-warn' : 'btn-ghost'}">${c.status === 'active' ? 'Pause' : 'Activate'}</button></form>
+      <form method="POST" action="/admin/advertisers/${H(adv.slug)}/campaigns/${c.id}/delete" style="display:inline" data-confirm="Delete campaign ${H(c.name)}? History is kept.">${csrfField(csrfToken)}
+        <button class="btn btn-danger">Delete</button></form>
+    </div></td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/publishers" class="hbtn ghost">Publishers</a>
+    <a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}
+<main>
+${flashHtml(flash ? { type: 'success', text: flash } : (error ? { type: 'error', text: error } : null))}
+<div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
+<section>
+  <div class="sh"><h2>Campaigns — ${H(adv.name)}</h2><span class="meta">${campaigns.length} campaign(s)</span></div>
+  ${campaigns.length === 0 ? '<div class="empty">No campaigns yet. Create one below.</div>' : `<table>
+    <thead><tr><th>Name</th><th>Offer URL</th><th>Payout</th><th>Event</th><th>Cap (this month)</th><th>Status</th><th>Clicks</th><th>Conv.</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`}
+</section>
+<section>
+  <div class="sh"><h2>New Campaign</h2></div>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/campaigns" style="display:grid;grid-template-columns:1.4fr 2fr .8fr .7fr .9fr .8fr auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px">${csrfField(csrfToken)}
+    <label>Name<input name="name" required placeholder="Summer offer"></label>
+    <label>Offer URL<input name="offer_url" required placeholder="https://advertiser.com/o"></label>
+    <label>Payout<input name="payout" type="number" step="0.01" min="0" value="0"></label>
+    <label>Currency<input name="currency" value="USD" maxlength="8"></label>
+    <label>Event<input name="event" value="sale"></label>
+    <label>Cap/mo<input name="cap_monthly" type="number" min="0" placeholder="∞"></label>
+    <button class="btn btn-primary">Add</button>
+  </form>
+</main>`;
+  return adminLayout(`Campaigns — ${adv.name}`, body);
+}
+function renderCampaignForm({ adv, campaign, csrfToken }) {
+  const c = campaign;
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/campaigns" class="hbtn ghost">← Campaigns</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Edit Campaign — ${H(c.name)}</h2></div>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/campaigns/${c.id}">${csrfField(csrfToken)}
+    <label>Name<input name="name" value="${H(c.name)}" required></label>
+    <label>Offer URL<input name="offer_url" value="${H(c.offer_url)}" required></label>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px">
+      <label>Payout<input name="payout" type="number" step="0.01" min="0" value="${H(c.payout)}"></label>
+      <label>Currency<input name="currency" value="${H(c.currency)}" maxlength="8"></label>
+      <label>Event<input name="event" value="${H(c.event)}"></label>
+      <label>Cap / month<input name="cap_monthly" type="number" min="0" value="${c.cap_monthly == null ? '' : H(c.cap_monthly)}" placeholder="∞"></label>
+    </div>
+    <label>Status<select name="status"><option value="active"${c.status === 'active' ? ' selected' : ''}>active</option><option value="paused"${c.status === 'paused' ? ' selected' : ''}>paused</option></select></label>
+    <div style="margin-top:14px"><button class="btn btn-primary">Save changes</button>
+      <a href="/admin/advertisers/${H(adv.slug)}/campaigns" class="btn btn-ghost">Cancel</a></div>
+  </form>
+</main>`;
+  return adminLayout(`Edit Campaign — ${c.name}`, body);
+}
+function renderAdvPublishers({ adv, rows }) {
+  const trs = rows.map(r => `<tr>
+    <td><code>${H(r.publisher)}</code> <a href="/admin/publishers/${encodeURIComponent(r.publisher)}/campaigns" class="btn btn-ghost" style="margin-left:6px">View</a></td>
+    <td>${H(r.campaign)}</td>
+    <td>${N(r.clicks)}</td>
+    <td>${N(r.conversions)}</td>
+    <td>${cvr(r.clicks, r.conversions)}</td>
+    <td><small style="color:#86868b">${H((r.last_active || '').slice(0, 19))}</small></td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/campaigns" class="hbtn ghost">Campaigns</a>
+    <a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}
+<main>
+<div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
+<section>
+  <div class="sh"><h2>Publishers running ${H(adv.name)}</h2><span class="meta">by publisher × campaign</span></div>
+  ${rows.length === 0 ? '<div class="empty">No traffic recorded for this advertiser yet.</div>' : `<table>
+    <thead><tr><th>Publisher</th><th>Campaign</th><th>Clicks</th><th>Conversions</th><th>CVR</th><th>Last active</th></tr></thead>
+    <tbody>${trs}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout(`Publishers — ${adv.name}`, body);
+}
+function renderPublisherCampaigns({ username, rows }) {
+  const trs = rows.map(r => `<tr>
+    <td>${H(r.advertiser)}</td>
+    <td>${H(r.campaign)}</td>
+    <td>${N(r.clicks)}</td>
+    <td>${N(r.conversions)}</td>
+    <td>${fmtCur(r.payout, r.currency)}</td>
+    <td><small style="color:#86868b">${H((r.last_active || '').slice(0, 19))}</small></td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="/admin/publishers" class="hbtn ghost">All Publishers</a>`)}
+<main>
+<div style="margin-bottom:14px"><a href="/admin/publishers" style="font-size:13px;color:#0071e3">← Publishers</a></div>
+<section>
+  <div class="sh"><h2>Campaigns run by ${H(username)}</h2><span class="meta">by advertiser × campaign</span></div>
+  ${rows.length === 0 ? '<div class="empty">This publisher has no recorded traffic yet.</div>' : `<table>
+    <thead><tr><th>Advertiser</th><th>Campaign</th><th>Clicks</th><th>Conversions</th><th>Payout</th><th>Last active</th></tr></thead>
+    <tbody>${trs}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout(`Campaigns — ${username}`, body);
+}
+function renderLinkGenerator({ pub, advertisers, campaigns, baseUrl }) {
+  const advOptions = advertisers.map(a => `<option value="${H(a.slug)}">${H(a.name)}</option>`).join('');
+  const data = JSON.stringify({ base: baseUrl, pub: pub.username, campaigns });
+  const body = `<div class="page-head"><h1>Link Generator</h1><p>Build a custom tracking link with sub-IDs and UTM parameters.</p></div>
+<section class="card-block">
+  <div class="lg-grid">
+    <form id="lg-form" class="lg-form" autocomplete="off">
+      <label>Advertiser
+        <select id="lg-adv" name="advertiser">${advOptions || '<option value="">No approved advertisers</option>'}</select>
+      </label>
+      <label>Campaign
+        <select id="lg-camp" name="campaign"><option value="">Advertiser default</option></select>
+      </label>
+      <div class="lg-row">
+        <label>af_sub1<input id="lg-sub1" placeholder="optional"></label>
+        <label>af_sub2<input id="lg-sub2" placeholder="optional"></label>
+      </div>
+      <div class="lg-row">
+        <label>utm_source<input id="lg-utm-source" placeholder="e.g. facebook"></label>
+        <label>utm_medium<input id="lg-utm-medium" placeholder="e.g. cpc"></label>
+      </div>
+      <label>utm_campaign<input id="lg-utm-campaign" placeholder="optional"></label>
+      <button type="button" id="lg-gen" class="pub-btn">Generate link</button>
+    </form>
+    <div class="lg-out">
+      <label>Tracking URL</label>
+      <div class="lg-url-wrap"><input id="lg-url" readonly value=""><button type="button" id="lg-copy" class="pub-btn ghost">Copy</button></div>
+      <div id="lg-copied" class="lg-copied" hidden>Copied!</div>
+      <div class="lg-qr"><img id="lg-qr-img" alt="QR code" width="200" height="200"></div>
+      <div class="lg-hist-head">Recent links <button type="button" id="lg-clear" class="lg-link-btn">clear</button></div>
+      <ul id="lg-hist" class="lg-hist"></ul>
+    </div>
+  </div>
+</section>
+<style>
+.lg-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+@media(max-width:760px){.lg-grid{grid-template-columns:1fr}}
+.lg-form label,.lg-out label{display:block;font-size:12px;font-weight:600;color:#3a3a3c;margin-bottom:10px}
+.lg-form input,.lg-form select,#lg-url{width:100%;padding:8px 10px;border:1px solid #d2d2d7;border-radius:8px;font-size:13px;margin-top:4px}
+.lg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.lg-url-wrap{display:flex;gap:8px;align-items:center}
+.lg-qr{margin-top:16px;min-height:200px}
+.lg-qr img{border:1px solid #e5e5ea;border-radius:8px;background:#fff}
+.lg-copied{color:#2e7d32;font-size:12px;margin-top:6px}
+.lg-hist-head{margin-top:18px;font-size:12px;font-weight:600;color:#3a3a3c}
+.lg-hist{list-style:none;padding:0;margin:8px 0 0;font-size:12px}
+.lg-hist li{padding:6px 0;border-top:1px solid #f0f0f2;word-break:break-all;color:#515154}
+.lg-link-btn{background:none;border:none;color:#0071e3;cursor:pointer;font-size:11px;margin-left:8px}
+</style>
+<script id="lg-data" type="application/json">${data}</script>
+<script>
+(function(){
+  var D = JSON.parse(document.getElementById('lg-data').textContent);
+  var $ = function(id){ return document.getElementById(id); };
+  var HKEY = 'komorebi_link_history';
+  function camps(slug){ return (D.campaigns && D.campaigns[slug]) || []; }
+  function fillCampaigns(){
+    var slug = $('lg-adv').value, sel = $('lg-camp');
+    sel.innerHTML = '<option value="">Advertiser default</option>';
+    camps(slug).forEach(function(c){
+      var o = document.createElement('option'); o.value = c.id; o.textContent = c.name; sel.appendChild(o);
+    });
+  }
+  function build(){
+    var slug = $('lg-adv').value; if(!slug) return '';
+    var camp = $('lg-camp').value;
+    var url = D.base + '/track/' + encodeURIComponent(slug) + (camp ? '/' + encodeURIComponent(camp) : '');
+    var qs = ['pub=' + encodeURIComponent(D.pub)];
+    var map = { af_sub1:'lg-sub1', af_sub2:'lg-sub2', utm_source:'lg-utm-source', utm_medium:'lg-utm-medium', utm_campaign:'lg-utm-campaign' };
+    Object.keys(map).forEach(function(k){
+      var v = ($(map[k]).value || '').trim();
+      if(v) qs.push(k + '=' + encodeURIComponent(v));
+    });
+    return url + '?' + qs.join('&');
+  }
+  function loadHist(){
+    var h = [];
+    try { h = JSON.parse(localStorage.getItem(HKEY) || '[]'); } catch(e){}
+    var ul = $('lg-hist'); ul.innerHTML = '';
+    h.slice(0,10).forEach(function(u){ var li = document.createElement('li'); li.textContent = u; ul.appendChild(li); });
+  }
+  function saveHist(u){
+    var h = [];
+    try { h = JSON.parse(localStorage.getItem(HKEY) || '[]'); } catch(e){}
+    h = [u].concat(h.filter(function(x){ return x !== u; })).slice(0,10);
+    try { localStorage.setItem(HKEY, JSON.stringify(h)); } catch(e){}
+    loadHist();
+  }
+  $('lg-adv').addEventListener('change', fillCampaigns);
+  $('lg-gen').addEventListener('click', function(){
+    var u = build(); if(!u) return;
+    $('lg-url').value = u;
+    $('lg-qr-img').src = '/publisher/qr?text=' + encodeURIComponent(u);
+    saveHist(u);
+  });
+  $('lg-copy').addEventListener('click', function(){
+    var i = $('lg-url'); if(!i.value) return;
+    i.select();
+    if(navigator.clipboard){ navigator.clipboard.writeText(i.value); } else { document.execCommand('copy'); }
+    var c = $('lg-copied'); c.hidden = false; setTimeout(function(){ c.hidden = true; }, 1500);
+  });
+  $('lg-clear').addEventListener('click', function(){ try{ localStorage.removeItem(HKEY); }catch(e){} loadHist(); });
+  fillCampaigns(); loadHist();
+})();
+</script>`;
+  return pubLayout('Link Generator', body, pub, 'link');
+}
+
 // HTML templates — shared helpers
 // ---------------------------------------------------------------------------
 
@@ -4495,6 +5010,7 @@ function adminSidebar() {
     quality:     ic(`<path stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" d="M8 1.6l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.3 4.3 13.4l.7-4.3-3.1-3 4.3-.6L8 1.6z"/>`),
     smartlink:   ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M6.5 9.5l3-3M5 8L3.5 9.5a2.5 2.5 0 0 0 3.5 3.5L8.5 11.5M11 8l1.5-1.5a2.5 2.5 0 0 0-3.5-3.5L7.5 4.5"/>`),
     market:      ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M2 6h12l-1 8H3L2 6zM5 6V4.5a3 3 0 0 1 6 0V6"/>`),
+    link:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M6.5 9.5l3-3M6 5.5l1-1a2.5 2.5 0 0 1 3.5 3.5l-1 1M10 10.5l-1 1A2.5 2.5 0 0 1 5.5 8l1-1"/>`),
   };
   const nav = (href, label, icon, paths) =>
     `<a href="${href}" class="adm-nav-a" data-paths="${paths||href}">${ICONS[icon]}<span>${label}</span></a>`;
@@ -4691,6 +5207,8 @@ function renderAdminDashboard({ totalClicks, totalConversions,
       <td><div class="ubox" data-copy="${H(postbkUrl)}" style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">/postback/${H(a.slug)}?click_id=…</div></td>
       <td><div class="act">
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -4730,6 +5248,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
       : `<span class="badge ${H(st)}">${H(st)}</span>`;
     const ctitFlagged = (r.fraud_flag || '').includes('ctit');
     return `<tr>
+      <td><input type="checkbox" class="bulk-cb" value="${r.id}" data-bulk-row></td>
       <td>${H(r.received_at)}</td><td>${H(adv?.name||r.advertiser_slug)}</td>
       <td><code>${H(r.publisher)}</code></td>
       <td><code class="xs">${H(r.click_id)}</code></td>
@@ -4881,10 +5400,55 @@ ${(topCountries.length || deviceSplit.length) ? `
       <a href="/admin/export.csv" class="btn btn-ghost">All CSV</a>
       <a href="/admin/export.csv?month=${thisMonth}" class="btn btn-ghost">${thisMonth} CSV</a></div>
   </div>
+  <div id="bulk-bar" class="bulk-bar" hidden>
+    <span id="bulk-count">0 selected</span>
+    <button type="button" class="btn btn-primary" data-bulk-approve>Approve</button>
+    <button type="button" class="btn btn-danger" data-bulk-reject>Reject</button>
+    <button type="button" class="btn btn-ghost" data-bulk-clear>Clear</button>
+  </div>
   ${recentRows.length===0 ? '<div class="empty">No conversions match.</div>'
-    : `<table><thead><tr><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Cur</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
+    : `<table><thead><tr><th style="width:28px"><input type="checkbox" id="bulk-all" title="Select all"></th><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Cur</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
         <tbody>${recentRows}</tbody></table>`}
 </section>
+<style>
+.bulk-bar{display:flex;align-items:center;gap:10px;background:#1d1d1f;color:#fff;padding:8px 14px;border-radius:8px;margin-bottom:10px;font-size:13px}
+.bulk-bar #bulk-count{font-weight:600;margin-right:6px}
+</style>
+<script>
+(function(){
+  var bar = document.getElementById('bulk-bar');
+  if(!bar) return;
+  var cbs = function(){ return Array.prototype.slice.call(document.querySelectorAll('.bulk-cb')); };
+  var selected = function(){ return cbs().filter(function(c){ return c.checked; }).map(function(c){ return parseInt(c.value,10); }); };
+  function refresh(){
+    var n = selected().length;
+    document.getElementById('bulk-count').textContent = n + ' selected';
+    bar.hidden = n === 0;
+  }
+  var all = document.getElementById('bulk-all');
+  if(all) all.addEventListener('change', function(){ cbs().forEach(function(c){ c.checked = all.checked; }); refresh(); });
+  document.addEventListener('change', function(e){ if(e.target && e.target.classList.contains('bulk-cb')) refresh(); });
+  var CSRF = ${JSON.stringify(csrfToken || '')};
+  function send(url, body){
+    body._csrf = CSRF;
+    fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+      .then(function(r){ return r.json(); })
+      .then(function(){ location.href = '/admin?msg=' + encodeURIComponent('Bulk action applied'); })
+      .catch(function(){ location.reload(); });
+  }
+  bar.querySelector('[data-bulk-approve]').addEventListener('click', function(){
+    var ids = selected(); if(!ids.length) return; send('/admin/conversions/bulk-approve', { ids: ids });
+  });
+  bar.querySelector('[data-bulk-reject]').addEventListener('click', function(){
+    var ids = selected(); if(!ids.length) return;
+    var reason = prompt('Rejection reason (optional):', '') || 'bulk_rejected';
+    send('/admin/conversions/bulk-reject', { ids: ids, reason: reason });
+  });
+  bar.querySelector('[data-bulk-clear]').addEventListener('click', function(){
+    cbs().forEach(function(c){ c.checked = false; }); if(all) all.checked = false; refresh();
+  });
+})();
+</script>
 </main><script>${CP_JS}</script>`;
 
   return adminLayout('Dashboard', body);
@@ -4913,6 +5477,8 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
       </td>
       <td><div class="act">
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -5271,6 +5837,7 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
     <td><small style="color:#8e8e93">${H(p.created_at?.slice(0,10)||'')}</small></td>
     <td><div class="act">
       <a href="/admin/publishers/${p.id}/edit" class="btn btn-ghost">Edit</a>
+      <a href="/admin/publishers/${encodeURIComponent(p.username)}/campaigns" class="btn btn-ghost">Campaigns</a>
       <a href="/admin/publishers/${p.id}/payments" class="btn btn-ghost">Payments</a>
       <a href="/admin/publishers/${p.id}/postback-log" class="btn btn-ghost">S2S Log</a>
       <form data-invoice-jump="${p.id}" style="display:inline-flex;gap:3px;vertical-align:middle">
@@ -6960,6 +7527,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     profile:     ic(`<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M2.5 14c0-2.8 2.5-4.5 5.5-4.5s5.5 1.7 5.5 4.5"/>`),
     docs:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3.5 1h9a.5.5 0 0 1 .5.5v13a.5.5 0 0 1-.5.5h-9A.5.5 0 0 1 3 14.5v-13A.5.5 0 0 1 3.5 1z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 5h5M5.5 8h5M5.5 11h3"/>`),
     market:      ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M2 6h12l-1 8H3L2 6zM5 6V4.5a3 3 0 0 1 6 0V6"/>`),
+    link:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M6.5 9.5l3-3M6 5.5l1-1a2.5 2.5 0 0 1 3.5 3.5l-1 1M10 10.5l-1 1A2.5 2.5 0 0 1 5.5 8l1-1"/>`),
   };
   const navItem = (href, key, label, external = false) =>
     `<a href="${href}" class="pub-nav-a${activeTab===key?' active':''}"${external?' target="_blank" rel="noopener noreferrer"':''}>${PICONS[key]||''}<span>${label}</span>${external?'<svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" style="margin-left:auto;opacity:.35"><path d="M6 3h7v7l-2-2-4 4-2-2 4-4L6 3z"/></svg>':''}</a>`;
@@ -6990,6 +7558,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
       <div class="pub-sb-group">OVERVIEW</div>
       ${navItem('/publisher/dashboard',   'dashboard',   'Dashboard')}
       ${navItem('/publisher/conversions', 'conversions', 'Conversions')}
+      ${navItem('/publisher/link-generator', 'link',     'Link Generator')}
       ${navItem('/publisher/payments',    'payments',    'Payments')}
       ${navItem('/marketplace',           'marketplace', 'Browse Offers')}
       ${navItem('/publisher/marketplace', 'market',      'Marketplace')}
