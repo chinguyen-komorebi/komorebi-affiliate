@@ -4332,7 +4332,7 @@ function bulkIds(body) {
   if (!Array.isArray(ids)) return [];
   return [...new Set(ids.map(Number).filter(Number.isInteger))];
 }
-app.post('/admin/conversions/bulk-approve', requireAdmin, (req, res) => {
+app.post('/admin/conversions/bulk-approve', requireAdmin, verifyCsrf, (req, res) => {
   const ids = bulkIds(req.body);
   if (!ids.length) return res.status(400).json({ error: 'no_ids' });
   const ph = ids.map(() => '?').join(',');
@@ -4340,7 +4340,7 @@ app.post('/admin/conversions/bulk-approve', requireAdmin, (req, res) => {
   logAudit('conversion.bulk_approve', 'conversion', null, { ids, count: info.changes }, req);
   res.json({ ok: true, approved: info.changes });
 });
-app.post('/admin/conversions/bulk-reject', requireAdmin, (req, res) => {
+app.post('/admin/conversions/bulk-reject', requireAdmin, verifyCsrf, (req, res) => {
   const ids = bulkIds(req.body);
   if (!ids.length) return res.status(400).json({ error: 'no_ids' });
   const reason = (req.body.reason || 'bulk_rejected').toString().slice(0, 200) || 'bulk_rejected';
