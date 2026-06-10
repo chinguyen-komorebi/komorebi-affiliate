@@ -4474,7 +4474,7 @@ app.get('/publisher/link-generator', requirePublisher, (req, res) => {
   for (const a of advertisers) {
     campaigns[a.slug] = db.prepare("SELECT id, name, event FROM campaigns WHERE advertiser_slug = ? AND status = 'active' ORDER BY name").all(a.slug);
   }
-  res.send(renderLinkGenerator({ pub, advertisers, campaigns, baseUrl: BASE_URL }));
+  res.send(renderLinkGenerator({ pub, advertisers, campaigns, baseUrl: publisherBase(pub) }));
 });
 
 // Same-origin QR endpoint (imgSrc 'self'). Lazy-require so a missing module degrades
@@ -5157,6 +5157,7 @@ function adminSidebar() {
   <div class="adm-sb-group">REPORTS</div>
   ${nav('/admin/cohort',        'Cohort Stats',      'reports','/admin/cohort')}
   ${nav('/admin/eqm',           'EQM',               'quality','/admin/eqm')}
+  ${nav('/admin/pacing',        'Pacing & Margin',   'reports','/admin/pacing')}
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   ${nav('/admin/attribution',   'Attribution',       'reports','/admin/attribution')}
@@ -5166,6 +5167,7 @@ function adminSidebar() {
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
+  ${nav('/admin/fx-rates',      'FX Rates (locked)','settings','/admin/fx-rates')}
   ${nav('/admin/postback-log','Postback Log','postback',    '/admin/postback-log')}
   ${nav('/admin/audit-log',   'Audit log',   'auditlog',    '/admin/audit-log')}
   ${nav('/admin/settings',    'Settings',    'settings',    '/admin/settings')}
@@ -5345,6 +5347,8 @@ function renderAdminDashboard({ totalClicks, totalConversions,
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/active-def" class="btn btn-ghost">Active Def</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/payout-preview" class="btn btn-ghost">Payout</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/attribution" class="btn btn-ghost">Attribution</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/mmp" class="btn btn-ghost">MMP</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -5618,6 +5622,8 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/active-def" class="btn btn-ghost">Active Def</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/payout-preview" class="btn btn-ghost">Payout</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/attribution" class="btn btn-ghost">Attribution</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/mmp" class="btn btn-ghost">MMP</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -9442,6 +9448,13 @@ function applyG9PostInsert({ convId, slug, pub, clickId, event, amount, req }) {
     db.prepare("UPDATE conversions SET status='rejected', reason='fraud_auto_reject' WHERE id=?").run(convId);
     db.prepare("UPDATE fraud_flags SET auto_reject=1 WHERE click_id=? AND advertiser_slug=?").run(clickId, slug);
   }
+
+  // F34 — preserve the conversion's original-currency amount.
+  db.prepare('UPDATE conversions SET original_currency=COALESCE(original_currency,currency), original_amount=COALESCE(original_amount,?) WHERE id=?').run(amount, convId);
+
+  // F31 — apply the advertiser's cross-channel attribution rule (gated: no rule = unchanged).
+  try { applyAttributionRule(convId, slug, req); } catch (e) { console.error('attribution rule error:', e.message); }
+
   return flags;
 }
 
@@ -9727,6 +9740,231 @@ function renderPublisherHoldback({ pub, rows }) {
   ${rows.length === 0 ? '<div class="empty">No holdback on your account.</div>' : `<table><thead><tr><th>Advertiser</th><th>Cohort</th><th>Held</th><th>Released</th><th>Outstanding</th></tr></thead><tbody>${trs}</tbody></table>`}
 </section></main>`;
   return pubLayout(`${pub.username} — Holdback`, body, pub, 'holdback');
+}
+
+// ===========================================================================
+// Group 10 — pacing/margin (F30), attribution rules (F31), Adjust S2S (F32),
+//   custom domains (F33), multi-currency FX (F34). All gated.
+// ===========================================================================
+
+// F31 — apply the advertiser's attribution rule to a freshly-inserted conversion.
+function applyAttributionRule(convId, slug, req) {
+  const rule = db.prepare('SELECT * FROM attribution_rules WHERE advertiser_slug=? ORDER BY id DESC LIMIT 1').get(slug);
+  if (!rule) return null; // no rule → legacy behaviour (Komorebi wins on last click)
+  const source = (req.query.source || '').toString().toLowerCase();
+  if (rule.rule_type === 'telesale_wins' && source === 'telesale') {
+    db.prepare("UPDATE conversions SET status='rejected', reason='telesale_wins' WHERE id=?").run(convId);
+    return 'telesale_wins';
+  }
+  if (rule.rule_type === 'split') {
+    db.prepare("UPDATE conversions SET payout=ROUND(payout*0.5,2), payout_local=ROUND(payout_local*0.5,2), reason=COALESCE(reason,'split_50') WHERE id=?").run(convId);
+    return 'split';
+  }
+  return 'komorebi_wins';
+}
+
+// F34 — FX rate lookup (locked rate for a period first, else the latest unlocked rate).
+function fxRate(from, to, period) {
+  if (from === to) return 1;
+  let r = period ? db.prepare('SELECT rate FROM fx_rates WHERE from_currency=? AND to_currency=? AND reconciliation_period=?').get(from, to, period) : null;
+  if (!r) r = db.prepare('SELECT rate FROM fx_rates WHERE from_currency=? AND to_currency=? AND reconciliation_period IS NULL ORDER BY id DESC LIMIT 1').get(from, to);
+  return r ? r.rate : null;
+}
+function fxConvert(amount, from, to, period) {
+  if (amount == null) return null;
+  const r = fxRate(from, to, period);
+  return r == null ? null : +(amount * r).toFixed(6);
+}
+
+// ---- F30 pacing / margin / budget dashboard ------------------------------
+function advertiserPacing(slug) {
+  const cfg = getActiveDef(slug);
+  const phases = (cfg.phases || []).map(ph => {
+    const quotaRaw = getSettingRaw(`quota:${slug}:${ph.name}`);
+    const quota = quotaRaw != null ? parseInt(quotaRaw, 10) : null;
+    const opens = db.prepare(
+      "SELECT COUNT(*) n FROM conversions WHERE advertiser_slug=? AND event=? AND date(received_at) >= ? AND (? IS NULL OR date(received_at) <= ?)"
+    ).get(slug, cfg.open_event, ph.start_date || '0000-01-01', ph.end_date, ph.end_date || '9999-12-31').n;
+    const pacingPct = quota && quota > 0 ? Math.round((opens / quota) * 1000) / 10 : null;
+    return { name: ph.name, base_per_open: ph.base_per_open, quota, opens, pacingPct };
+  });
+  const agg = db.prepare(
+    "SELECT COALESCE(SUM(payout),0) payout, COALESCE(SUM(revenue),0) revenue, COALESCE(SUM(held_amount),0) held FROM conversions WHERE advertiser_slug=?"
+  ).get(slug);
+  const projActives = db.prepare('SELECT COALESCE(SUM(active_by_d30),0) a FROM cohort_stats WHERE advertiser_slug=?').get(slug).a;
+  const blended = db.prepare('SELECT AVG(actual_d30_rate) r FROM cohort_stats WHERE advertiser_slug=? AND is_matured=1').get(slug).r || 0;
+  const margin = agg.revenue - agg.payout;
+  return { phases, payout: agg.payout, revenue: agg.revenue, held: agg.held, margin,
+    marginPct: agg.revenue > 0 ? Math.round((margin / agg.revenue) * 1000) / 10 : null,
+    projActives, blendedPct: +(blended * 100).toFixed(1), gate: Number(cfg.gate_pct) || 0, currency: (cfg.phases && cfg.phases[0] && cfg.phases[0].currency) || 'USD' };
+}
+app.get('/admin/pacing', requireAdmin, (req, res) => {
+  const slugs = db.prepare("SELECT key FROM settings WHERE key LIKE 'active_def:%'").all().map(r => r.key.slice('active_def:'.length));
+  const rows = slugs.map(s => ({ slug: s, name: (db.prepare('SELECT name FROM advertisers WHERE slug=?').get(s) || {}).name || s, ...advertiserPacing(s) }));
+  res.send(renderPacing({ rows }));
+});
+app.get('/admin/advertisers/:slug/quota', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const cfg = getActiveDef(adv.slug);
+  const phases = (cfg.phases || []).map(ph => ({ name: ph.name, quota: getSettingRaw(`quota:${adv.slug}:${ph.name}`) || '' }));
+  const flash = req.query.msg ? { type: 'success', text: req.query.msg } : null;
+  res.send(renderQuota({ adv, phases, csrfToken: req.session.csrfToken, flash }));
+});
+app.post('/admin/advertisers/:slug/quota', requireAdmin, verifyCsrf, (req, res) => {
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const cfg = getActiveDef(adv.slug);
+  for (const ph of (cfg.phases || [])) {
+    const v = (req.body[`quota_${ph.name}`] || '').toString().trim();
+    if (v === '') continue;
+    if (parseInt(v, 10) >= 0) setSetting(`quota:${adv.slug}:${ph.name}`, String(parseInt(v, 10)));
+  }
+  logAudit('advertiser.quota_set', 'advertiser', adv.slug, {}, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/quota?msg=Quota+saved`);
+});
+
+// ---- F31 attribution rule admin UI ---------------------------------------
+app.get('/admin/advertisers/:slug/attribution', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const rule = db.prepare('SELECT * FROM attribution_rules WHERE advertiser_slug=? ORDER BY id DESC LIMIT 1').get(adv.slug);
+  const flash = req.query.msg ? { type: 'success', text: req.query.msg } : null;
+  res.send(renderAttribution({ adv, rule, csrfToken: req.session.csrfToken, flash }));
+});
+app.post('/admin/advertisers/:slug/attribution', requireAdmin, verifyCsrf, (req, res) => {
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const ruleType = ['komorebi_wins', 'telesale_wins', 'split'].includes(req.body.rule_type) ? req.body.rule_type : 'komorebi_wins';
+  const windowDays = parseInt(req.body.window_days, 10) > 0 ? parseInt(req.body.window_days, 10) : 7;
+  const notes = (req.body.notes || '').toString().slice(0, 500);
+  db.prepare('INSERT INTO attribution_rules (advertiser_slug, rule_type, window_days, notes) VALUES (?,?,?,?)').run(adv.slug, ruleType, windowDays, notes);
+  logAudit('advertiser.attribution_rule_set', 'advertiser', adv.slug, { rule_type: ruleType, window_days: windowDays }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/attribution?msg=Attribution+rule+saved`);
+});
+
+// ---- F32 Adjust MMP setup + test connection ------------------------------
+app.get('/admin/advertisers/:slug/mmp', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const flash = req.query.msg ? { type: req.query.ok === '0' ? 'error' : 'success', text: req.query.msg } : null;
+  res.send(renderMmp({ adv, csrfToken: req.session.csrfToken, flash }));
+});
+app.post('/admin/advertisers/:slug/mmp/test', requireAdmin, verifyCsrf, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  let msg, ok = '1';
+  if (adv.mmp_type === 'adjust') {
+    // Adjust is push-based: a successful "connection" means we will accept its S2S
+    // postbacks at /postback/:slug and map event names via the active definition.
+    msg = 'Adjust S2S ready — point Adjust callbacks at /postback/' + adv.slug + ' (events mapped via active definition)';
+  } else if (adv.mmp_type === 'appsflyer') {
+    msg = 'AppsFlyer configured — use the MMP Sync page to pull events.';
+  } else { msg = 'No MMP configured for this advertiser.'; ok = '0'; }
+  logAudit('advertiser.mmp_test', 'advertiser', adv.slug, { mmp_type: adv.mmp_type }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/mmp?msg=${encodeURIComponent(msg)}&ok=${ok}`);
+});
+
+// ---- F34 FX rates admin UI -----------------------------------------------
+app.get('/admin/fx-rates', requireAdmin, (req, res) => {
+  const rows = db.prepare('SELECT * FROM fx_rates ORDER BY from_currency, to_currency, reconciliation_period').all();
+  const flash = req.query.msg ? { type: 'success', text: req.query.msg } : null;
+  res.send(renderFxRates({ rows, csrfToken: req.session.csrfToken, flash }));
+});
+app.post('/admin/fx-rates', requireAdmin, verifyCsrf, (req, res) => {
+  const from = (req.body.from_currency || '').trim().toUpperCase().slice(0, 8);
+  const to = (req.body.to_currency || 'USD').trim().toUpperCase().slice(0, 8);
+  const rate = parseFloat(req.body.rate);
+  const period = (req.body.reconciliation_period || '').trim() || null;
+  if (!from || !to || isNaN(rate) || rate <= 0) return res.redirect('/admin/fx-rates?msg=Valid+currencies+and+rate+required&ok=0');
+  if (period) {
+    const existing = db.prepare('SELECT id FROM fx_rates WHERE from_currency=? AND to_currency=? AND reconciliation_period=?').get(from, to, period);
+    if (existing) return res.redirect('/admin/fx-rates?msg=' + encodeURIComponent('Period ' + period + ' already locked for ' + from + String.fromCharCode(8594) + to + '; cannot overwrite') + '&ok=0');
+  }
+  db.prepare('INSERT OR REPLACE INTO fx_rates (from_currency, to_currency, rate, reconciliation_period, locked_at) VALUES (?,?,?,?,datetime(\'now\'))').run(from, to, rate, period);
+  logAudit('fx_rate.set', 'fx', `${from}->${to}`, { rate, period }, req);
+  res.redirect('/admin/fx-rates?msg=' + encodeURIComponent(`Rate ${from}→${to} ${period ? 'locked for ' + period : 'set'}`));
+});
+
+// ---- Group 10 render helpers ---------------------------------------------
+function renderPacing({ rows }) {
+  const totRev = rows.reduce((s, r) => s + r.revenue, 0);
+  const totPay = rows.reduce((s, r) => s + r.payout, 0);
+  const fm = (v, c) => fmtCur(v, c || 'USD');
+  const cards = `<div class="cards" style="margin-bottom:16px">
+    <div class="card"><div class="lbl">Revenue</div><div class="val" data-revenue>${fm(totRev, 'USD')}</div></div>
+    <div class="card"><div class="lbl">Payout exposure</div><div class="val" data-payout>${fm(totPay, 'USD')}</div></div>
+    <div class="card"><div class="lbl">Margin</div><div class="val" data-margin>${fm(totRev - totPay, 'USD')}</div></div>
+    <div class="card"><div class="lbl">Margin %</div><div class="val">${totRev > 0 ? (((totRev - totPay) / totRev) * 100).toFixed(1) + '%' : '—'}</div></div>
+  </div>`;
+  const blocks = rows.map(r => {
+    const phaseRows = r.phases.map(ph => {
+      const pacing = ph.pacingPct == null ? '<span style="color:#9ca3af">no quota</span>' : `${ph.pacingPct}%`;
+      const bar = ph.quota ? `<div style="height:6px;background:#e5e5ea;border-radius:3px;overflow:hidden;min-width:120px"><div style="height:100%;width:${Math.min(100, ph.pacingPct || 0)}%;background:${(ph.pacingPct || 0) >= 100 ? '#c62828' : '#2e7d32'}"></div></div>` : '';
+      return `<tr data-phase="${H(ph.name)}" data-opens="${ph.opens}" data-quota="${ph.quota == null ? '' : ph.quota}">
+        <td>${H(ph.name)}</td><td>${ph.quota == null ? '—' : N(ph.quota)}</td><td>${N(ph.opens)}</td><td>${pacing} ${bar}</td><td>${fm(ph.base_per_open, r.currency)}</td></tr>`;
+    }).join('');
+    return `<section data-advertiser="${H(r.slug)}" data-margin="${r.margin}" data-revenue="${r.revenue}" data-payout="${r.payout}">
+      <div class="sh"><h2>${H(r.name)}</h2><span class="meta">blended D30 ${r.blendedPct}% vs gate ${r.gate}% · proj. actives ${N(r.projActives)} · margin ${fm(r.margin, 'USD')}${r.marginPct != null ? ` (${r.marginPct}%)` : ''}</span></div>
+      <table><thead><tr><th>Phase</th><th>Quota (opens)</th><th>Actual opens</th><th>Pacing</th><th>Base/open</th></tr></thead><tbody>${phaseRows}</tbody></table>
+      <div style="margin-top:6px"><a href="/admin/advertisers/${H(r.slug)}/quota" class="btn btn-ghost">Set quota</a></div>
+    </section>`;
+  }).join('');
+  const body = `${adminHeader()}<main>
+  <section><div class="sh"><h2>Budget Pacing &amp; Margin</h2><span class="meta">${rows.length} advertiser(s) with active definition</span></div>${cards}</section>
+  ${rows.length === 0 ? '<div class="empty">No advertisers with an active definition yet.</div>' : blocks}
+  </main>`;
+  return adminLayout('Pacing', body);
+}
+function renderQuota({ adv, phases, csrfToken, flash }) {
+  const fields = phases.map(ph => `<label style="display:block;margin-bottom:10px">${H(ph.name)} quota (opens)
+    <input name="quota_${H(ph.name)}" type="number" min="0" value="${H(ph.quota)}" style="display:block;margin-top:4px;padding:8px;border:1px solid #d2d2d7;border-radius:7px;width:200px"></label>`).join('');
+  const body = `${adminHeader(`<a href="/admin/pacing" class="hbtn ghost">← Pacing</a>`)}<main>${flashHtml(flash)}
+  <section style="max-width:520px"><div class="sh"><h2>Quota — ${H(adv.name)}</h2></div>
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/quota">${csrfField(csrfToken)}${fields}
+      <button class="btn btn-primary">Save quota</button></form></section></main>`;
+  return adminLayout(`Quota — ${adv.name}`, body);
+}
+function renderAttribution({ adv, rule, csrfToken, flash }) {
+  const opt = (v, l) => `<option value="${v}"${rule && rule.rule_type === v ? ' selected' : ''}>${l}</option>`;
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}<main>${flashHtml(flash)}
+  <section style="max-width:560px"><div class="sh"><h2>Attribution Rule — ${H(adv.name)}</h2></div>
+    <p style="font-size:12px;color:#6e6e73">Current: <strong>${H(rule ? rule.rule_type : 'komorebi_wins (default)')}</strong>${rule ? ` · window ${rule.window_days}d` : ''}</p>
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/attribution">${csrfField(csrfToken)}
+      <label style="display:block;margin:10px 0">Rule type<select name="rule_type" style="display:block;margin-top:4px;padding:8px">${opt('komorebi_wins', 'Komorebi wins (last click in window)')}${opt('telesale_wins', 'Telesale wins (source=telesale excluded)')}${opt('split', 'Split 50/50')}</select></label>
+      <label style="display:block;margin:10px 0">Window (days)<input name="window_days" type="number" min="1" value="${rule ? rule.window_days : 7}" style="display:block;margin-top:4px;padding:8px;width:120px"></label>
+      <label style="display:block;margin:10px 0">Notes<input name="notes" value="${H(rule ? rule.notes : '')}" style="display:block;margin-top:4px;padding:8px;width:100%"></label>
+      <button class="btn btn-primary">Save rule</button></form></section></main>`;
+  return adminLayout(`Attribution — ${adv.name}`, body);
+}
+function renderMmp({ adv, csrfToken, flash }) {
+  const t = adv.mmp_type || 'none';
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}<main>${flashHtml(flash)}
+  <section style="max-width:600px"><div class="sh"><h2>MMP Integration — ${H(adv.name)}</h2></div>
+    <p style="font-size:13px">Type: <strong>${H(t)}</strong></p>
+    ${t === 'adjust' ? `<div style="background:#eef6ff;padding:12px;border-radius:8px;font-size:13px;margin-bottom:12px">
+      <strong>Adjust (S2S push)</strong> — point Adjust partner callbacks at <code>${H(BASE_URL)}/postback/${H(adv.slug)}?click_id={click_id}&amp;event={event}&amp;value={revenue}</code>.
+      Event names are mapped to the funnel via this advertiser's <a href="/admin/advertisers/${H(adv.slug)}/active-def">Active Definition</a>. No App ID/token pull is required.</div>` : ''}
+    <form method="POST" action="/admin/advertisers/${H(adv.slug)}/mmp/test">${csrfField(csrfToken)}<button class="btn btn-primary">Test connection</button></form>
+  </section></main>`;
+  return adminLayout(`MMP — ${adv.name}`, body);
+}
+function renderFxRates({ rows, csrfToken, flash }) {
+  const trs = rows.map(r => `<tr><td>${H(r.from_currency)}</td><td>${H(r.to_currency)}</td><td>${r.rate}</td>
+    <td>${r.reconciliation_period ? `<span class="badge active">locked ${H(r.reconciliation_period)}</span>` : '<span class="badge pending">current</span>'}</td>
+    <td><small>${H((r.locked_at || '').slice(0, 16))}</small></td></tr>`).join('');
+  const body = `${adminHeader()}<main>${flashHtml(flash)}
+  <section><div class="sh"><h2>FX Rates</h2><span class="meta">${rows.length} rate(s)</span></div>
+    <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">A rate with a reconciliation period is <strong>locked</strong> for that month; reconciliation uses the locked rate, not the live one.</p>
+    <form method="POST" action="/admin/fx-rates" style="display:grid;grid-template-columns:repeat(4,1fr) auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px;margin-bottom:14px">${csrfField(csrfToken)}
+      <label>From<input name="from_currency" placeholder="VND" maxlength="8" required></label>
+      <label>To<input name="to_currency" value="USD" maxlength="8"></label>
+      <label>Rate<input name="rate" type="number" step="0.0000001" min="0" required></label>
+      <label>Period (YYYY-MM)<input name="reconciliation_period" placeholder="optional"></label>
+      <button class="btn btn-primary">Add / Lock</button></form>
+    ${rows.length === 0 ? '<div class="empty">No FX rates yet.</div>' : `<table><thead><tr><th>From</th><th>To</th><th>Rate</th><th>Status</th><th>Locked at</th></tr></thead><tbody>${trs}</tbody></table>`}
+  </section></main>`;
+  return adminLayout('FX Rates', body);
 }
 
 // F24 — phased + tiered payout engine.

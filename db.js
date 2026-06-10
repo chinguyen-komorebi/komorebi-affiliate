@@ -894,6 +894,43 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_referral_adv ON advertiser_referral_lists(advertiser_slug);
 `);
 
+// ===========================================================================
+// Group 10 — Sprint 3 P2: pacing/margin dashboard (F30), cross-channel
+//   attribution rules (F31), Adjust S2S (F32), branded custom domains (F33),
+//   multi-currency FX with period locking (F34).
+// ===========================================================================
+
+// F31 — per-advertiser cross-channel attribution rule.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS attribution_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL,
+    rule_type       TEXT NOT NULL DEFAULT 'komorebi_wins',  -- komorebi_wins | telesale_wins | split
+    window_days     INTEGER NOT NULL DEFAULT 7,
+    notes           TEXT DEFAULT '',
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_attr_rules_adv ON attribution_rules(advertiser_slug);
+`);
+
+// F34 — FX rates, optionally locked to a reconciliation period ('YYYY-MM').
+db.exec(`
+  CREATE TABLE IF NOT EXISTS fx_rates (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_currency         TEXT NOT NULL,
+    to_currency           TEXT NOT NULL,
+    rate                  REAL NOT NULL,
+    locked_at             TEXT DEFAULT (datetime('now')),
+    reconciliation_period TEXT,                              -- 'YYYY-MM' = locked for that period
+    UNIQUE(from_currency, to_currency, reconciliation_period)
+  );
+`);
+
+// F34 — preserve the original-currency amount on each conversion.
+const convColsG10 = db.prepare('PRAGMA table_info(conversions)').all().map(c => c.name);
+if (!convColsG10.includes('original_currency')) db.exec('ALTER TABLE conversions ADD COLUMN original_currency TEXT');
+if (!convColsG10.includes('original_amount'))   db.exec('ALTER TABLE conversions ADD COLUMN original_amount REAL');
+
 // Sessions table — sessions live in affiliate.db (one file, always present), served by
 // better-sqlite3-session-store with this `db` (node:sqlite) as its client. See server.js.
 db.exec(`
