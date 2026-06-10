@@ -400,6 +400,7 @@ function makeRateLimiter(max) {
 const globalLimiter   = makeRateLimiter(RATE_LIMIT_MAX);
 const postbackLimiter = makeRateLimiter(POSTBACK_RATE_LIMIT_MAX); // F19(E) mounted on /postback/*
 const applyLimiter    = makeRateLimiter(10);                      // F19(E) mounted on /marketplace/apply
+const advertiserApplyLimiter = makeRateLimiter(10);              // G7-5 — public /advertiser/apply (10/min/IP)
 
 // Global limiter applies everywhere except /postback/* (those get their own higher limit).
 app.use((req, res, next) => (req.path.startsWith('/postback/') ? next() : globalLimiter(req, res, next)));
@@ -4160,7 +4161,7 @@ app.get('/admin/exchange-rates', requireAdmin, (req, res) => {
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
   res.send(renderExchangeRates({ rates, csrfToken: req.session.csrfToken, flash, error }));
 });
-app.post('/admin/exchange-rates', requireAdmin, (req, res) => {
+app.post('/admin/exchange-rates', requireAdmin, verifyCsrf, (req, res) => {
   const base = (req.body.base || '').trim().toUpperCase().slice(0, 8);
   const rate = parseFloat(req.body.rate);
   if (!base || !(rate > 0)) return res.redirect('/admin/exchange-rates?msg=Currency+code+and+a+positive+rate+are+required&ok=0');
@@ -4180,7 +4181,7 @@ app.get('/admin/advertisers/:slug/branding', requireAdmin, (req, res) => {
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
   res.send(renderBranding({ adv, branding, csrfToken: req.session.csrfToken, flash, error }));
 });
-app.post('/admin/advertisers/:slug/branding', requireAdmin, (req, res) => {
+app.post('/admin/advertisers/:slug/branding', requireAdmin, verifyCsrf, (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
   const logo    = (req.body.logo_url || '').trim().slice(0, 500) || null;
@@ -4674,6 +4675,9 @@ function renderLinkGenerator({ pub, advertisers, campaigns, baseUrl }) {
 // ---------------------------------------------------------------------------
 
 const H   = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Only treat http(s) URLs as safe link targets — anything else (javascript:, data:,
+// relative, etc.) is rendered as plain text to avoid scheme-based XSS.
+const safeUrl = u => /^https?:\/\//i.test(String(u || '')) ? String(u) : null;
 // Server-side CSRF hidden field — rendered directly into the form HTML so it
 // works even when client JS fails. The JS fallback in the admin shell only
 // injects _csrf into forms that don't already have it, so this never doubles up.
@@ -9024,7 +9028,7 @@ app.get('/admin/advertisers/:slug/tiers', requireAdmin, (req, res) => {
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
   res.send(renderTiers({ adv, tiers, csrfToken: req.session.csrfToken, flash, error }));
 });
-app.post('/admin/advertisers/:slug/tiers', requireAdmin, (req, res) => {
+app.post('/admin/advertisers/:slug/tiers', requireAdmin, verifyCsrf, (req, res) => {
   const adv = db.prepare('SELECT slug FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
   const minConv  = parseInt(req.body.min_conversions, 10);
@@ -9038,7 +9042,7 @@ app.post('/admin/advertisers/:slug/tiers', requireAdmin, (req, res) => {
   logAudit('tier.created', 'advertiser', adv.slug, { min_conversions: minConv, payout_rate: rate, currency }, req);
   res.redirect(`/admin/advertisers/${adv.slug}/tiers?msg=Tier+added`);
 });
-app.post('/admin/advertisers/:slug/tiers/:id/delete', requireAdmin, (req, res) => {
+app.post('/admin/advertisers/:slug/tiers/:id/delete', requireAdmin, verifyCsrf, (req, res) => {
   const adv = db.prepare('SELECT slug FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
   db.prepare('DELETE FROM commission_tiers WHERE id = ? AND advertiser_slug = ?').run(req.params.id, adv.slug);
@@ -9047,16 +9051,21 @@ app.post('/admin/advertisers/:slug/tiers/:id/delete', requireAdmin, (req, res) =
 });
 
 // ---- G7-5 advertiser self-onboarding -------------------------------------
-app.get('/advertiser/apply', (req, res) => {
+// Public, unauthenticated — rate-limited to 10/min/IP to curb abuse.
+app.get('/advertiser/apply', advertiserApplyLimiter, (req, res) => {
   res.send(renderAdvertiserApply({ submitted: req.query.submitted === '1' }));
 });
-app.post('/advertiser/apply', (req, res) => {
+app.post('/advertiser/apply', advertiserApplyLimiter, (req, res) => {
   const name    = (req.body.name || '').trim();
   const email   = (req.body.email || '').trim();
   const website = (req.body.website || '').trim();
   const notes   = (req.body.notes || '').trim();
   if (!name || !email) {
     return res.send(renderAdvertiserApply({ error: 'Name and email are required.', values: { name, email, website, notes } }));
+  }
+  // Length caps (the global input-hardening only caps fields at 2000 chars).
+  if (name.length > 200 || email.length > 200 || website.length > 500 || notes.length > 2000) {
+    return res.status(400).send(renderAdvertiserApply({ error: 'Input too long.', values: { name, email, website, notes } }));
   }
   db.prepare('INSERT INTO advertiser_applications (name, email, website, notes) VALUES (?, ?, ?, ?)')
     .run(name, email, website, notes);
@@ -9071,7 +9080,7 @@ app.get('/admin/advertiser-applications', requireAdmin, (req, res) => {
   const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
   res.send(renderAdvertiserApplications({ apps, filter, csrfToken: req.session.csrfToken, flash, error }));
 });
-app.post('/admin/advertiser-applications/:id/approve', requireAdmin, (req, res) => {
+app.post('/admin/advertiser-applications/:id/approve', requireAdmin, verifyCsrf, (req, res) => {
   const a = db.prepare('SELECT * FROM advertiser_applications WHERE id = ?').get(req.params.id);
   if (!a) return res.redirect('/admin/advertiser-applications?msg=Application+not+found&ok=0');
   db.prepare("UPDATE advertiser_applications SET status = 'approved' WHERE id = ?").run(a.id);
@@ -9085,7 +9094,7 @@ app.post('/admin/advertiser-applications/:id/approve', requireAdmin, (req, res) 
   logAudit('advertiser_application.approved', 'application', a.id, { name: a.name, slug }, req);
   res.redirect('/admin/advertiser-applications?msg=Approved+%E2%80%94+advertiser+created');
 });
-app.post('/admin/advertiser-applications/:id/reject', requireAdmin, (req, res) => {
+app.post('/admin/advertiser-applications/:id/reject', requireAdmin, verifyCsrf, (req, res) => {
   const a = db.prepare('SELECT * FROM advertiser_applications WHERE id = ?').get(req.params.id);
   if (!a) return res.redirect('/admin/advertiser-applications?msg=Application+not+found&ok=0');
   db.prepare("UPDATE advertiser_applications SET status = 'rejected' WHERE id = ?").run(a.id);
@@ -9145,7 +9154,7 @@ async function sendWeeklyReports() {
 }
 
 // Admin "run now" trigger (also makes the report observable for tests).
-app.post('/admin/reports/weekly/run', requireAdmin, (req, res) => {
+app.post('/admin/reports/weekly/run', requireAdmin, verifyCsrf, (req, res) => {
   sendWeeklyReports().catch(e => console.error('Weekly report (manual) error:', e.message));
   res.redirect('/admin/settings?msg=Weekly+report+triggered');
 });
@@ -9194,7 +9203,7 @@ function renderAdvertiserApplications({ apps, filter, csrfToken, flash, error })
   const rows = apps.map(a => `<tr>
     <td><strong>${H(a.name)}</strong></td>
     <td>${H(a.email)}</td>
-    <td>${a.website ? `<a href="${H(a.website)}" target="_blank" rel="noopener noreferrer" style="color:#0071e3">${H(a.website.slice(0, 40))}</a>` : '<span style="color:#9ca3af">—</span>'}</td>
+    <td>${a.website ? (safeUrl(a.website) ? `<a href="${H(safeUrl(a.website))}" target="_blank" rel="noopener noreferrer" style="color:#0071e3">${H(a.website.slice(0, 40))}</a>` : H(a.website.slice(0, 40))) : '<span style="color:#9ca3af">—</span>'}</td>
     <td style="max-width:220px;font-size:12px;color:#6e6e73">${H((a.notes || '').slice(0, 120))}</td>
     <td><span class="badge ${a.status === 'approved' ? 'active' : a.status === 'rejected' ? 'rejected' : 'pending'}">${H(a.status)}</span></td>
     <td><small style="color:#86868b">${H((a.created_at || '').slice(0, 16))}</small></td>
