@@ -1564,6 +1564,9 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
       }
       throw err;
     }
+    // F27/F28 — holdback + AppsFlyer id + anti-fraud (gated; no-ops when not configured).
+    let fFlags = [];
+    try { fFlags = applyG9PostInsert({ convId: fConvId, slug, pub, clickId: click_id, event: rawEvent, amount: 0, req }); } catch (e) { console.error('G9 post-insert error:', e.message); }
     // F23 — refresh this cohort's stats (the open's month defines the cohort).
     try {
       const openRow = db.prepare("SELECT received_at FROM conversions WHERE click_id = ? AND advertiser_slug = ? AND event = ? ORDER BY id LIMIT 1").get(click_id, slug, cfg.open_event);
@@ -1573,6 +1576,7 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     const out = { status: fStatus === 'qualified' ? 'qualified' : 'ok', funnel: true, click_id,
       advertiser: slug, publisher: pub, event: rawEvent, value: rawValue, conversion_status: fStatus, id: fConvId };
     if (fReason) out.reason = fReason;
+    if (fFlags && fFlags.length) out.fraud_flags = fFlags;
     logPostback(req, out);
     return res.json(out);
   }
@@ -1708,6 +1712,12 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     }
     throw err;
   }
+
+  // F27/F28 — holdback + AppsFlyer id + anti-fraud (gated; no-ops when not configured).
+  try {
+    const g9 = applyG9PostInsert({ convId: conversionId, slug, pub, clickId: click_id, event, amount, req });
+    if (g9 && g9.length) result.fraud_flags = g9;
+  } catch (e) { console.error('G9 post-insert error:', e.message); }
 
   // Backlog #14 — duplicate click_id across distinct events. Once a click_id has 2+
   // distinct events, flag every conversion for that click_id, preserving any CTIT flag
@@ -3370,10 +3380,12 @@ app.post('/admin/settings', requireAdmin, (req, res) => {
   const mktApprovedOn  = req.body.notify_marketplace_approved === 'on';
   const invoiceOn      = req.body.notify_invoice_ready        === 'on';
   const weeklyOn       = req.body.weekly_report               === 'on';
+  const autoRejectFraud = req.body.auto_reject_fraud          === 'on';
   setSetting('notify_conversion_approved',  convApprovedOn ? 'true' : 'false');
   setSetting('notify_marketplace_approved', mktApprovedOn  ? 'true' : 'false');
   setSetting('notify_invoice_ready',        invoiceOn      ? 'true' : 'false');
   setSetting('weekly_report',               weeklyOn       ? 'true' : 'false');
+  setSetting('auto_reject_fraud',           autoRejectFraud ? 'true' : 'false');
   logAudit('settings.changed', 'settings', null,
     { email_notifications: emailOn, daily_summary: summaryOn,
       webhook_notifications: webhookOn, webhook_daily_summary: webhookSumOn,
@@ -4565,14 +4577,23 @@ function renderCampaignForm({ adv, campaign, csrfToken }) {
   return adminLayout(`Edit Campaign — ${c.name}`, body);
 }
 function renderAdvPublishers({ adv, rows }) {
-  const trs = rows.map(r => `<tr>
-    <td><code>${H(r.publisher)}</code> <a href="/admin/publishers/${encodeURIComponent(r.publisher)}/campaigns" class="btn btn-ghost" style="margin-left:6px">View</a></td>
+  // F26 — KPI badge per publisher (only meaningful for config advertisers).
+  const kpiBadge = (pub) => {
+    const s = kpiStatus(adv.slug, pub);
+    if (!s || s === 'no_data') return s === 'no_data' ? '<span class="badge" style="background:#eee;color:#777">no data</span>' : '';
+    return s === 'ok' ? '<span class="badge active">KPI ok</span>' : '<span class="badge" style="background:#fdecea;color:#c62828">below KPI</span>';
+  };
+  const seen = new Set();
+  const trs = rows.map(r => {
+    const badge = seen.has(r.publisher) ? '' : (seen.add(r.publisher), kpiBadge(r.publisher));
+    return `<tr>
+    <td><code>${H(r.publisher)}</code> ${badge} <a href="/admin/publishers/${encodeURIComponent(r.publisher)}/campaigns" class="btn btn-ghost" style="margin-left:6px">View</a></td>
     <td>${H(r.campaign)}</td>
     <td>${N(r.clicks)}</td>
     <td>${N(r.conversions)}</td>
     <td>${cvr(r.clicks, r.conversions)}</td>
     <td><small style="color:#86868b">${H((r.last_active || '').slice(0, 19))}</small></td>
-  </tr>`).join('');
+  </tr>`; }).join('');
   const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/campaigns" class="hbtn ghost">Campaigns</a>
     <a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}
 <main>
@@ -5135,11 +5156,13 @@ function adminSidebar() {
   ${nav('/admin/advertiser-applications', 'Advertiser Applications', 'advertisers', '/admin/advertiser-applications')}
   <div class="adm-sb-group">REPORTS</div>
   ${nav('/admin/cohort',        'Cohort Stats',      'reports','/admin/cohort')}
+  ${nav('/admin/eqm',           'EQM',               'quality','/admin/eqm')}
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   ${nav('/admin/attribution',   'Attribution',       'reports','/admin/attribution')}
   <div class="adm-sb-group">RISK</div>
   ${nav('/admin/fraud',            'Fraud Review',      'fraud',  '/admin/fraud')}
+  ${nav('/admin/fraud-review',     'Trading Fraud',     'fraud',  '/admin/fraud-review')}
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
@@ -6607,6 +6630,7 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
   const notifMktOn   = getSetting('notify_marketplace_approved') === 'true';
   const notifInvOn   = getSetting('notify_invoice_ready')        === 'true';
   const weeklyOn     = getSetting('weekly_report')              === 'true';
+  const autoRejectFraudOn = getSetting('auto_reject_fraud', 'false') === 'true';
   const gmailOk      = !!(GMAIL_USER && GMAIL_PASS);
   const tgOk         = telegramOk();
   const slOk         = slackOk();
@@ -6713,6 +6737,9 @@ function renderSettingsPage({ flash, csrfToken = '' }) {
         ${toggle('weekly_report', weeklyOn,
           'Weekly reports',
           'Send each active publisher a 7-day summary every Monday 08:00 SGT, plus a platform summary to admin')}
+        ${toggle('auto_reject_fraud', autoRejectFraudOn,
+          'Auto-reject flagged fraud',
+          'Automatically reject conversions flagged by the trading anti-fraud rules (AFID ratio, cycling)')}
         <div style="padding:16px 0">
           <button type="submit" class="btn btn-primary btn-lg">Save Settings</button>
           <span style="font-size:12px;color:#6e6e73;margin-left:12px">Toggles auto-save — clicking a toggle saves immediately</span>
@@ -7692,6 +7719,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
       ${navItem('/publisher/conversions', 'conversions', 'Conversions')}
       ${navItem('/publisher/link-generator', 'link',     'Link Generator')}
       ${navItem('/publisher/payments',    'payments',    'Payments')}
+      ${navItem('/publisher/holdback',    'payments',    'Holdback')}
       ${navItem('/marketplace',           'marketplace', 'Browse Offers')}
       ${navItem('/publisher/marketplace', 'market',      'Marketplace')}
       ${navItem('/publisher/marketplace/my-applications', 'market', 'My Applications')}
@@ -9320,6 +9348,12 @@ function computeCohortStats(advertiserSlug, publisher, cohortMonth) {
       is_matured=excluded.is_matured, computed_at=datetime('now')
   `).run(advertiserSlug, publisher, cohortMonth, opens.length, opensAged7, opensAged30, activeD7, activeD30,
     d7_rate, actual_d30_rate, projected_d30_rate, is_matured);
+  // F25 — keep the per-cohort k calibration in sync with the configured default.
+  db.prepare('UPDATE cohort_stats SET k_factor=? WHERE advertiser_slug=? AND publisher=? AND cohort_month=?')
+    .run(k, advertiserSlug, publisher, cohortMonth);
+
+  // F26 — once a cohort matures, gate the publisher's assignment on its KPI.
+  if (is_matured) { try { checkPublisherKPI(advertiserSlug, publisher); } catch (e) { console.error('KPI check error:', e.message); } }
 
   return { opens: opens.length, opens_aged7: opensAged7, opens_aged30: opensAged30,
     active_by_d7: activeD7, active_by_d30: activeD30, d7_rate, actual_d30_rate, projected_d30_rate, is_matured };
@@ -9336,8 +9370,363 @@ function recomputeAllCohorts() {
       "SELECT DISTINCT publisher, strftime('%Y-%m', received_at) AS m FROM conversions WHERE advertiser_slug=? AND event=?"
     ).all(slug, cfg.open_event);
     for (const c of combos) { computeCohortStats(slug, c.publisher, c.m); n++; }
+    // F25 — after recompute, evaluate Early Quality Monitor for each publisher.
+    const pubs = db.prepare("SELECT DISTINCT publisher FROM cohort_stats WHERE advertiser_slug=?").all(slug);
+    for (const p of pubs) { try { evaluateEQM(slug, p.publisher); } catch (e) { console.error('EQM eval error:', e.message); } }
   }
   return n;
+}
+
+// ===========================================================================
+// Group 9 — EQM (F25), KPI gate (F26), holdback (F27), anti-fraud (F28),
+//   reason tagging + referral dedup (F29). All gated so non-config / non-opted
+//   advertisers behave exactly as before.
+// ===========================================================================
+
+// F27 — holdback rate for an advertiser (null = holdback disabled for this advertiser).
+function holdbackPct(slug) {
+  const raw = getSettingRaw(`holdback_pct:${slug}`);
+  if (raw == null) return null;
+  const n = parseFloat(raw);
+  return (isNaN(n) || n < 0) ? 0.25 : n;
+}
+function getSettingRaw(key) { return db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value ?? null; }
+
+// F28 — record a fraud flag.
+function recordFraud(clickId, pub, slug, flagType, detail, autoReject = 0) {
+  db.prepare('INSERT INTO fraud_flags (click_id, publisher, advertiser_slug, flag_type, detail, auto_reject) VALUES (?,?,?,?,?,?)')
+    .run(clickId || null, pub || null, slug || null, flagType, detail || null, autoReject);
+}
+
+// F27 + F28 — applied after every conversion insert (funnel or CPS). Returns the
+// list of fraud flags raised (may be empty). Pure no-op unless opted in.
+function applyG9PostInsert({ convId, slug, pub, clickId, event, amount, req }) {
+  const cfg = getActiveDef(slug);
+  const hasConfig = !!getRawActiveDef(slug);
+  const flags = [];
+
+  // F28 — AppsFlyer id captured from the postback query (unmasked identifier).
+  const afId = (req.query.af_id || req.query.appsflyer_id || req.query.afid || '').toString().trim() || null;
+  if (afId) db.prepare('UPDATE conversions SET af_id=? WHERE id=?').run(afId, convId);
+
+  // F27 — holdback at ingest (only when holdback_pct:{slug} is set + payout > 0).
+  const pct = holdbackPct(slug);
+  if (pct != null && amount > 0) {
+    const held = Math.round(amount * pct * 100) / 100;
+    const net = Math.round((amount - held) * 100) / 100;
+    db.prepare('UPDATE conversions SET held_amount=?, payout=?, payout_local=? WHERE id=?').run(held, net, net, convId);
+    const month = String(new Date().toISOString()).slice(0, 7);
+    db.prepare('INSERT INTO holdback_events (advertiser_slug, publisher, cohort_month, event_type, amount) VALUES (?,?,?,?,?)')
+      .run(slug, pub, month, 'hold', held);
+  }
+
+  // F28 #1 — AFID ratio: too many accounts per distinct af_id (30d window).
+  if (afId) {
+    const s = db.prepare("SELECT COUNT(*) AS accounts, COUNT(DISTINCT af_id) AS afids FROM conversions WHERE publisher=? AND af_id IS NOT NULL AND received_at >= datetime('now','-30 days')").get(pub);
+    if (s.afids > 0 && s.accounts / s.afids > 8) { recordFraud(clickId, pub, slug, 'afid_ratio_breach', `accounts=${s.accounts} afids=${s.afids}`); flags.push('afid_ratio_breach'); }
+  }
+
+  // F28 #2 — cycling: deposit → small trade (< min_value×2) → withdraw within window.
+  if (hasConfig && event === cfg.withdraw_event) {
+    const dep   = db.prepare('SELECT received_at FROM conversions WHERE click_id=? AND event=? ORDER BY id LIMIT 1').get(clickId, cfg.deposit_event);
+    const trade = db.prepare('SELECT raw_value FROM conversions WHERE click_id=? AND event=? ORDER BY id LIMIT 1').get(clickId, cfg.active_event);
+    if (dep && trade && Number(trade.raw_value || 0) < Number(cfg.min_value) * 2) {
+      recordFraud(clickId, pub, slug, 'cycling', 'deposit→small_trade→withdraw');
+      db.prepare("UPDATE conversions SET status='pending', reason='cycling_hold' WHERE id=?").run(convId);
+      flags.push('cycling');
+    }
+  }
+
+  // F28 — optional auto-reject of flagged conversions.
+  if (flags.length && getSetting('auto_reject_fraud', 'false') === 'true') {
+    db.prepare("UPDATE conversions SET status='rejected', reason='fraud_auto_reject' WHERE id=?").run(convId);
+    db.prepare("UPDATE fraud_flags SET auto_reject=1 WHERE click_id=? AND advertiser_slug=?").run(clickId, slug);
+  }
+  return flags;
+}
+
+// F25 — Early Quality Monitor: RAG status from the latest cohort's projected D30.
+function computeEQM(slug, pub) {
+  const cfg = getActiveDef(slug);
+  const gate = Number(cfg.gate_pct) || 0;
+  const c = db.prepare('SELECT * FROM cohort_stats WHERE advertiser_slug=? AND publisher=? ORDER BY cohort_month DESC LIMIT 1').get(slug, pub);
+  if (!c) return null;
+  const k = Number(c.k_factor) > 0 ? Number(c.k_factor) : (Number(cfg.k_default) || 0.70);
+  const projected = Math.max(0, Math.min(1, k > 0 ? c.d7_rate / k : 0));
+  const projPct = projected * 100;
+  const rag = projPct >= gate ? 'green' : projPct >= gate * 0.7 ? 'amber' : 'red';
+  return { cohort: c, projected, projPct, gate, rag, opens_aged7: c.opens_aged7, min_sample: Number(cfg.min_sample) || 30, d7_rate: c.d7_rate };
+}
+function evaluateEQM(slug, pub) {
+  const eqm = computeEQM(slug, pub);
+  if (!eqm) return null;
+  const key = `eqm_red_days:${slug}:${pub}`;
+  let redDays = parseInt(getSetting(key, '0'), 10) || 0;
+  redDays = eqm.rag === 'red' ? redDays + 1 : 0;
+  setSetting(key, String(redDays));
+  if (eqm.rag === 'red' && redDays >= 2 && eqm.opens_aged7 >= eqm.min_sample) {
+    sendTelegram(`\u{1F534} EQM: <b>${pub}</b> @ ${slug} Red ${redDays}d — projected ${eqm.projPct.toFixed(1)}% &lt; gate ${eqm.gate}%`).catch(() => {});
+    if (getSetting(`auto_throttle:${slug}`, 'false') === 'true') {
+      const p = db.prepare('SELECT id, status FROM publishers WHERE username=?').get(pub);
+      if (p && p.status === 'active') {
+        db.prepare("UPDATE publishers SET status='paused' WHERE id=?").run(p.id);
+        logAudit('eqm.auto_throttle', 'publisher', pub, { advertiser: slug, red_days: redDays, projected_pct: eqm.projPct }, 'eqm');
+      }
+    }
+  }
+  return { rag: eqm.rag, redDays };
+}
+
+// F26 — KPI gate, run when a cohort matures. Pauses or removes the assignment.
+function checkPublisherKPI(slug, pub) {
+  if (!getRawActiveDef(slug)) return null;
+  const pubRow = db.prepare('SELECT id FROM publishers WHERE username=?').get(pub);
+  const advRow = db.prepare('SELECT id FROM advertisers WHERE slug=?').get(slug);
+  if (!pubRow || !advRow) return null;
+  const assigned = db.prepare('SELECT 1 FROM publisher_advertisers WHERE publisher_id=? AND advertiser_id=?').get(pubRow.id, advRow.id);
+  if (!assigned) return null; // only gate real assignments
+  const cfg = getActiveDef(slug);
+  const kpi = Number(cfg.pub_kpi_pct) || 0;
+  const gate = Number(cfg.gate_pct) || 0;
+  const matured = db.prepare('SELECT actual_d30_rate FROM cohort_stats WHERE advertiser_slug=? AND publisher=? AND is_matured=1 ORDER BY cohort_month DESC LIMIT 2').all(slug, pub);
+  if (matured.length === 0) return null;
+  if (matured[0].actual_d30_rate * 100 >= kpi) return 'ok';
+  // remove when the two most-recent matured cohorts are both below gate
+  if (matured.length >= 2 && matured[0].actual_d30_rate * 100 < gate && matured[1].actual_d30_rate * 100 < gate) {
+    db.prepare('DELETE FROM publisher_advertisers WHERE publisher_id=? AND advertiser_id=?').run(pubRow.id, advRow.id);
+    logAudit('kpi.assignment_removed', 'publisher', pub, { advertiser: slug, reason: '2_months_below_gate' }, 'kpi');
+    return 'removed';
+  }
+  // otherwise pause the assignment (expire it as of yesterday)
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  db.prepare('UPDATE publisher_advertisers SET valid_until=? WHERE publisher_id=? AND advertiser_id=?').run(yesterday, pubRow.id, advRow.id);
+  logAudit('kpi.assignment_paused', 'publisher', pub, { advertiser: slug, latest_rate_pct: matured[0].actual_d30_rate * 100 }, 'kpi');
+  return 'paused';
+}
+function kpiStatus(slug, pub) {
+  if (!getRawActiveDef(slug)) return null;
+  const cfg = getActiveDef(slug);
+  const m = db.prepare('SELECT actual_d30_rate FROM cohort_stats WHERE advertiser_slug=? AND publisher=? AND is_matured=1 ORDER BY cohort_month DESC LIMIT 1').get(slug, pub);
+  if (!m) return 'no_data';
+  return (m.actual_d30_rate * 100 >= (Number(cfg.pub_kpi_pct) || 0)) ? 'ok' : 'below_kpi';
+}
+
+// F27 — release or claw back held amounts for a cohort.
+function processHoldback(slug, pub, cohortMonth) {
+  const cfg = getActiveDef(slug);
+  const c = db.prepare('SELECT * FROM cohort_stats WHERE advertiser_slug=? AND publisher=? AND cohort_month=?').get(slug, pub, cohortMonth);
+  const held = db.prepare("SELECT id, held_amount FROM conversions WHERE advertiser_slug=? AND publisher=? AND held_amount>0 AND holdback_released=0 AND strftime('%Y-%m',received_at)=?").all(slug, pub, cohortMonth);
+  if (held.length === 0) return null;
+  const ratePct = c ? c.actual_d30_rate * 100 : 0;
+  const kpi = Number(cfg.pub_kpi_pct) || 0;
+  let total = 0;
+  if (ratePct >= kpi) {
+    for (const h of held) { db.prepare('UPDATE conversions SET payout=payout+held_amount, payout_local=payout_local+held_amount, holdback_released=1 WHERE id=?').run(h.id); total += h.held_amount; }
+    db.prepare('INSERT INTO holdback_events (advertiser_slug, publisher, cohort_month, event_type, amount) VALUES (?,?,?,?,?)').run(slug, pub, cohortMonth, 'release', total);
+    return { action: 'release', amount: total };
+  }
+  if (c && c.is_matured) {
+    for (const h of held) { db.prepare("UPDATE conversions SET holdback_released=1, status='rejected', reason='holdback_clawback' WHERE id=?").run(h.id); total += h.held_amount; }
+    db.prepare('INSERT INTO holdback_events (advertiser_slug, publisher, cohort_month, event_type, amount) VALUES (?,?,?,?,?)').run(slug, pub, cohortMonth, 'clawback', total);
+    return { action: 'clawback', amount: total };
+  }
+  return null;
+}
+function processAdvertiserHoldback(slug) {
+  const combos = db.prepare("SELECT DISTINCT publisher, strftime('%Y-%m',received_at) AS m FROM conversions WHERE advertiser_slug=? AND held_amount>0 AND holdback_released=0").all(slug);
+  let n = 0; for (const c of combos) { if (processHoldback(slug, c.publisher, c.m)) n++; } return n;
+}
+
+// F29 — referral-list match + reconciliation reason tagging.
+function referralHas(slug, identifier) {
+  return !!db.prepare('SELECT 1 FROM advertiser_referral_lists WHERE advertiser_slug=? AND identifier=?').get(slug, identifier);
+}
+function reasonForClick(slug, clickId) {
+  const cfg = getActiveDef(slug);
+  const convs = db.prepare('SELECT * FROM conversions WHERE advertiser_slug=? AND click_id=?').all(slug, clickId);
+  if (convs.length === 0) return 'no_event';
+  if (convs.some(c => c.status === 'approved')) return 'duplicate';
+  for (const c of convs) for (const id of [c.user_id, c.af_id].filter(Boolean)) if (referralHas(slug, id)) return 'referral_overlap';
+  const hasOpen = convs.some(c => c.event === cfg.open_event);
+  const hasActive = convs.some(c => c.event === cfg.active_event && c.status === 'qualified');
+  if (hasOpen && !hasActive) return 'not_activated';
+  return 'ok';
+}
+function reasonBreakdown(slug) {
+  const clicks = db.prepare('SELECT click_id FROM clicks WHERE advertiser_slug=?').all(slug);
+  const counts = { duplicate: 0, referral_overlap: 0, not_activated: 0, no_event: 0, ok: 0 };
+  const rows = [];
+  for (const c of clicks) { const r = reasonForClick(slug, c.click_id); counts[r] = (counts[r] || 0) + 1; rows.push({ click_id: c.click_id, reason: r }); }
+  return { counts, rows };
+}
+function parseReferralInput(text, type) {
+  const ids = String(text || '').split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+  const ins = db.prepare('INSERT OR IGNORE INTO advertiser_referral_lists (advertiser_slug, identifier, identifier_type) VALUES (?,?,?)');
+  return { ids, ins };
+}
+
+// ---- F25 EQM admin UI ----------------------------------------------------
+app.get('/admin/eqm', requireAdmin, (req, res) => {
+  const configured = db.prepare("SELECT key FROM settings WHERE key LIKE 'active_def:%'").all().map(r => r.key.slice('active_def:'.length));
+  const rows = [];
+  for (const slug of configured) {
+    const pubs = db.prepare('SELECT DISTINCT publisher FROM cohort_stats WHERE advertiser_slug=?').all(slug);
+    for (const p of pubs) {
+      const e = computeEQM(slug, p.publisher);
+      if (e) rows.push({ slug, publisher: p.publisher, cohort: e.cohort.cohort_month, d7: e.d7_rate, proj: e.projPct, gate: e.gate, rag: e.rag,
+        auto_throttle: getSetting(`auto_throttle:${slug}`, 'false') === 'true' });
+    }
+  }
+  res.send(renderEQM({ rows, csrfToken: req.session.csrfToken, flash: req.query.msg ? { type: 'success', text: req.query.msg } : null }));
+});
+app.post('/admin/advertisers/:slug/auto-throttle', requireAdmin, verifyCsrf, (req, res) => {
+  const slug = req.params.slug;
+  const on = req.body.auto_throttle === 'on' || req.body.value === 'true';
+  setSetting(`auto_throttle:${slug}`, on ? 'true' : 'false');
+  logAudit('eqm.auto_throttle_setting', 'advertiser', slug, { enabled: on }, req);
+  res.redirect('/admin/eqm?msg=' + encodeURIComponent(`auto_throttle ${on ? 'enabled' : 'disabled'} for ${slug}`));
+});
+
+// ---- F27 holdback process trigger ----------------------------------------
+app.post('/admin/advertisers/:slug/holdback/process', requireAdmin, verifyCsrf, (req, res) => {
+  const n = processAdvertiserHoldback(req.params.slug);
+  res.redirect(`/admin/advertisers/${req.params.slug}/payout-preview?msg=Processed+${n}+cohort(s)`);
+});
+
+// ---- F28 fraud review (filtered) -----------------------------------------
+app.get('/admin/fraud-review', requireAdmin, (req, res) => {
+  const filter = ['afid_ratio_breach', 'cycling', 'duplicate'].includes(req.query.flag) ? req.query.flag : 'all';
+  const rows = filter === 'all'
+    ? db.prepare('SELECT * FROM fraud_flags ORDER BY id DESC LIMIT 200').all()
+    : db.prepare('SELECT * FROM fraud_flags WHERE flag_type=? ORDER BY id DESC LIMIT 200').all(filter);
+  res.send(renderFraudReview({ rows, filter }));
+});
+
+// ---- F29 referral list + reason breakdown --------------------------------
+app.get('/admin/advertisers/:slug/referral-list', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const ids = db.prepare('SELECT * FROM advertiser_referral_lists WHERE advertiser_slug=? ORDER BY id DESC LIMIT 500').all(adv.slug);
+  const flash = req.query.msg ? { type: 'success', text: req.query.msg } : null;
+  res.send(renderReferralList({ adv, ids, csrfToken: req.session.csrfToken, flash }));
+});
+app.post('/admin/advertisers/:slug/referral-list', requireAdmin, verifyCsrf, (req, res) => {
+  const adv = db.prepare('SELECT slug FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const type = ['email', 'phone', 'device_id'].includes(req.body.identifier_type) ? req.body.identifier_type : 'email';
+  const { ids, ins } = parseReferralInput(req.body.identifiers, type);
+  let added = 0; for (const id of ids) added += ins.run(adv.slug, id, type).changes;
+  logAudit('referral_list.uploaded', 'advertiser', adv.slug, { added, type }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/referral-list?msg=Added+${added}+identifier(s)`);
+});
+app.post('/admin/advertisers/:slug/referral-list/clear', requireAdmin, verifyCsrf, (req, res) => {
+  db.prepare('DELETE FROM advertiser_referral_lists WHERE advertiser_slug=?').run(req.params.slug);
+  logAudit('referral_list.cleared', 'advertiser', req.params.slug, {}, req);
+  res.redirect(`/admin/advertisers/${req.params.slug}/referral-list?msg=Referral+list+cleared`);
+});
+app.get('/admin/advertisers/:slug/reason-breakdown', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug=?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const { counts, rows } = reasonBreakdown(adv.slug);
+  res.send(renderReasonBreakdown({ adv, counts, rows }));
+});
+
+// ---- F27 publisher portal holdback section -------------------------------
+app.get('/publisher/holdback', requirePublisher, (req, res) => {
+  const pub = req.publisher;
+  const rows = db.prepare(`
+    SELECT advertiser_slug, strftime('%Y-%m',received_at) AS cohort_month,
+           COALESCE(SUM(held_amount),0) AS held,
+           COALESCE(SUM(CASE WHEN holdback_released=1 THEN held_amount ELSE 0 END),0) AS released
+    FROM conversions WHERE publisher=? AND held_amount>0
+    GROUP BY advertiser_slug, cohort_month ORDER BY cohort_month DESC
+  `).all(pub.username);
+  res.send(renderPublisherHoldback({ pub, rows }));
+});
+
+// ---- Group 9 render helpers ----------------------------------------------
+function ragBadge(rag) {
+  const map = { green: ['#e7f6ec', '#1e7e34', '🟢 Green'], amber: ['#fff4e0', '#a8730a', '🟡 Amber'], red: ['#fdecea', '#c62828', '🔴 Red'] };
+  const [bg, fg, label] = map[rag] || ['#eee', '#555', rag];
+  return `<span class="badge" style="background:${bg};color:${fg}">${label}</span>`;
+}
+function renderEQM({ rows, csrfToken, flash }) {
+  const trs = rows.map(r => `<tr>
+    <td><code>${H(r.slug)}</code></td><td><code>${H(r.publisher)}</code></td><td>${H(r.cohort)}</td>
+    <td>${(r.d7 * 100).toFixed(1)}%</td><td><strong>${r.proj.toFixed(1)}%</strong></td><td>${r.gate}%</td>
+    <td>${ragBadge(r.rag)}</td>
+    <td><form method="POST" action="/admin/advertisers/${H(r.slug)}/auto-throttle" style="display:inline">${csrfField(csrfToken)}
+      <input type="hidden" name="value" value="${r.auto_throttle ? 'false' : 'true'}">
+      <button class="btn ${r.auto_throttle ? 'btn-warn' : 'btn-ghost'}">${r.auto_throttle ? 'Throttle ON' : 'Throttle OFF'}</button></form></td>
+  </tr>`).join('');
+  const body = `${adminHeader()}
+<main>${flashHtml(flash)}
+<section>
+  <div class="sh"><h2>Early Quality Monitor</h2><span class="meta">${rows.length} publisher cohort(s)</span></div>
+  <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">Projected D30 = D7 rate ÷ k. 🟢 ≥ gate · 🟡 ≥ 70% of gate · 🔴 below. Auto-throttle pauses a publisher after 2 consecutive Red evaluations.</p>
+  ${rows.length === 0 ? '<div class="empty">No cohort data yet.</div>' : `<table>
+    <thead><tr><th>Advertiser</th><th>Publisher</th><th>Cohort</th><th>D7 rate</th><th>Projected D30</th><th>Gate</th><th>RAG</th><th>Auto-throttle</th></tr></thead>
+    <tbody>${trs}</tbody></table>`}
+</section></main>`;
+  return adminLayout('EQM', body);
+}
+function renderFraudReview({ rows, filter }) {
+  const tab = (k, l) => `<a href="/admin/fraud-review${k === 'all' ? '' : `?flag=${k}`}" class="btn ${filter === k ? 'btn-primary' : 'btn-ghost'}">${l}</a>`;
+  const trs = rows.map(r => `<tr><td>${r.id}</td><td><code class="xs">${H(r.click_id || '')}</code></td><td><code>${H(r.publisher || '')}</code></td>
+    <td><code>${H(r.advertiser_slug || '')}</code></td><td><span class="badge pending">${H(r.flag_type)}</span></td>
+    <td style="font-size:12px;color:#6e6e73">${H(r.detail || '')}</td><td>${r.auto_reject ? 'yes' : ''}</td><td><small>${H((r.created_at || '').slice(0, 16))}</small></td></tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+<section>
+  <div class="sh"><h2>Fraud Review</h2><span class="meta">${rows.length} flag(s)</span></div>
+  <div style="display:flex;gap:6px;margin-bottom:14px">${tab('all', 'All')}${tab('afid_ratio_breach', 'AFID ratio')}${tab('cycling', 'Cycling')}${tab('duplicate', 'Duplicate')}</div>
+  ${rows.length === 0 ? '<div class="empty">No fraud flags.</div>' : `<table>
+    <thead><tr><th>#</th><th>Click</th><th>Publisher</th><th>Advertiser</th><th>Flag</th><th>Detail</th><th>Auto-reject</th><th>When</th></tr></thead>
+    <tbody>${trs}</tbody></table>`}
+</section></main>`;
+  return adminLayout('Fraud Review', body);
+}
+function renderReferralList({ adv, ids, csrfToken, flash }) {
+  const trs = ids.map(r => `<tr><td><code>${H(r.identifier)}</code></td><td>${H(r.identifier_type)}</td><td><small>${H((r.uploaded_at || '').slice(0, 16))}</small></td></tr>`).join('');
+  const body = `${adminHeader()}
+<main>${flashHtml(flash)}
+<div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
+<section>
+  <div class="sh"><h2>Referral List — ${H(adv.name)}</h2><span class="meta">${ids.length} identifier(s)</span></div>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/referral-list" style="margin-bottom:14px">${csrfField(csrfToken)}
+    <label style="font-size:12px;font-weight:600">Identifier type
+      <select name="identifier_type" style="margin-left:6px"><option value="email">email</option><option value="phone">phone</option><option value="device_id">device_id</option></select></label>
+    <textarea name="identifiers" placeholder="One per line, or comma-separated" style="display:block;width:100%;height:120px;margin-top:8px;padding:10px;border:1px solid #d2d2d7;border-radius:8px;font-family:ui-monospace,monospace;font-size:12px"></textarea>
+    <div style="margin-top:10px"><button class="btn btn-primary">Upload</button>
+      <button formaction="/admin/advertisers/${H(adv.slug)}/referral-list/clear" class="btn btn-danger" data-confirm="Clear the whole referral list?">Clear all</button></div>
+  </form>
+  ${ids.length === 0 ? '<div class="empty">No identifiers yet.</div>' : `<table><thead><tr><th>Identifier</th><th>Type</th><th>Uploaded</th></tr></thead><tbody>${trs}</tbody></table>`}
+</section></main>`;
+  return adminLayout(`Referral List — ${adv.name}`, body);
+}
+function renderReasonBreakdown({ adv, counts, rows }) {
+  const order = ['duplicate', 'referral_overlap', 'not_activated', 'no_event', 'ok'];
+  const cards = order.map(k => `<div class="card"><div class="lbl">${H(k)}</div><div class="val">${N(counts[k] || 0)}</div></div>`).join('');
+  const trs = rows.slice(0, 300).map(r => `<tr><td><code class="xs">${H(r.click_id)}</code></td><td><span class="badge ${r.reason === 'ok' ? 'active' : 'pending'}">${H(r.reason)}</span></td></tr>`).join('');
+  const body = `${adminHeader()}
+<main>
+<div style="margin-bottom:14px"><a href="/admin/advertisers/${H(adv.slug)}/referral-list" style="font-size:13px;color:#0071e3">Referral List</a></div>
+<section>
+  <div class="sh"><h2>Reject Reason Breakdown — ${H(adv.name)}</h2></div>
+  <div class="cards" style="margin-bottom:14px">${cards}</div>
+  ${rows.length === 0 ? '<div class="empty">No clicks yet.</div>' : `<table><thead><tr><th>Click</th><th>Reason</th></tr></thead><tbody>${trs}</tbody></table>`}
+</section></main>`;
+  return adminLayout(`Reason Breakdown — ${adv.name}`, body);
+}
+function renderPublisherHoldback({ pub, rows }) {
+  const trs = rows.map(r => `<tr><td>${H(r.advertiser_slug)}</td><td>${H(r.cohort_month)}</td>
+    <td>${fmtMoney(r.held, 'VND')}</td><td>${fmtMoney(r.released, 'VND')}</td><td>${fmtMoney(r.held - r.released, 'VND')}</td></tr>`).join('');
+  const body = `<main>
+<section>
+  <div class="sh"><h2>Holdback</h2><span class="meta">withheld vs released, per cohort</span></div>
+  ${rows.length === 0 ? '<div class="empty">No holdback on your account.</div>' : `<table><thead><tr><th>Advertiser</th><th>Cohort</th><th>Held</th><th>Released</th><th>Outstanding</th></tr></thead><tbody>${trs}</tbody></table>`}
+</section></main>`;
+  return pubLayout(`${pub.username} — Holdback`, body, pub, 'holdback');
 }
 
 // F24 — phased + tiered payout engine.
@@ -9424,7 +9813,7 @@ app.get('/admin/advertisers/:slug/payout-preview', requireAdmin, (req, res) => {
     const payout = computePhasedPayout(adv.slug, c.publisher, null, `${c.cohort_month}-01`);
     return { ...c, ...payout };
   });
-  res.send(renderPayoutPreview({ adv, rows, hasConfig: !!getRawActiveDef(adv.slug) }));
+  res.send(renderPayoutPreview({ adv, rows, hasConfig: !!getRawActiveDef(adv.slug), csrfToken: req.session.csrfToken }));
 });
 
 // Daily cohort recompute — 02:00 UTC.
@@ -9480,8 +9869,15 @@ ${flashHtml(flash)}
   return adminLayout('Cohort Stats', body);
 }
 
-function renderPayoutPreview({ adv, rows, hasConfig }) {
+function renderPayoutPreview({ adv, rows, hasConfig, csrfToken = '' }) {
   const fmt = (v, cur) => fmtCur(v, cur || 'VND');
+  // F27 — holdback summary for this advertiser.
+  const hb = db.prepare(`SELECT
+      COALESCE(SUM(held_amount),0) AS held,
+      COALESCE(SUM(CASE WHEN holdback_released=1 THEN held_amount ELSE 0 END),0) AS released
+    FROM conversions WHERE advertiser_slug=? AND held_amount>0`).get(adv.slug) || { held: 0, released: 0 };
+  const hbEvents = db.prepare('SELECT event_type, COALESCE(SUM(amount),0) AS amt FROM holdback_events WHERE advertiser_slug=? GROUP BY event_type').all(adv.slug);
+  const hbMap = Object.fromEntries(hbEvents.map(e => [e.event_type, e.amt]));
   const trs = rows.map(r => `<tr data-cohort="${H(r.cohort_month)}" data-publisher="${H(r.publisher)}" data-total="${r.total}">
     <td><code>${H(r.publisher)}</code></td>
     <td>${H(r.cohort_month)}</td>
@@ -9502,6 +9898,17 @@ function renderPayoutPreview({ adv, rows, hasConfig }) {
   ${rows.length === 0 ? '<div class="empty">No cohorts to preview yet.</div>' : `<table>
     <thead><tr><th>Publisher</th><th>Cohort</th><th>Phase</th><th>Base/open</th><th>Actual D30</th><th>Bonus/active</th><th>Active</th><th>Total</th></tr></thead>
     <tbody>${trs}</tbody></table>`}
+</section>
+<section>
+  <div class="sh"><h2>Holdback Summary</h2></div>
+  <div class="cards" style="margin-bottom:12px" data-holdback>
+    <div class="card"><div class="lbl">Total held</div><div class="val" data-held>${fmt(hb.held, adv.currency)}</div></div>
+    <div class="card"><div class="lbl">Released</div><div class="val">${fmt(hbMap.release || 0, adv.currency)}</div></div>
+    <div class="card"><div class="lbl">Clawed back</div><div class="val">${fmt(hbMap.clawback || 0, adv.currency)}</div></div>
+    <div class="card"><div class="lbl">Outstanding</div><div class="val">${fmt(hb.held - hb.released, adv.currency)}</div></div>
+  </div>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/holdback/process">${csrfField(csrfToken)}
+    <button class="btn btn-primary">Process holdback (release / clawback)</button></form>
 </section>
 </main>`;
   return adminLayout(`Payout Preview — ${adv.name}`, body);

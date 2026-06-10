@@ -834,6 +834,66 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_cohort_adv ON cohort_stats(advertiser_slug, cohort_month);
 `);
 
+// ===========================================================================
+// Group 9 — Sprint 2 P1: EQM (F25), publisher KPI gate (F26), holdback/clawback
+//   (F27), trading anti-fraud (F28), reconciliation reason tagging + referral
+//   dedup (F29). Builds on the Group 8 cohort engine.
+// ===========================================================================
+
+// F25 — per-cohort k calibration factor (defaults to the config k_default).
+const cohortColsG9 = db.prepare('PRAGMA table_info(cohort_stats)').all().map(c => c.name);
+if (!cohortColsG9.includes('k_factor')) db.exec('ALTER TABLE cohort_stats ADD COLUMN k_factor REAL DEFAULT 0.70');
+
+// F27 — holdback amount withheld at ingest + a released flag. F28 — AppsFlyer id.
+const convColsG9 = db.prepare('PRAGMA table_info(conversions)').all().map(c => c.name);
+if (!convColsG9.includes('held_amount'))       db.exec('ALTER TABLE conversions ADD COLUMN held_amount REAL DEFAULT 0');
+if (!convColsG9.includes('holdback_released')) db.exec('ALTER TABLE conversions ADD COLUMN holdback_released INTEGER DEFAULT 0');
+if (!convColsG9.includes('af_id'))             db.exec('ALTER TABLE conversions ADD COLUMN af_id TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_conv_afid ON conversions(publisher, af_id)');
+
+// F27 — holdback ledger (hold / release / clawback).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS holdback_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL,
+    publisher       TEXT NOT NULL,
+    cohort_month    TEXT NOT NULL,
+    event_type      TEXT NOT NULL,        -- 'hold' | 'release' | 'clawback'
+    amount          REAL NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_holdback_adv ON holdback_events(advertiser_slug, publisher, cohort_month);
+`);
+
+// F28 — fraud flag ledger.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS fraud_flags (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    click_id        TEXT,
+    publisher       TEXT,
+    advertiser_slug TEXT,
+    flag_type       TEXT NOT NULL,        -- 'afid_ratio_breach' | 'cycling' | 'duplicate'
+    detail          TEXT,
+    auto_reject     INTEGER DEFAULT 0,
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_fraud_flags ON fraud_flags(advertiser_slug, flag_type);
+  CREATE INDEX IF NOT EXISTS idx_fraud_flags_click ON fraud_flags(click_id);
+`);
+
+// F29 — per-advertiser referral identifier lists (for referral-overlap dedup).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS advertiser_referral_lists (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug TEXT NOT NULL,
+    identifier      TEXT NOT NULL,
+    identifier_type TEXT NOT NULL DEFAULT 'email',
+    uploaded_at     TEXT DEFAULT (datetime('now')),
+    UNIQUE(advertiser_slug, identifier)
+  );
+  CREATE INDEX IF NOT EXISTS idx_referral_adv ON advertiser_referral_lists(advertiser_slug);
+`);
+
 // Sessions table — sessions live in affiliate.db (one file, always present), served by
 // better-sqlite3-session-store with this `db` (node:sqlite) as its client. See server.js.
 db.exec(`
