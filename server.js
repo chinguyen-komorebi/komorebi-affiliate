@@ -9153,6 +9153,31 @@ async function sendWeeklyReports() {
   return { publisherEmails, platform: tot };
 }
 
+// Weekly reports page — manual "Run Now" trigger.
+app.get('/admin/reports/weekly/run', requireAdmin, (req, res) => {
+  const flash = req.query.msg ? { type: req.query.ok === '0' ? 'error' : 'success', text: req.query.msg } : null;
+  const enabled = getSetting('weekly_report', 'true') === 'true';
+  const body = `${adminHeader()}
+<main>
+${flashHtml(flash)}
+<section style="max-width:600px">
+  <div class="sh"><h2>Weekly Reports</h2></div>
+  <div style="padding:16px 20px">
+    <p style="font-size:14px;color:#3a3a3c;margin:0 0 14px">Manually trigger the weekly report email to all active publishers + admin summary.</p>
+    <p style="font-size:12px;color:#6e6e73;margin:0 0 18px">
+      Scheduled automatically every Monday 08:00 SGT (01:00 UTC).
+      Scheduled sending is currently <strong>${enabled ? 'enabled' : 'disabled'}</strong> —
+      change this on the <a href="/admin/settings" style="color:#0071e3">Settings</a> page.
+    </p>
+    <form method="POST" action="/admin/reports/weekly/run">${csrfField(req.session.csrfToken)}
+      <button type="submit" class="btn btn-primary btn-lg">Run Now</button>
+    </form>
+  </div>
+</section>
+</main>`;
+  res.send(adminLayout('Weekly Reports', body));
+});
+
 // Admin "run now" trigger (also makes the report observable for tests).
 app.post('/admin/reports/weekly/run', requireAdmin, verifyCsrf, (req, res) => {
   sendWeeklyReports().catch(e => console.error('Weekly report (manual) error:', e.message));
