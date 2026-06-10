@@ -23,3 +23,5 @@ node_modules/
 # Scratch
 /tmp
 ecosystem.config.js
+.DS_Store
+.claude/
