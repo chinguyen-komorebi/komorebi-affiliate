@@ -9877,6 +9877,10 @@ app.post('/admin/fx-rates', requireAdmin, verifyCsrf, (req, res) => {
   const rate = parseFloat(req.body.rate);
   const period = (req.body.reconciliation_period || '').trim() || null;
   if (!from || !to || isNaN(rate) || rate <= 0) return res.redirect('/admin/fx-rates?msg=Valid+currencies+and+rate+required&ok=0');
+  if (period) {
+    const existing = db.prepare('SELECT id FROM fx_rates WHERE from_currency=? AND to_currency=? AND reconciliation_period=?').get(from, to, period);
+    if (existing) return res.redirect('/admin/fx-rates?msg=' + encodeURIComponent('Period ' + period + ' already locked for ' + from + String.fromCharCode(8594) + to + '; cannot overwrite') + '&ok=0');
+  }
   db.prepare('INSERT OR REPLACE INTO fx_rates (from_currency, to_currency, rate, reconciliation_period, locked_at) VALUES (?,?,?,?,datetime(\'now\'))').run(from, to, rate, period);
   logAudit('fx_rate.set', 'fx', `${from}->${to}`, { rate, period }, req);
   res.redirect('/admin/fx-rates?msg=' + encodeURIComponent(`Rate ${from}→${to} ${period ? 'locked for ' + period : 'set'}`));
