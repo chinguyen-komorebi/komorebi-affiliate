@@ -740,6 +740,66 @@ db.exec(`
 const mmpLogCols = db.prepare('PRAGMA table_info(mmp_sync_log)').all().map(c => c.name);
 if (!mmpLogCols.includes('flagged')) db.exec('ALTER TABLE mmp_sync_log ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0');
 
+// ===========================================================================
+// Group 7 — Operational growth: commission tiers, publisher notifications,
+//   advertiser self-onboarding, scheduled weekly reports.
+// ===========================================================================
+
+// G7-3 — per-advertiser commission tiers. The highest tier a publisher has
+// reached (by their approved-conversion count with that advertiser) sets the
+// flat payout rate, overriding the advertiser's default payout_amount.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS commission_tiers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug  TEXT NOT NULL,
+    min_conversions  INTEGER NOT NULL,
+    payout_rate      REAL NOT NULL,
+    currency         TEXT NOT NULL DEFAULT 'USD'
+  );
+  CREATE INDEX IF NOT EXISTS idx_tiers_adv ON commission_tiers(advertiser_slug, min_conversions);
+`);
+
+// G7-4 — publisher notification outbox. One row per dispatched publisher email
+// (gated by the per-type Settings toggles). Persisted so delivery is observable
+// independent of SMTP, and doubles as a notification history.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS publisher_notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher   TEXT NOT NULL,
+    email       TEXT NOT NULL DEFAULT '',
+    type        TEXT NOT NULL,
+    subject     TEXT NOT NULL DEFAULT '',
+    sent        INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pubnotif_pub  ON publisher_notifications(publisher, type);
+`);
+
+// G7-5 — advertiser self-onboarding applications (public submissions, admin-decided).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS advertiser_applications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    email       TEXT NOT NULL,
+    website     TEXT NOT NULL DEFAULT '',
+    notes       TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_advapps_status ON advertiser_applications(status);
+`);
+
+// G7-4 / G7-6 — notification toggles (default on). INSERT OR IGNORE never clobbers
+// an admin's saved preference.
+for (const [key, value] of [
+  ['notify_conversion_approved',  'true'],
+  ['notify_marketplace_approved', 'true'],
+  ['notify_invoice_ready',        'true'],
+  ['weekly_report',               'true'],
+]) {
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run(key, value);
+}
+
 // Sessions table — sessions live in affiliate.db (one file, always present), served by
 // better-sqlite3-session-store with this `db` (node:sqlite) as its client. See server.js.
 db.exec(`
