@@ -122,11 +122,15 @@ app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 app.use(express.json({ limit: '20kb' })); // Group 6 — JSON bodies for bulk conversion actions
 
 // F19(F) — input hardening on POST bodies: strip null bytes, reject oversized fields.
+// F21 — the active-def JSON config legitimately exceeds the generic field cap;
+// its route handler enforces its own 10KB limit instead.
+const fieldCapExempt = (req, k) =>
+  k === 'config' && /^\/admin\/advertisers\/[^/]+\/active-def$/.test(req.path);
 app.use((req, res, next) => {
   if (req.body && typeof req.body === 'object') {
     for (const [k, v] of Object.entries(req.body)) {
       if (typeof v === 'string') {
-        if (v.length > 2000) return res.status(400).json({ error: `Field "${k}" exceeds 2000 characters` });
+        if (v.length > 2000 && !fieldCapExempt(req, k)) return res.status(400).json({ error: `Field "${k}" exceeds 2000 characters` });
         req.body[k] = v.replace(/\0/g, '');
       } else if (Array.isArray(v)) {
         for (let i = 0; i < v.length; i++) {
@@ -5385,7 +5389,7 @@ function renderAdminDashboard({ totalClicks, totalConversions,
            <select name="status" style="font-size:10px;padding:1px 3px"><option value="pending">pending</option><option value="approved">approved</option></select>
            <button class="btn btn-ghost" style="font-size:10px;padding:1px 6px">Override</button>
          </form>`
-      : `<span class="badge ${H(st)}">${H(st)}</span>`;
+      : `<span class="badge ${H(st)}">${H(st)}</span>${r.reason ? ` <span class="badge" style="background:#f3f4f6;color:#6e6e73;font-size:10px" title="${H(r.reason)}">${H(r.reason)}</span>` : ''}`;
     const ctitFlagged = (r.fraud_flag || '').includes('ctit');
     return `<tr>
       <td><input type="checkbox" class="bulk-cb" value="${r.id}" data-bulk-row></td>
@@ -10016,6 +10020,9 @@ app.post('/admin/advertisers/:slug/active-def', requireAdmin, verifyCsrf, (req, 
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
   const raw = (req.body.config || '').trim();
+  if (raw.length > 10000) {
+    return res.status(400).send(renderActiveDef({ adv, json: raw, hasConfig: !!getRawActiveDef(adv.slug), csrfToken: req.session.csrfToken, error: 'Config JSON too large (max 10KB)' }));
+  }
   let parsed;
   try { parsed = JSON.parse(raw); } catch (e) {
     return res.send(renderActiveDef({ adv, json: raw, hasConfig: !!getRawActiveDef(adv.slug), csrfToken: req.session.csrfToken, error: 'Invalid JSON: ' + e.message }));

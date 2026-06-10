@@ -80,6 +80,14 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   ok('F21.2 invalid JSON rejected with error', badRes.includes('Invalid JSON'));
   ok('F21.2 invalid JSON not saved (config unchanged)', JSON.parse(db.prepare("SELECT value FROM settings WHERE key='active_def:g8adv'").get().value).min_value === 200000);
 
+  // >10000 chars decoded but still under the global 10kb urlencoded body limit
+  // (alphanumeric padding URL-encodes 1:1) so it reaches the handler's own cap.
+  const bigCfg = JSON.stringify({ pad: 'x'.repeat(10050) });
+  const bigRes = await post(admin, '/admin/advertisers/g8adv/active-def', { config: bigCfg }, '/admin/advertisers/g8adv/active-def');
+  ok('F21.5 oversized config rejected with 400', bigRes.status === 400, 'status=' + bigRes.status);
+  ok('F21.5 oversized config error message shown', (await txt(bigRes)).includes('Config JSON too large (max 10KB)'));
+  ok('F21.5 oversized config not saved (config unchanged)', !db.prepare("SELECT value FROM settings WHERE key='active_def:g8adv'").get().value.includes('pad'));
+
   ok('F21.3 audit_log records config update',
     !!db.prepare("SELECT 1 FROM audit_log WHERE action='advertiser.active_def_updated' AND entity_id='g8adv'").get());
 
