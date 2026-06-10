@@ -800,6 +800,40 @@ for (const [key, value] of [
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run(key, value);
 }
 
+// ===========================================================================
+// Group 8 — Kafi go-live: active-definition config (F21), multi-event funnel
+//   ingestion (F22), cohort D30 active-rate engine (F23), phased+tiered payout
+//   engine (F24). Per-advertiser config lives in settings under active_def:{slug}.
+// ===========================================================================
+
+// F22 — raw funnel-event value (e.g. deposit amount) carried on the conversion,
+// used for active-event qualification against the config's min_value.
+const convColsG8 = db.prepare('PRAGMA table_info(conversions)').all().map(c => c.name);
+if (!convColsG8.includes('raw_value')) db.exec('ALTER TABLE conversions ADD COLUMN raw_value REAL');
+
+// F23 — per (advertiser, publisher, cohort_month) cohort statistics. Recomputed by
+// a daily cron and on funnel postbacks. UNIQUE keeps one row per cohort.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS cohort_stats (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser_slug    TEXT NOT NULL,
+    publisher          TEXT NOT NULL,
+    cohort_month       TEXT NOT NULL,            -- 'YYYY-MM'
+    opens              INTEGER DEFAULT 0,
+    opens_aged7        INTEGER DEFAULT 0,
+    opens_aged30       INTEGER DEFAULT 0,
+    active_by_d7       INTEGER DEFAULT 0,
+    active_by_d30      INTEGER DEFAULT 0,
+    d7_rate            REAL DEFAULT 0,
+    actual_d30_rate    REAL DEFAULT 0,
+    projected_d30_rate REAL DEFAULT 0,
+    is_matured         INTEGER DEFAULT 0,        -- 1 once cohort_month is past 30+window days
+    computed_at        TEXT DEFAULT (datetime('now')),
+    UNIQUE(advertiser_slug, publisher, cohort_month)
+  );
+  CREATE INDEX IF NOT EXISTS idx_cohort_adv ON cohort_stats(advertiser_slug, cohort_month);
+`);
+
 // Sessions table — sessions live in affiliate.db (one file, always present), served by
 // better-sqlite3-session-store with this `db` (node:sqlite) as its client. See server.js.
 db.exec(`

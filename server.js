@@ -1533,6 +1533,50 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     return res.status(403).json({ error: block.message });
   }
 
+  // F22 — multi-event funnel ingestion for advertisers configured with an
+  // active-definition (F21). Each funnel event (open/deposit/active/withdraw, or an
+  // unrecognised event) is recorded as its own conversion under UNIQUE(click_id,event).
+  // The active event qualifies only when its `value` meets the configured min_value.
+  // Advertisers WITHOUT a saved config fall through to the legacy CPS flow unchanged.
+  if (getRawActiveDef(slug)) {
+    const cfg = getActiveDef(slug);
+    const rawValue = (req.query.value != null && req.query.value !== '' && !isNaN(parseFloat(req.query.value)))
+      ? parseFloat(req.query.value) : 0;
+    const known = [cfg.open_event, cfg.deposit_event, cfg.active_event, cfg.withdraw_event].includes(rawEvent);
+    let fStatus = 'pending', fReason = null;
+    if (!known) {
+      fReason = 'unknown_event';                       // stored raw, never crashes
+    } else if (rawEvent === cfg.active_event) {
+      if (rawValue >= cfg.min_value) { fStatus = 'qualified'; fReason = null; }
+      else { fStatus = 'pending'; fReason = 'below_min_value'; }
+    }
+    const fCurrency = (cfg.phases && cfg.phases[0] && cfg.phases[0].currency) || 'VND';
+    let fConvId;
+    try {
+      fConvId = db.prepare(
+        `INSERT INTO conversions (click_id, advertiser_slug, campaign_id, publisher, event, payout, payout_local, payout_usd, currency, raw_value, status, reason, raw_params)
+         VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?)`
+      ).run(click_id, slug, click.campaign_id || null, pub, rawEvent, fCurrency, rawValue, fStatus, fReason, JSON.stringify(maskPII(req.query))).lastInsertRowid;
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || (err.message && err.message.includes('UNIQUE'))) {
+        logPostback(req, { status: 'duplicate', click_id, event: rawEvent });
+        return res.json({ status: 'duplicate', click_id, event: rawEvent });
+      }
+      throw err;
+    }
+    // F23 — refresh this cohort's stats (the open's month defines the cohort).
+    try {
+      const openRow = db.prepare("SELECT received_at FROM conversions WHERE click_id = ? AND advertiser_slug = ? AND event = ? ORDER BY id LIMIT 1").get(click_id, slug, cfg.open_event);
+      const cohortMonth = String(openRow?.received_at || new Date().toISOString()).slice(0, 7);
+      computeCohortStats(slug, pub, cohortMonth);
+    } catch (e) { console.error('cohort recompute error:', e.message); }
+    const out = { status: fStatus === 'qualified' ? 'qualified' : 'ok', funnel: true, click_id,
+      advertiser: slug, publisher: pub, event: rawEvent, value: rawValue, conversion_status: fStatus, id: fConvId };
+    if (fReason) out.reason = fReason;
+    logPostback(req, out);
+    return res.json(out);
+  }
+
   // F12 — advertiser-level monthly conversion cap (hard ceiling on approved conversions).
   // At/over cap → reject (429), auto-pause the advertiser, fire the 100% alert. Below cap
   // but ≥80% → fire the 80% alert. Alerts are throttled to once per threshold per month.
@@ -5090,6 +5134,7 @@ function adminSidebar() {
   ${nav('/admin/marketplace',          'Marketplace Apps',     'market', '/admin/marketplace')}
   ${nav('/admin/advertiser-applications', 'Advertiser Applications', 'advertisers', '/admin/advertiser-applications')}
   <div class="adm-sb-group">REPORTS</div>
+  ${nav('/admin/cohort',        'Cohort Stats',      'reports','/admin/cohort')}
   ${nav('/admin/reports/cohort','Cohort / Retention','reports','/admin/reports/cohort')}
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   ${nav('/admin/attribution',   'Attribution',       'reports','/admin/attribution')}
@@ -5275,6 +5320,8 @@ function renderAdminDashboard({ totalClicks, totalConversions,
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/active-def" class="btn btn-ghost">Active Def</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/payout-preview" class="btn btn-ghost">Payout</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -5546,6 +5593,8 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/active-def" class="btn btn-ghost">Active Def</a>`}
+        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/payout-preview" class="btn btn-ghost">Payout</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
         ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
@@ -9189,6 +9238,274 @@ cron.schedule('0 1 * * 1', () => {
   if (getSetting('weekly_report', 'true') !== 'true') return;
   sendWeeklyReports().catch(e => console.error('Weekly report error:', e.message));
 }, { timezone: 'UTC' });
+
+// ===========================================================================
+// Group 8 — Kafi go-live: active definition (F21) → funnel ingest (F22) →
+//   cohort engine (F23) → phased+tiered payout (F24). Nothing is hardcoded;
+//   all thresholds are read from the per-advertiser config.
+// ===========================================================================
+
+// F21 — safe defaults. Used when an advertiser has no saved config so callers
+// never crash and money is never overpaid (P3 base = 0, no bonus tiers).
+const SAFE_DEFAULT_ACTIVE_DEF = {
+  open_event: 'open_account', deposit_event: 'deposit', active_event: 'first_trade', withdraw_event: 'withdraw',
+  min_value: 0, window_days: 30, gate_pct: 0, pub_kpi_pct: 0,
+  bonus_tiers: [], k_default: 0.70, min_sample: 30,
+  phases: [{ name: 'DEFAULT', start_date: '2000-01-01', end_date: null, base_per_open: 0, currency: 'VND' }],
+};
+function getRawActiveDef(slug) {
+  return db.prepare("SELECT value FROM settings WHERE key = ?").get(`active_def:${slug}`)?.value ?? null;
+}
+function getActiveDef(slug) {
+  const raw = getRawActiveDef(slug);
+  if (!raw) return { ...SAFE_DEFAULT_ACTIVE_DEF };
+  try {
+    const cfg = JSON.parse(raw);
+    // Merge over safe defaults so a partial config never leaves a field undefined.
+    return { ...SAFE_DEFAULT_ACTIVE_DEF, ...cfg };
+  } catch {
+    return { ...SAFE_DEFAULT_ACTIVE_DEF };
+  }
+}
+
+// F23 — recompute one cohort (advertiser × publisher × YYYY-MM) and upsert the row.
+function computeCohortStats(advertiserSlug, publisher, cohortMonth) {
+  const cfg = getActiveDef(advertiserSlug);
+  const minSample = Number(cfg.min_sample) > 0 ? Number(cfg.min_sample) : 30;
+  const k = Number(cfg.k_default) > 0 ? Number(cfg.k_default) : 0.70;
+  const windowDays = Number(cfg.window_days) > 0 ? Number(cfg.window_days) : 30;
+  const nowMs = Date.now();
+  const parseUtc = s => Date.parse(String(s).replace(' ', 'T') + (String(s).includes('Z') ? '' : 'Z'));
+
+  const opens = db.prepare(
+    "SELECT click_id, received_at FROM conversions WHERE advertiser_slug=? AND publisher=? AND event=? AND strftime('%Y-%m', received_at)=?"
+  ).all(advertiserSlug, publisher, cfg.open_event, cohortMonth);
+
+  // earliest qualified active per click_id
+  const activeRows = db.prepare(
+    "SELECT click_id, MIN(received_at) AS active_at FROM conversions WHERE advertiser_slug=? AND publisher=? AND event=? AND status='qualified' GROUP BY click_id"
+  ).all(advertiserSlug, publisher, cfg.active_event);
+  const activeMap = {}; for (const r of activeRows) activeMap[r.click_id] = r.active_at;
+
+  let opensAged7 = 0, opensAged30 = 0, activeD7 = 0, activeD30 = 0;
+  for (const o of opens) {
+    const openMs = parseUtc(o.received_at);
+    const ageDays = (nowMs - openMs) / 86_400_000;
+    if (ageDays >= 7) opensAged7++;
+    if (ageDays >= 30) opensAged30++;
+    const at = activeMap[o.click_id];
+    if (at) {
+      const deltaDays = (parseUtc(at) - openMs) / 86_400_000;
+      if (deltaDays >= 0 && deltaDays <= 7) activeD7++;
+      if (deltaDays >= 0 && deltaDays <= 30) activeD30++;
+    }
+  }
+  const d7_rate = opensAged7 >= minSample ? activeD7 / opensAged7 : 0;
+  const actual_d30_rate = opensAged30 >= minSample ? activeD30 / opensAged30 : 0;
+  const projected_d30_rate = Math.max(0, Math.min(1, k > 0 ? d7_rate / k : 0));
+
+  // matured once the cohort month is fully past its 30 + window_days observation horizon.
+  const [y, m] = cohortMonth.split('-').map(Number);
+  const monthEndMs = Date.UTC(y, m, 0, 23, 59, 59); // last instant of month m (1-based)
+  const is_matured = nowMs >= monthEndMs + (30 + windowDays) * 86_400_000 ? 1 : 0;
+
+  db.prepare(`
+    INSERT INTO cohort_stats (advertiser_slug, publisher, cohort_month, opens, opens_aged7, opens_aged30,
+      active_by_d7, active_by_d30, d7_rate, actual_d30_rate, projected_d30_rate, is_matured, computed_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+    ON CONFLICT(advertiser_slug, publisher, cohort_month) DO UPDATE SET
+      opens=excluded.opens, opens_aged7=excluded.opens_aged7, opens_aged30=excluded.opens_aged30,
+      active_by_d7=excluded.active_by_d7, active_by_d30=excluded.active_by_d30, d7_rate=excluded.d7_rate,
+      actual_d30_rate=excluded.actual_d30_rate, projected_d30_rate=excluded.projected_d30_rate,
+      is_matured=excluded.is_matured, computed_at=datetime('now')
+  `).run(advertiserSlug, publisher, cohortMonth, opens.length, opensAged7, opensAged30, activeD7, activeD30,
+    d7_rate, actual_d30_rate, projected_d30_rate, is_matured);
+
+  return { opens: opens.length, opens_aged7: opensAged7, opens_aged30: opensAged30,
+    active_by_d7: activeD7, active_by_d30: activeD30, d7_rate, actual_d30_rate, projected_d30_rate, is_matured };
+}
+
+// Recompute every cohort for every advertiser that has a saved config.
+function recomputeAllCohorts() {
+  const keys = db.prepare("SELECT key FROM settings WHERE key LIKE 'active_def:%'").all();
+  let n = 0;
+  for (const { key } of keys) {
+    const slug = key.slice('active_def:'.length);
+    const cfg = getActiveDef(slug);
+    const combos = db.prepare(
+      "SELECT DISTINCT publisher, strftime('%Y-%m', received_at) AS m FROM conversions WHERE advertiser_slug=? AND event=?"
+    ).all(slug, cfg.open_event);
+    for (const c of combos) { computeCohortStats(slug, c.publisher, c.m); n++; }
+  }
+  return n;
+}
+
+// F24 — phased + tiered payout engine.
+function phaseForDate(cfg, dateStr) {
+  const d = String(dateStr).slice(0, 10);
+  for (const p of (cfg.phases || [])) {
+    const start = p.start_date || '0000-01-01';
+    const end   = p.end_date || '9999-12-31';
+    if (d >= start && d <= end) return p;
+  }
+  return null;
+}
+function bonusForRate(cfg, ratePct) {
+  for (const t of (cfg.bonus_tiers || [])) {
+    if (ratePct >= t.min_pct && ratePct < t.max_pct) return t.bonus;
+  }
+  return 0;
+}
+function computePhasedPayout(advertiserSlug, publisher, clickId, openDate) {
+  const cfg = getActiveDef(advertiserSlug);
+  const phase = phaseForDate(cfg, openDate);
+  const base = phase ? Number(phase.base_per_open) || 0 : 0;           // base is unconditional
+  const cohortMonth = String(openDate).slice(0, 7);
+  const cohort = db.prepare(
+    'SELECT actual_d30_rate, active_by_d30 FROM cohort_stats WHERE advertiser_slug=? AND publisher=? AND cohort_month=?'
+  ).get(advertiserSlug, publisher, cohortMonth) || { actual_d30_rate: 0, active_by_d30: 0 };
+  const ratePct = (cohort.actual_d30_rate || 0) * 100;
+  const bonusPerActive = bonusForRate(cfg, ratePct);
+  const activeCount = cohort.active_by_d30 || 0;
+  const total = base + bonusPerActive * activeCount;
+  return {
+    phase: phase ? phase.name : null, base_per_open: base, actual_d30_rate: cohort.actual_d30_rate || 0,
+    bonus_per_active: bonusPerActive, active_count: activeCount, total,
+    currency: phase ? phase.currency : ((cfg.phases && cfg.phases[0] && cfg.phases[0].currency) || 'VND'),
+  };
+}
+
+// ---- F21 admin UI --------------------------------------------------------
+app.get('/admin/advertisers/:slug/active-def', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const raw = getRawActiveDef(adv.slug);
+  const json = raw || JSON.stringify(SAFE_DEFAULT_ACTIVE_DEF, null, 2);
+  const flash = req.query.msg && req.query.ok !== '0' ? req.query.msg : null;
+  const error = req.query.msg && req.query.ok === '0' ? req.query.msg : null;
+  res.send(renderActiveDef({ adv, json, hasConfig: !!raw, csrfToken: req.session.csrfToken, flash, error }));
+});
+app.post('/admin/advertisers/:slug/active-def', requireAdmin, verifyCsrf, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const raw = (req.body.config || '').trim();
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) {
+    return res.send(renderActiveDef({ adv, json: raw, hasConfig: !!getRawActiveDef(adv.slug), csrfToken: req.session.csrfToken, error: 'Invalid JSON: ' + e.message }));
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return res.send(renderActiveDef({ adv, json: raw, hasConfig: !!getRawActiveDef(adv.slug), csrfToken: req.session.csrfToken, error: 'Config must be a JSON object.' }));
+  }
+  setSetting(`active_def:${adv.slug}`, JSON.stringify(parsed));
+  logAudit('advertiser.active_def_updated', 'advertiser', adv.slug, { keys: Object.keys(parsed) }, req);
+  res.redirect(`/admin/advertisers/${adv.slug}/active-def?msg=Active+definition+saved`);
+});
+
+// ---- F23 cohort UI + recompute -------------------------------------------
+app.get('/admin/cohort', requireAdmin, (req, res) => {
+  const slug = (req.query.slug || '').trim();
+  const rows = slug
+    ? db.prepare('SELECT * FROM cohort_stats WHERE advertiser_slug=? ORDER BY cohort_month DESC, publisher').all(slug)
+    : db.prepare('SELECT * FROM cohort_stats ORDER BY advertiser_slug, cohort_month DESC, publisher').all();
+  const flash = req.query.msg ? { type: 'success', text: req.query.msg } : null;
+  res.send(renderCohort({ rows, slug, csrfToken: req.session.csrfToken, flash }));
+});
+app.post('/admin/cohort/recompute', requireAdmin, verifyCsrf, (req, res) => {
+  const n = recomputeAllCohorts();
+  res.redirect('/admin/cohort?msg=' + encodeURIComponent(`Recomputed ${n} cohort(s)`));
+});
+
+// ---- F24 payout preview (read-only) --------------------------------------
+app.get('/admin/advertisers/:slug/payout-preview', requireAdmin, (req, res) => {
+  const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
+  if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
+  const cohorts = db.prepare('SELECT * FROM cohort_stats WHERE advertiser_slug=? ORDER BY cohort_month DESC, publisher').all(adv.slug);
+  const rows = cohorts.map(c => {
+    const payout = computePhasedPayout(adv.slug, c.publisher, null, `${c.cohort_month}-01`);
+    return { ...c, ...payout };
+  });
+  res.send(renderPayoutPreview({ adv, rows, hasConfig: !!getRawActiveDef(adv.slug) }));
+});
+
+// Daily cohort recompute — 02:00 UTC.
+cron.schedule('0 2 * * *', () => {
+  try { recomputeAllCohorts(); } catch (e) { console.error('Cohort recompute (cron) error:', e.message); }
+}, { timezone: 'UTC' });
+
+// ---- Group 8 render helpers ----------------------------------------------
+function renderActiveDef({ adv, json, hasConfig, csrfToken, flash, error }) {
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}
+<main>
+<div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
+${flashHtml(flash ? { type: 'success', text: flash } : (error ? { type: 'error', text: error } : null))}
+<section style="max-width:760px">
+  <div class="sh"><h2>Active Definition — ${H(adv.name)}</h2></div>
+  ${!hasConfig ? `<div style="background:#fff8e1;color:#8a6d00;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px">No config — using safe defaults. Edit and save the JSON below to activate funnel ingestion, cohort tracking and phased payouts for this advertiser.</div>` : ''}
+  <p style="font-size:12px;color:#6e6e73;margin:0 0 10px">Funnel event names, qualification threshold (<code>min_value</code>), cohort window, bonus tiers and payout phases. All downstream engines read from here — nothing is hardcoded.</p>
+  <form method="POST" action="/admin/advertisers/${H(adv.slug)}/active-def">${csrfField(csrfToken)}
+    <textarea name="config" spellcheck="false" style="width:100%;height:440px;font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.5;padding:12px;border:1px solid #d2d2d7;border-radius:8px">${H(json)}</textarea>
+    <div style="margin-top:12px"><button class="btn btn-primary btn-lg">Save Config</button>
+      <a href="/admin/advertisers/${H(adv.slug)}/payout-preview" class="btn btn-ghost">Payout Preview →</a></div>
+  </form>
+</section>
+</main>`;
+  return adminLayout(`Active Definition — ${adv.name}`, body);
+}
+
+function renderCohort({ rows, slug, csrfToken, flash }) {
+  const pct = r => `${(Number(r) * 100).toFixed(1)}%`;
+  const trs = rows.map(c => `<tr>
+    <td><code>${H(c.advertiser_slug)}</code></td>
+    <td><code>${H(c.publisher)}</code></td>
+    <td>${H(c.cohort_month)}</td>
+    <td>${N(c.opens)}</td>
+    <td>${N(c.opens_aged7)} / ${N(c.opens_aged30)}</td>
+    <td>${N(c.active_by_d7)} / ${N(c.active_by_d30)}</td>
+    <td>${pct(c.d7_rate)}</td>
+    <td><strong>${pct(c.actual_d30_rate)}</strong></td>
+    <td>${pct(c.projected_d30_rate)}</td>
+    <td>${c.is_matured ? '<span class="badge active">matured</span>' : '<span class="badge pending">maturing</span>'}</td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<form method="POST" action="/admin/cohort/recompute" style="display:inline">${csrfField(csrfToken)}<button class="hbtn">Recompute now</button></form>`)}
+<main>
+${flashHtml(flash)}
+<section>
+  <div class="sh"><h2>Cohort D30 Active-Rate${slug ? ` — ${H(slug)}` : ''}</h2><span class="meta">${rows.length} cohort(s)</span></div>
+  <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">Aged = opens old enough to evaluate (7d / 30d). Rates only populate once aged opens reach the configured <code>min_sample</code>. Projected = D7 rate ÷ k.</p>
+  ${rows.length === 0 ? '<div class="empty">No cohort data yet. Funnel postbacks populate cohorts; click “Recompute now” to refresh.</div>' : `<table>
+    <thead><tr><th>Advertiser</th><th>Publisher</th><th>Cohort</th><th>Opens</th><th>Aged 7/30</th><th>Active 7/30</th><th>D7 rate</th><th>Actual D30</th><th>Projected D30</th><th>Maturity</th></tr></thead>
+    <tbody>${trs}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout('Cohort Stats', body);
+}
+
+function renderPayoutPreview({ adv, rows, hasConfig }) {
+  const fmt = (v, cur) => fmtCur(v, cur || 'VND');
+  const trs = rows.map(r => `<tr data-cohort="${H(r.cohort_month)}" data-publisher="${H(r.publisher)}" data-total="${r.total}">
+    <td><code>${H(r.publisher)}</code></td>
+    <td>${H(r.cohort_month)}</td>
+    <td>${H(r.phase || '—')}</td>
+    <td>${fmt(r.base_per_open, r.currency)}</td>
+    <td>${(Number(r.actual_d30_rate) * 100).toFixed(1)}%</td>
+    <td>${fmt(r.bonus_per_active, r.currency)}</td>
+    <td>${N(r.active_count)}</td>
+    <td><strong data-total-fmt>${fmt(r.total, r.currency)}</strong></td>
+  </tr>`).join('');
+  const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/active-def" class="hbtn ghost">Active Definition</a>`)}
+<main>
+<div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
+<section>
+  <div class="sh"><h2>Payout Preview — ${H(adv.name)}</h2><span class="meta">read-only — not committed</span></div>
+  ${!hasConfig ? `<div style="background:#fff8e1;color:#8a6d00;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px">No active definition saved — preview uses safe defaults (base 0, no bonus).</div>` : ''}
+  <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">Total = base_per_open + (bonus_per_active × active accounts in cohort). Phase is chosen by the cohort's open month.</p>
+  ${rows.length === 0 ? '<div class="empty">No cohorts to preview yet.</div>' : `<table>
+    <thead><tr><th>Publisher</th><th>Cohort</th><th>Phase</th><th>Base/open</th><th>Actual D30</th><th>Bonus/active</th><th>Active</th><th>Total</th></tr></thead>
+    <tbody>${trs}</tbody></table>`}
+</section>
+</main>`;
+  return adminLayout(`Payout Preview — ${adv.name}`, body);
+}
 
 // ---- G7-3 / G7-5 render helpers ------------------------------------------
 function renderTiers({ adv, tiers, csrfToken, flash, error }) {
