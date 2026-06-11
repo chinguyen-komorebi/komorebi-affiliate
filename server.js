@@ -7912,9 +7912,9 @@ function renderResetPassword({ token, error, invalid } = {}) {
 
 // Publishers only ever see operationally-meaningful rejection reasons; internal
 // attribution/reconciliation reasons (telesale_wins, split_50, mmp_*, …) collapse
-// to a neutral "adjustment" label. Admin views render the raw reason unchanged.
+// to a neutral "Attribution adjustment" label. Admin views render the raw reason unchanged.
 const PUB_SAFE_REASONS = new Set(['below_min_value', 'duplicate', 'duplicate_user', 'duplicate_click_id', 'not_activated', 'no_event']);
-const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'adjustment');
+const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'Attribution adjustment');
 
 function renderPubConversions({ pub, conversions }) {
   // F17 — show loan_amount / revenue columns only when at least one row has them.
@@ -9729,13 +9729,13 @@ function renderFraudReview({ rows, filter }) {
   const body = `${adminHeader()}
 <main>
 <section>
-  <div class="sh"><h2>Fraud Review</h2><span class="meta">${rows.length} flag(s)</span></div>
+  <div class="sh"><h2>Trading Fraud Review</h2><span class="meta">${rows.length} flag(s)</span></div>
   <div style="display:flex;gap:6px;margin-bottom:14px">${tab('all', 'All')}${tab('afid_ratio_breach', 'AFID ratio')}${tab('cycling', 'Cycling')}${tab('duplicate', 'Duplicate')}</div>
   ${rows.length === 0 ? '<div class="empty">No fraud flags.</div>' : `<div class="table-wrap"><table>
     <thead><tr><th>#</th><th>Click</th><th>Publisher</th><th>Advertiser</th><th>Flag</th><th>Detail</th><th>Auto-reject</th><th>When</th></tr></thead>
     <tbody>${trs}</tbody></table></div>`}
 </section></main>`;
-  return adminLayout('Fraud Review', body);
+  return adminLayout('Trading Fraud Review', body);
 }
 function renderReferralList({ adv, ids, csrfToken, flash }) {
   const trs = ids.map(r => `<tr><td><code>${H(r.identifier)}</code></td><td>${H(r.identifier_type)}</td><td><small>${H((r.uploaded_at || '').slice(0, 16))}</small></td></tr>`).join('');
@@ -10355,6 +10355,9 @@ app.use((err, req, res, next) => {
 const MEM_THRESHOLD   = 85;   // percent
 const MEM_ALERT_QUIET = 3600_000; // 1 hour cooldown
 let   _lastMemAlert   = 0;
+// Alerts identify the box they fire from — SERVER_NAME env wins (useful when the
+// machine hostname is opaque, e.g. a container id), else the OS hostname.
+const SERVER_NAME = process.env.SERVER_NAME || os.hostname();
 
 function fmtGiB(bytes) {
   return (bytes / 1073741824).toFixed(2) + 'GiB';
@@ -10368,7 +10371,7 @@ cron.schedule('*/5 * * * *', () => {
 
   if (pct > MEM_THRESHOLD && now - _lastMemAlert > MEM_ALERT_QUIET) {
     _lastMemAlert = now;
-    const msg = `⚠️ High memory usage: ${pct}% (${fmtGiB(used)}/${fmtGiB(total)}) on track.komorebimedia.com`;
+    const msg = `⚠️ High memory usage: ${pct}% (${fmtGiB(used)}/${fmtGiB(total)}) on ${SERVER_NAME}`;
     console.warn('[mem-alert]', msg);
     sendTelegram(msg).catch(e => console.error('Mem alert Telegram error:', e.message));
   }
@@ -10381,7 +10384,7 @@ app.listen(PORT, () => {
   console.log(`  Track      : ${BASE_URL}/track/:advertiser?pub=PUBLISHER`);
   console.log(`  Postback   : ${BASE_URL}/postback/:advertiser?click_id=X&payout=Y&event=sale\n`);
 
-  sendTelegram('🔄 Komorebi tracker restarted — track.komorebimedia.com is up.')
+  sendTelegram(`🔄 Komorebi tracker restarted — ${SERVER_NAME} is up.`)
     .catch(e => console.error('Startup Telegram error:', e.message));
 
   // F19(D) — alert if critical secrets are unset or still at insecure defaults.
