@@ -10307,22 +10307,40 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   if (err.type === 'entity.too.large') {
     const m = req.method === 'POST' && req.path.match(/^\/admin\/advertisers\/([^/]+)\/active-def$/);
-    const adv = m ? db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(decodeURIComponent(m[1])) : null;
-    if (adv) {
-      const renderEditor = () => {
+    if (m) {
+      // The parser threw before the session middleware — and therefore before the
+      // route's requireAdmin — ran, so this handler must gate on the admin flag
+      // itself (C3): without the check, an anonymous >10KB POST would be served
+      // the advertiser's saved funnel/payout config. Replay the session first,
+      // then decide.
+      const afterSession = () => {
+        // Mirror requireAdmin: an idle-expired session is not an admin.
+        const idle = req.session?.adminLastActivity && Date.now() - req.session.adminLastActivity > ADMIN_IDLE_MS;
+        let slug = null;
+        try { slug = decodeURIComponent(m[1]); } catch { /* malformed %-encoding — treat as unknown */ }
+        const adv = req.session?.isAdmin && !idle && slug
+          ? db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug) : null;
+        if (!adv) {
+          // Anyone unauthenticated — and any unknown slug — gets the exact same
+          // response as every other oversized request: no advertiser data, no
+          // signal as to whether the slug exists.
+          return res.status(413).json({ error: 'Payload too large' });
+        }
+        req.session.adminLastActivity = Date.now();
+        // Use the session's persisted token; mint one only if the session never
+        // got one (express-session saves the modified session at response end),
+        // so the error page's form token deterministically matches on resubmit.
+        if (!req.session.csrfToken) req.session.csrfToken = generateCsrfToken();
         // The oversized body was never parsed, so re-render the saved config.
         const saved = getRawActiveDef(adv.slug);
-        res.status(400).send(renderActiveDef({
+        return res.status(400).send(renderActiveDef({
           adv, json: saved || JSON.stringify(SAFE_DEFAULT_ACTIVE_DEF, null, 2), hasConfig: !!saved,
-          csrfToken: req.session?.csrfToken || '', error: 'Config JSON too large (max 10KB)',
+          csrfToken: req.session.csrfToken, error: 'Config JSON too large (max 10KB)',
           errorNote: 'Your submitted config was too large to retain — the saved config is shown below.',
         }));
       };
-      // The parser threw before the session middleware ran, so replay it here
-      // to load the admin's session — the form needs the real CSRF token to be
-      // resubmittable straight from the error page.
-      if (req.session) return renderEditor();
-      return sessionMiddleware(req, res, () => renderEditor());
+      if (req.session) return afterSession();
+      return sessionMiddleware(req, res, afterSession);
     }
     return res.status(413).json({ error: 'Payload too large' });
   }

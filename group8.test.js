@@ -212,6 +212,35 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   ok('FIX1.b CSRF failure → 403 styled page, not plain text', csrfRes.status === 403 && csrfBody.includes('<!DOCTYPE html>') && csrfBody !== 'Invalid CSRF token');
   ok('FIX1.b CSRF error page has a back link', /<a href="[^"]*"/.test(csrfBody) && csrfBody.includes('Back to previous page'));
 
+  // (C3) the error handler must gate on the admin session itself — the parser
+  // throws before requireAdmin runs, so without its own check an anonymous
+  // oversized POST would be served the advertiser's saved config
+  const bigBody = 'config=' + 'x'.repeat(24000);
+  const anonPost = p => fetch(`${BASE}${p}`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: bigBody, redirect: 'manual' });
+  const anonRes = await anonPost('/admin/advertisers/g8adv/active-def');
+  const anonBody = await anonRes.text();
+  ok('C3a anon oversized POST → 413, no editor page', anonRes.status === 413 && JSON.parse(anonBody).error === 'Payload too large', `status=${anonRes.status}`);
+  ok('C3a anon response leaks no advertiser data',
+    !anonBody.includes('min_value') && !anonBody.includes('200000') && !anonBody.includes('G8 Adv') && !anonBody.includes('Config JSON') && !anonBody.includes('too large to retain'));
+
+  const adminBig = await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def');
+  const adminBigBody = await txt(adminBig);
+  ok('C3b admin oversized POST still gets the styled editor with saved config',
+    adminBig.status === 400 && adminBigBody.includes('Config JSON too large (max 10KB)') && adminBigBody.includes('200000') && adminBigBody.includes('G8 Adv'));
+
+  const anonGhost = await anonPost('/admin/advertisers/no-such-adv/active-def');
+  const anonGhostBody = await anonGhost.text();
+  ok('C3c anon response identical for unknown slug (no enumeration)', anonGhost.status === anonRes.status && anonGhostBody === anonBody, `status=${anonGhost.status}`);
+
+  // (C minor) resubmit from the error page is deterministic — repeat the
+  // 413 → extract token → resubmit cycle and expect a 302 every time
+  for (let i = 1; i <= 3; i++) {
+    const ep = await txt(await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def'));
+    const tok = ((ep.match(/name="_csrf" value="([a-f0-9]+)"/)) || [])[1] || '';
+    const rs = await admin.req('POST', '/admin/advertisers/g8adv/active-def', { form: { config: JSON.stringify(CFG, null, 2), _csrf: tok } });
+    ok(`Cminor.${i} resubmit from error page → 302 (round ${i})`, rs.status === 302 || rs.status === 303, `status=${rs.status} tok=${tok.length}`);
+  }
+
   // (d) publisher views collapse internal reasons to "adjustment"; safe ones stay visible
   db.prepare("INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, status, reason) VALUES ('g8-internal-reason','g8adv','g8pub','first_trade',0,'VND','rejected','telesale_wins')").run();
   const pubJar = makeJar();
