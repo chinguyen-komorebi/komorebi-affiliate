@@ -5194,8 +5194,8 @@ function adminSidebar() {
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   ${nav('/admin/attribution',   'Attribution',       'reports','/admin/attribution')}
   <div class="adm-sb-group">RISK</div>
-  ${nav('/admin/fraud',            'Conversion Fraud',  'fraud',  '/admin/fraud')}
-  ${nav('/admin/fraud-review',     'Fraud Review',      'fraud',  '/admin/fraud-review')}
+  ${nav('/admin/fraud',            'Fraud Review',      'fraud',  '/admin/fraud')}
+  ${nav('/admin/fraud-review',     'Trading Fraud',     'fraud',  '/admin/fraud-review')}
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
@@ -7229,14 +7229,14 @@ function renderFraudPage({ rows }) {
   const body = `${adminHeader()}
 <main>
 <section>
-  <div class="sh"><h2>Conversion Fraud</h2><span class="meta">Flagged conversions grouped by click_id</span></div>
+  <div class="sh"><h2>Fraud Review</h2><span class="meta">Flagged conversions grouped by click_id</span></div>
   ${rows.length === 0 ? '<div class="empty">No flagged conversions.</div>' : `
   <table><thead><tr>
     <th>Click ID</th><th>Advertiser</th><th>Publisher</th><th>Events</th><th>Rows</th><th>Flags</th><th>Last Seen</th>
   </tr></thead><tbody>${tableRows}</tbody></table>`}
 </section>
 </main>`;
-  return adminLayout('Conversion Fraud', body);
+  return adminLayout('Fraud Review', body);
 }
 
 // Backlog #11 — Advertiser portal HTML templates (reuse the publisher portal CSS)
@@ -9729,13 +9729,13 @@ function renderFraudReview({ rows, filter }) {
   const body = `${adminHeader()}
 <main>
 <section>
-  <div class="sh"><h2>Fraud Review</h2><span class="meta">${rows.length} flag(s)</span></div>
+  <div class="sh"><h2>Trading Fraud Review</h2><span class="meta">${rows.length} flag(s)</span></div>
   <div style="display:flex;gap:6px;margin-bottom:14px">${tab('all', 'All')}${tab('afid_ratio_breach', 'AFID ratio')}${tab('cycling', 'Cycling')}${tab('duplicate', 'Duplicate')}</div>
   ${rows.length === 0 ? '<div class="empty">No fraud flags.</div>' : `<div class="table-wrap"><table>
     <thead><tr><th>#</th><th>Click</th><th>Publisher</th><th>Advertiser</th><th>Flag</th><th>Detail</th><th>Auto-reject</th><th>When</th></tr></thead>
     <tbody>${trs}</tbody></table></div>`}
 </section></main>`;
-  return adminLayout('Fraud Review', body);
+  return adminLayout('Trading Fraud Review', body);
 }
 function renderReferralList({ adv, ids, csrfToken, flash }) {
   const trs = ids.map(r => `<tr><td><code>${H(r.identifier)}</code></td><td>${H(r.identifier_type)}</td><td><small>${H((r.uploaded_at || '').slice(0, 16))}</small></td></tr>`).join('');
