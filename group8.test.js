@@ -80,6 +80,14 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   ok('F21.2 invalid JSON rejected with error', badRes.includes('Invalid JSON'));
   ok('F21.2 invalid JSON not saved (config unchanged)', JSON.parse(db.prepare("SELECT value FROM settings WHERE key='active_def:g8adv'").get().value).min_value === 200000);
 
+  // >10000 chars decoded but still under the global 10kb urlencoded body limit
+  // (alphanumeric padding URL-encodes 1:1) so it reaches the handler's own cap.
+  const bigCfg = JSON.stringify({ pad: 'x'.repeat(10050) });
+  const bigRes = await post(admin, '/admin/advertisers/g8adv/active-def', { config: bigCfg }, '/admin/advertisers/g8adv/active-def');
+  ok('F21.5 oversized config rejected with 400', bigRes.status === 400, 'status=' + bigRes.status);
+  ok('F21.5 oversized config error message shown', (await txt(bigRes)).includes('Config JSON too large (max 10KB)'));
+  ok('F21.5 oversized config not saved (config unchanged)', !db.prepare("SELECT value FROM settings WHERE key='active_def:g8adv'").get().value.includes('pad'));
+
   ok('F21.3 audit_log records config update',
     !!db.prepare("SELECT 1 FROM audit_log WHERE action='advertiser.active_def_updated' AND entity_id='g8adv'").get());
 
@@ -165,6 +173,84 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   ok('F24.1 preview shows phase labels', prevHtml.includes('P1') && prevHtml.includes('P2') && prevHtml.includes('P3'));
   // F24.5 — payout reflects recomputed D30 rate: a non-aged cohort yields base only (no bonus)
   ok('F24.5 D30-driven bonus only after maturity (matured rate used)', cohortRow('g8adv', 'g8pubA', '2024-01').is_matured === 1);
+
+  // ===== UIUX review fixes — B1 (413 stack-trace leak) + D (publisher reason exposure) =====
+  const noStack = t => !/PayloadTooLargeError|SyntaxError|node_modules|\/server\.js/.test(t);
+
+  // (a) 24KB config blows the 10kb urlencoded body limit → friendly flash, no stack trace
+  const hugeRes = await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def');
+  const hugeBody = await txt(hugeRes);
+  ok('B1.a oversized (24KB) active-def → 400 with friendly flash', hugeRes.status === 400 && hugeBody.includes('Config JSON too large (max 10KB)'), 'status=' + hugeRes.status);
+  ok('B1.a oversized active-def response has no stack trace', noStack(hugeBody));
+
+  // (b) >10kb body on any other route → clean 413 JSON
+  const otherRes = await fetch(`${BASE}/admin/login`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'username=' + 'x'.repeat(12000), redirect: 'manual' });
+  const otherBody = await otherRes.text();
+  ok('B1.b oversized body on other route → 413 JSON', otherRes.status === 413 && JSON.parse(otherBody).error === 'Payload too large', `status=${otherRes.status} body=${otherBody.slice(0, 120)}`);
+  ok('B1.b 413 response has no stack trace', noStack(otherBody));
+
+  // (c) parser-level error (malformed JSON body) → generic 500, no stack trace
+  const errRes = await fetch(`${BASE}/admin/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{invalid json', redirect: 'manual' });
+  const errBody = await errRes.text();
+  ok('B1.c unexpected error → generic 500 JSON', errRes.status === 500 && JSON.parse(errBody).error === 'Internal server error', `status=${errRes.status} body=${errBody.slice(0, 120)}`);
+  ok('B1.c 500 response has no stack trace', noStack(errBody));
+
+  // (FIX 1) the 413 error page carries the session's real CSRF token + retention
+  // note, so the admin can fix the config and resubmit straight from it
+  const errPage = await txt(await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def'));
+  ok('FIX1.a 413 error page shows draft-not-retained note', errPage.includes('too large to retain'));
+  const errTok = ((errPage.match(/name="_csrf" value="([a-f0-9]+)"/)) || [])[1] || '';
+  ok('FIX1.a 413 error page carries a real CSRF token', errTok.length === 48, 'token=' + JSON.stringify(errTok));
+  const resubmit = await admin.req('POST', '/admin/advertisers/g8adv/active-def', { form: { config: JSON.stringify({ ...CFG, min_value: 150000 }), _csrf: errTok } });
+  ok('FIX1.a resubmit from error page succeeds (redirect to saved)', resubmit.status === 302 || resubmit.status === 303, 'status=' + resubmit.status);
+  ok('FIX1.a resubmitted config persisted', JSON.parse(db.prepare("SELECT value FROM settings WHERE key='active_def:g8adv'").get().value).min_value === 150000);
+  await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify(CFG, null, 2) }, '/admin/advertisers/g8adv/active-def'); // restore for later sections
+
+  // (FIX 1b) CSRF failure renders a styled page with a way back, not plain text
+  const csrfRes = await admin.req('POST', '/admin/advertisers/g8adv/active-def', { form: { config: '{}', _csrf: 'deadbeef' } });
+  const csrfBody = await txt(csrfRes);
+  ok('FIX1.b CSRF failure → 403 styled page, not plain text', csrfRes.status === 403 && csrfBody.includes('<!DOCTYPE html>') && csrfBody !== 'Invalid CSRF token');
+  ok('FIX1.b CSRF error page has a back link', /<a href="[^"]*"/.test(csrfBody) && csrfBody.includes('Back to previous page'));
+
+  // (C3) the error handler must gate on the admin session itself — the parser
+  // throws before requireAdmin runs, so without its own check an anonymous
+  // oversized POST would be served the advertiser's saved config
+  const bigBody = 'config=' + 'x'.repeat(24000);
+  const anonPost = p => fetch(`${BASE}${p}`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: bigBody, redirect: 'manual' });
+  const anonRes = await anonPost('/admin/advertisers/g8adv/active-def');
+  const anonBody = await anonRes.text();
+  ok('C3a anon oversized POST → 413, no editor page', anonRes.status === 413 && JSON.parse(anonBody).error === 'Payload too large', `status=${anonRes.status}`);
+  ok('C3a anon response leaks no advertiser data',
+    !anonBody.includes('min_value') && !anonBody.includes('200000') && !anonBody.includes('G8 Adv') && !anonBody.includes('Config JSON') && !anonBody.includes('too large to retain'));
+
+  const adminBig = await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def');
+  const adminBigBody = await txt(adminBig);
+  ok('C3b admin oversized POST still gets the styled editor with saved config',
+    adminBig.status === 400 && adminBigBody.includes('Config JSON too large (max 10KB)') && adminBigBody.includes('200000') && adminBigBody.includes('G8 Adv'));
+
+  const anonGhost = await anonPost('/admin/advertisers/no-such-adv/active-def');
+  const anonGhostBody = await anonGhost.text();
+  ok('C3c anon response identical for unknown slug (no enumeration)', anonGhost.status === anonRes.status && anonGhostBody === anonBody, `status=${anonGhost.status}`);
+
+  // (C minor) resubmit from the error page is deterministic — repeat the
+  // 413 → extract token → resubmit cycle and expect a 302 every time
+  for (let i = 1; i <= 3; i++) {
+    const ep = await txt(await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def'));
+    const tok = ((ep.match(/name="_csrf" value="([a-f0-9]+)"/)) || [])[1] || '';
+    const rs = await admin.req('POST', '/admin/advertisers/g8adv/active-def', { form: { config: JSON.stringify(CFG, null, 2), _csrf: tok } });
+    ok(`Cminor.${i} resubmit from error page → 302 (round ${i})`, rs.status === 302 || rs.status === 303, `status=${rs.status} tok=${tok.length}`);
+  }
+
+  // (d) publisher views collapse internal reasons to "adjustment"; safe ones stay visible
+  db.prepare("INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, status, reason) VALUES ('g8-internal-reason','g8adv','g8pub','first_trade',0,'VND','rejected','telesale_wins')").run();
+  const pubJar = makeJar();
+  await post(pubJar, '/publisher/login', { username: 'g8pub', password: 'g8pubpass1' }, '/publisher/login');
+  const pubConvPage = await txt(await pubJar.req('GET', '/publisher/conversions'));
+  ok('D.1 internal reason hidden from publisher', !pubConvPage.includes('telesale_wins'));
+  ok('D.1 internal reason shown as neutral "adjustment"', pubConvPage.includes('adjustment'));
+  ok('D.2 publisher-safe reason still visible', pubConvPage.includes('below_min_value'));
+  const pubDashPage = await txt(await pubJar.req('GET', '/publisher/dashboard'));
+  ok('D.3 publisher dashboard also masks internal reason', !pubDashPage.includes('telesale_wins'));
 
   console.log(`\nPASSED: ${pass}`);
   if (failures.length) { console.log(`FAILED: ${failures.length}`); failures.forEach(f => console.log('  ✗ ' + f)); process.exit(1); }
