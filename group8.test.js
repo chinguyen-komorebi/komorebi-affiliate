@@ -247,7 +247,7 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   await post(pubJar, '/publisher/login', { username: 'g8pub', password: 'g8pubpass1' }, '/publisher/login');
   const pubConvPage = await txt(await pubJar.req('GET', '/publisher/conversions'));
   ok('D.1 internal reason hidden from publisher', !pubConvPage.includes('telesale_wins'));
-  ok('D.1 internal reason shown as neutral "adjustment"', pubConvPage.includes('adjustment'));
+  ok('D.1 internal reason shown as neutral "Attribution adjustment"', pubConvPage.includes('Attribution adjustment'));
   ok('D.2 publisher-safe reason still visible', pubConvPage.includes('below_min_value'));
   const pubDashPage = await txt(await pubJar.req('GET', '/publisher/dashboard'));
   ok('D.3 publisher dashboard also masks internal reason', !pubDashPage.includes('telesale_wins'));

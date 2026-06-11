@@ -5194,8 +5194,8 @@ function adminSidebar() {
   ${nav('/admin/reports/pivot', 'Pivot Export',      'reports','/admin/reports/pivot')}
   ${nav('/admin/attribution',   'Attribution',       'reports','/admin/attribution')}
   <div class="adm-sb-group">RISK</div>
-  ${nav('/admin/fraud',            'Fraud Review',      'fraud',  '/admin/fraud')}
-  ${nav('/admin/fraud-review',     'Trading Fraud',     'fraud',  '/admin/fraud-review')}
+  ${nav('/admin/fraud',            'Conversion Fraud',  'fraud',  '/admin/fraud')}
+  ${nav('/admin/fraud-review',     'Fraud Review',      'fraud',  '/admin/fraud-review')}
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
@@ -7229,14 +7229,14 @@ function renderFraudPage({ rows }) {
   const body = `${adminHeader()}
 <main>
 <section>
-  <div class="sh"><h2>Fraud Review</h2><span class="meta">Flagged conversions grouped by click_id</span></div>
+  <div class="sh"><h2>Conversion Fraud</h2><span class="meta">Flagged conversions grouped by click_id</span></div>
   ${rows.length === 0 ? '<div class="empty">No flagged conversions.</div>' : `
   <table><thead><tr>
     <th>Click ID</th><th>Advertiser</th><th>Publisher</th><th>Events</th><th>Rows</th><th>Flags</th><th>Last Seen</th>
   </tr></thead><tbody>${tableRows}</tbody></table>`}
 </section>
 </main>`;
-  return adminLayout('Fraud Review', body);
+  return adminLayout('Conversion Fraud', body);
 }
 
 // Backlog #11 — Advertiser portal HTML templates (reuse the publisher portal CSS)
@@ -7912,9 +7912,9 @@ function renderResetPassword({ token, error, invalid } = {}) {
 
 // Publishers only ever see operationally-meaningful rejection reasons; internal
 // attribution/reconciliation reasons (telesale_wins, split_50, mmp_*, …) collapse
-// to a neutral "adjustment" label. Admin views render the raw reason unchanged.
+// to a neutral "Attribution adjustment" label. Admin views render the raw reason unchanged.
 const PUB_SAFE_REASONS = new Set(['below_min_value', 'duplicate', 'duplicate_user', 'duplicate_click_id', 'not_activated', 'no_event']);
-const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'adjustment');
+const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'Attribution adjustment');
 
 function renderPubConversions({ pub, conversions }) {
   // F17 — show loan_amount / revenue columns only when at least one row has them.
@@ -10355,6 +10355,9 @@ app.use((err, req, res, next) => {
 const MEM_THRESHOLD   = 85;   // percent
 const MEM_ALERT_QUIET = 3600_000; // 1 hour cooldown
 let   _lastMemAlert   = 0;
+// Alerts identify the box they fire from — SERVER_NAME env wins (useful when the
+// machine hostname is opaque, e.g. a container id), else the OS hostname.
+const SERVER_NAME = process.env.SERVER_NAME || os.hostname();
 
 function fmtGiB(bytes) {
   return (bytes / 1073741824).toFixed(2) + 'GiB';
@@ -10368,7 +10371,7 @@ cron.schedule('*/5 * * * *', () => {
 
   if (pct > MEM_THRESHOLD && now - _lastMemAlert > MEM_ALERT_QUIET) {
     _lastMemAlert = now;
-    const msg = `⚠️ High memory usage: ${pct}% (${fmtGiB(used)}/${fmtGiB(total)}) on track.komorebimedia.com`;
+    const msg = `⚠️ High memory usage: ${pct}% (${fmtGiB(used)}/${fmtGiB(total)}) on ${SERVER_NAME}`;
     console.warn('[mem-alert]', msg);
     sendTelegram(msg).catch(e => console.error('Mem alert Telegram error:', e.message));
   }
@@ -10381,7 +10384,7 @@ app.listen(PORT, () => {
   console.log(`  Track      : ${BASE_URL}/track/:advertiser?pub=PUBLISHER`);
   console.log(`  Postback   : ${BASE_URL}/postback/:advertiser?click_id=X&payout=Y&event=sale\n`);
 
-  sendTelegram('🔄 Komorebi tracker restarted — track.komorebimedia.com is up.')
+  sendTelegram(`🔄 Komorebi tracker restarted — ${SERVER_NAME} is up.`)
     .catch(e => console.error('Startup Telegram error:', e.message));
 
   // F19(D) — alert if critical secrets are unset or still at insecure defaults.
