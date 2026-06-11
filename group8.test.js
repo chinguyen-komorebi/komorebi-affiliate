@@ -195,6 +195,23 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   ok('B1.c unexpected error → generic 500 JSON', errRes.status === 500 && JSON.parse(errBody).error === 'Internal server error', `status=${errRes.status} body=${errBody.slice(0, 120)}`);
   ok('B1.c 500 response has no stack trace', noStack(errBody));
 
+  // (FIX 1) the 413 error page carries the session's real CSRF token + retention
+  // note, so the admin can fix the config and resubmit straight from it
+  const errPage = await txt(await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def'));
+  ok('FIX1.a 413 error page shows draft-not-retained note', errPage.includes('too large to retain'));
+  const errTok = ((errPage.match(/name="_csrf" value="([a-f0-9]+)"/)) || [])[1] || '';
+  ok('FIX1.a 413 error page carries a real CSRF token', errTok.length === 48, 'token=' + JSON.stringify(errTok));
+  const resubmit = await admin.req('POST', '/admin/advertisers/g8adv/active-def', { form: { config: JSON.stringify({ ...CFG, min_value: 150000 }), _csrf: errTok } });
+  ok('FIX1.a resubmit from error page succeeds (redirect to saved)', resubmit.status === 302 || resubmit.status === 303, 'status=' + resubmit.status);
+  ok('FIX1.a resubmitted config persisted', JSON.parse(db.prepare("SELECT value FROM settings WHERE key='active_def:g8adv'").get().value).min_value === 150000);
+  await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify(CFG, null, 2) }, '/admin/advertisers/g8adv/active-def'); // restore for later sections
+
+  // (FIX 1b) CSRF failure renders a styled page with a way back, not plain text
+  const csrfRes = await admin.req('POST', '/admin/advertisers/g8adv/active-def', { form: { config: '{}', _csrf: 'deadbeef' } });
+  const csrfBody = await txt(csrfRes);
+  ok('FIX1.b CSRF failure → 403 styled page, not plain text', csrfRes.status === 403 && csrfBody.includes('<!DOCTYPE html>') && csrfBody !== 'Invalid CSRF token');
+  ok('FIX1.b CSRF error page has a back link', /<a href="[^"]*"/.test(csrfBody) && csrfBody.includes('Back to previous page'));
+
   // (d) publisher views collapse internal reasons to "adjustment"; safe ones stay visible
   db.prepare("INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, status, reason) VALUES ('g8-internal-reason','g8adv','g8pub','first_trade',0,'VND','rejected','telesale_wins')").run();
   const pubJar = makeJar();

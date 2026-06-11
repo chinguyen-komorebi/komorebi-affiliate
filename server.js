@@ -152,7 +152,10 @@ app.use((req, res, next) => {
 // valid client for better-sqlite3-session-store — the store is pure JS and only uses
 // prepare/run/get/all/exec, so this also drops the native better-sqlite3 dependency.
 // The `sessions` table + index are created in db.js so they exist before the store runs.
-app.use(session({
+// Kept in a const so the global error handler can replay it: body-parser errors
+// (entity.too.large) fire before this middleware runs, yet the error page needs
+// the session's CSRF token to render a resubmittable form.
+const sessionMiddleware = session({
   // Prune expired rows every 15 min so the sessions table doesn't grow unbounded.
   store: new SQLiteStore({ client: db, expired: { clear: true, intervalMs: 15 * 60 * 1000 } }),
   secret: process.env.SESSION_SECRET || 'komorebi-dev-secret-change-in-prod',
@@ -164,7 +167,8 @@ app.use(session({
     secure: process.env.NODE_ENV === 'production',
     maxAge: 24 * 60 * 60 * 1000,        // F18(A) — 24h cookie ceiling; admin + publisher also have a 5-min idle timeout
   },
-}));
+});
+app.use(sessionMiddleware);
 
 const PORT       = process.env.PORT       || 3000;
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
@@ -878,11 +882,28 @@ function generateCsrfToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
+// Minimal styled 403 for CSRF failures — same "no raw error pages" principle as
+// the global error handler. Links back to the page the form was submitted from
+// (same-origin Referer only; falls back to the admin home).
+function sendCsrfError(req, res) {
+  let back = '/admin';
+  const ref = req.get('referer');
+  if (ref) { try { const u = new URL(ref); if (u.host === req.get('host')) back = u.pathname + u.search; } catch {} }
+  res.status(403).send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Session expired</title></head>
+<body style="font-family:'Inter',system-ui,-apple-system,sans-serif;background:#f5f7fa;color:#111827;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="background:#fff;border:1px solid #e2e6ea;border-radius:8px;padding:28px 32px;max-width:420px;text-align:center">
+  <h1 style="font-size:16px;font-weight:600;margin:0 0 8px">Invalid or expired form token</h1>
+  <p style="font-size:13px;color:#6b7280;margin:0 0 18px">Your session token didn't match — the page may have been open too long. Go back and resubmit the form.</p>
+  <a href="${H(back)}" style="display:inline-block;background:#00e5c3;color:#0d1117;padding:8px 18px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">← Back to previous page</a>
+</div></body></html>`);
+}
+
 function verifyCsrf(req, res, next) {
   const bodyToken    = (req.body._csrf || '').trim();
   const sessionToken = req.session.csrfToken || '';
   if (!bodyToken || !sessionToken || bodyToken !== sessionToken) {
-    return res.status(403).send('Invalid CSRF token');
+    return sendCsrfError(req, res);
   }
   next();
 }
@@ -3555,7 +3576,7 @@ app.post('/admin/advertisers/:slug/reconcile', requireAdmin, (req, res, next) =>
     const bodyToken    = (req.body._csrf || '').trim();
     const sessionToken = req.session.csrfToken || '';
     if (!bodyToken || !sessionToken || bodyToken !== sessionToken) {
-      return res.status(403).send('Invalid CSRF token');
+      return sendCsrfError(req, res);
     }
 
     const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(req.params.slug);
@@ -3984,7 +4005,7 @@ app.post('/advertiser/reconcile', requireAdvertiser, (req, res) => {
   csvUpload(req, res, err => {
     if (err) return res.redirect(`/advertiser/reconcile?msg=${encodeURIComponent(err.message)}&ok=0`);
     const bodyToken = (req.body._csrf || '').trim();
-    if (!bodyToken || bodyToken !== (req.session.csrfToken || '')) return res.status(403).send('Invalid CSRF token');
+    if (!bodyToken || bodyToken !== (req.session.csrfToken || '')) return sendCsrfError(req, res);
     if (!req.file) return res.redirect('/advertiser/reconcile?msg=No+file+uploaded&ok=0');
     const rows = parseCSV(req.file.buffer);
     const r = processReconcileRows(req.advertiser, rows, req.file.originalname, req);
@@ -4875,6 +4896,13 @@ const ADMIN_CSS = `
   .sh .meta{font-size:11px;color:#9ca3af}
   .sh-r{display:flex;gap:6px;align-items:center}
   table{width:100%;border-collapse:collapse}
+  /* UIUX — wide tables scroll horizontally inside their frame on narrow viewports
+     (the parent section has overflow:hidden, which otherwise clips them dead).
+     Inside a wrap, click_ids and badges stay on one line and scroll instead of
+     wrapping per-character. Desktop is unaffected: no overflow → no scrollbar. */
+  .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .table-wrap code.xs{word-break:normal;white-space:nowrap}
+  .table-wrap .badge{white-space:nowrap}
   th{background:#f9fafb;padding:8px 13px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:#6b7280;border-bottom:1px solid #f3f4f6;white-space:nowrap}
   td{padding:9px 13px;border-bottom:1px solid #f3f4f6;vertical-align:middle;font-size:13px;color:#111827}
   tr:last-child td{border-bottom:none}
@@ -5428,16 +5456,16 @@ ${flashHtml(flash)}
   </div>
   ${advStats.filter(a=>a.slug!=='legacy'||a.clicks>0).length===0
     ? '<div class="empty">No advertisers yet. <a href="/admin/advertisers/new">Create one.</a></div>'
-    : `<table><thead><tr><th>Advertiser / Tracking URL</th><th>Status</th><th>Clicks</th>
+    : `<div class="table-wrap"><table><thead><tr><th>Advertiser / Tracking URL</th><th>Status</th><th>Clicks</th>
         <th>Conv</th><th>Payout</th><th>Revenue</th><th>Margin</th><th>Cap (mo)</th><th>CVR</th><th>Postback URL</th><th>Actions</th></tr></thead>
-        <tbody>${advRows}</tbody></table>`}
+        <tbody>${advRows}</tbody></table></div>`}
 </section>
 
 <section>
   <div class="sh"><h2>Publisher Performance</h2><span class="meta">Top 100 by payout</span></div>
   ${pubRows.length===0 ? '<div class="empty">No data yet.</div>'
-    : `<table><thead><tr><th>Advertiser</th><th>Publisher</th><th>Clicks</th><th>Conv</th><th>Payout</th><th>Revenue</th><th>Margin</th><th>CVR</th><th></th></tr></thead>
-        <tbody>${pubRows}</tbody></table>`}
+    : `<div class="table-wrap"><table><thead><tr><th>Advertiser</th><th>Publisher</th><th>Clicks</th><th>Conv</th><th>Payout</th><th>Revenue</th><th>Margin</th><th>CVR</th><th></th></tr></thead>
+        <tbody>${pubRows}</tbody></table></div>`}
 </section>
 
 ${(topCountries.length || deviceSplit.length) ? `
@@ -5551,8 +5579,8 @@ ${(topCountries.length || deviceSplit.length) ? `
     <button type="button" class="btn btn-ghost" data-bulk-clear>Clear</button>
   </div>
   ${recentRows.length===0 ? '<div class="empty">No conversions match.</div>'
-    : `<table><thead><tr><th style="width:28px"><input type="checkbox" id="bulk-all" title="Select all"></th><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Cur</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
-        <tbody>${recentRows}</tbody></table>`}
+    : `<div class="table-wrap"><table><thead><tr><th style="width:28px"><input type="checkbox" id="bulk-all" title="Select all"></th><th>Received</th><th>Advertiser</th><th>Publisher</th><th>Click ID</th><th>Event</th><th>CTIT</th><th>Cur</th><th>Sub-Aff</th><th>Payout</th><th>Status</th><th>Fraud</th></tr></thead>
+        <tbody>${recentRows}</tbody></table></div>`}
 </section>
 <style>
 .bulk-bar{display:flex;align-items:center;gap:10px;background:#1d1d1f;color:#fff;padding:8px 14px;border-radius:8px;margin-bottom:10px;font-size:13px}
@@ -5691,8 +5719,8 @@ function renderMmpSync({ adv, logs, csrfToken = '', flash, error }) {
   </form>
   ${logs.length === 0
     ? '<div class="empty">No sync runs yet.</div>'
-    : `<table><thead><tr><th>When</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Flagged</th><th>Issues</th></tr></thead>
-        <tbody>${rows}</tbody></table>`}
+    : `<div class="table-wrap"><table><thead><tr><th>When</th><th>Status</th><th>Pulled</th><th>Matched</th><th>Approved</th><th>Rejected</th><th>Flagged</th><th>Issues</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`}
 </div></main>`;
   return adminLayout(`MMP Sync — ${adv.name}`, body);
 }
@@ -6035,8 +6063,8 @@ ${pending.length > 0 ? `
   </div>
   ${publishers.length===0
     ? '<div class="empty">No publisher accounts yet. <a href="/admin/publishers/new">Create one.</a></div>'
-    : `<table><thead><tr><th>Username / Contact</th><th>Status</th><th>Clicks</th><th>Conv</th><th>Payout</th><th>Created</th><th>Actions</th></tr></thead>
-        <tbody>${rows}</tbody></table>`}
+    : `<div class="table-wrap"><table><thead><tr><th>Username / Contact</th><th>Status</th><th>Clicks</th><th>Conv</th><th>Payout</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`}
 </section>
 </main>`;
 
@@ -6622,9 +6650,9 @@ function renderAuditLog({ logs, actions, filters }) {
   </div>
   ${logs.length === 0
     ? '<div class="empty">No audit entries match the current filter.</div>'
-    : `<table><thead><tr>
+    : `<div class="table-wrap"><table><thead><tr>
         <th>Timestamp</th><th>Action</th><th>Entity</th><th>ID</th><th>Detail</th><th>IP</th>
-      </tr></thead><tbody>${rows}</tbody></table>`}
+      </tr></thead><tbody>${rows}</tbody></table></div>`}
 </section>
 </main>`;
 
@@ -7006,8 +7034,8 @@ function renderGlobalPostbackLog({ dir, status, q, rows, stats, dupCount, dupSet
   }).join('');
 
   const table = dir === 'received'
-    ? `<table><thead><tr><th>Received At</th><th>Publisher</th><th>Advertiser</th><th>Click ID</th><th>Event</th><th>Status</th><th>Reason</th></tr></thead><tbody>${recvRows}</tbody></table>`
-    : `<table><thead><tr><th>Fired At</th><th>Publisher</th><th>Click ID</th><th>URL Fired</th><th>Status</th><th style="text-align:center">Attempt</th><th>Error</th></tr></thead><tbody>${sentRows}</tbody></table>`;
+    ? `<div class="table-wrap"><table><thead><tr><th>Received At</th><th>Publisher</th><th>Advertiser</th><th>Click ID</th><th>Event</th><th>Status</th><th>Reason</th></tr></thead><tbody>${recvRows}</tbody></table></div>`
+    : `<div class="table-wrap"><table><thead><tr><th>Fired At</th><th>Publisher</th><th>Click ID</th><th>URL Fired</th><th>Status</th><th style="text-align:center">Attempt</th><th>Error</th></tr></thead><tbody>${sentRows}</tbody></table></div>`;
 
   const body = `${adminHeader()}
 <main>
@@ -7106,9 +7134,9 @@ function renderCohortReport({ rows, by, cohortType, advFilter, advertisers }) {
     </div>
   </div>
   ${rows.length===0 ? '<div class="empty">No conversion data for this cohort.</div>' : `
-  <table><thead><tr>
+  <div class="table-wrap"><table><thead><tr>
     <th>Media Source</th><th>Conversions</th><th>LTV</th><th>D0</th><th>D1-7</th><th>D8-14</th><th>D15-28</th><th>D28+</th>
-  </tr></thead><tbody>${tableRows}</tbody></table>`}
+  </tr></thead><tbody>${tableRows}</tbody></table></div>`}
 </section>
 </main>`;
   return adminLayout('Cohort Report', body);
@@ -7141,7 +7169,7 @@ function renderPivotReport({ rows, dim1, dim2 }) {
     <p style="font-size:11px;color:#6e6e73;margin-top:8px">Tip: export to CSV for scheduled/emailed delivery. (A nightly emailed export can be wired to this endpoint via cron — see ops notes.)</p>
   </div>
   ${rows.length===0 ? '<div class="empty">No conversion data.</div>' : `
-  <table><thead><tr>${head}</tr></thead><tbody>${tableRows}</tbody></table>`}
+  <div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${tableRows}</tbody></table></div>`}
 </section>
 </main>`;
   return adminLayout('Pivot Report', body);
@@ -7608,7 +7636,7 @@ function renderExchangeRates({ rates, csrfToken = '', flash, error }) {
 ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}${error ? `<div class="form-err">${H(error)}</div>` : ''}
 <section>
   <div class="sh"><h2>Exchange Rates</h2><span class="meta">value of 1 unit in USD</span></div>
-  <table><thead><tr><th>Pair</th><th>Rate (→ USD)</th><th>Updated</th></tr></thead><tbody>${rows}</tbody></table>
+  <div class="table-wrap"><table><thead><tr><th>Pair</th><th>Rate (→ USD)</th><th>Updated</th></tr></thead><tbody>${rows}</tbody></table></div>
   <div style="padding:16px 20px;border-top:1px solid #f0f0f0">
     <form method="POST" action="/admin/exchange-rates" style="display:flex;gap:8px;align-items:end">${csrfField(csrfToken)}
       <div class="fg" style="margin:0"><label>Add / update currency</label><input type="text" name="base" placeholder="e.g. SGD" style="text-transform:uppercase"></div>
@@ -9687,9 +9715,9 @@ function renderEQM({ rows, csrfToken, flash }) {
 <section>
   <div class="sh"><h2>Early Quality Monitor</h2><span class="meta">${rows.length} publisher cohort(s)</span></div>
   <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">Projected D30 = D7 rate ÷ k. 🟢 ≥ gate · 🟡 ≥ 70% of gate · 🔴 below. Auto-throttle pauses a publisher after 2 consecutive Red evaluations.</p>
-  ${rows.length === 0 ? '<div class="empty">No cohort data yet.</div>' : `<table>
+  ${rows.length === 0 ? '<div class="empty">No cohort data yet.</div>' : `<div class="table-wrap"><table>
     <thead><tr><th>Advertiser</th><th>Publisher</th><th>Cohort</th><th>D7 rate</th><th>Projected D30</th><th>Gate</th><th>RAG</th><th>Auto-throttle</th></tr></thead>
-    <tbody>${trs}</tbody></table>`}
+    <tbody>${trs}</tbody></table></div>`}
 </section></main>`;
   return adminLayout('EQM', body);
 }
@@ -9703,9 +9731,9 @@ function renderFraudReview({ rows, filter }) {
 <section>
   <div class="sh"><h2>Fraud Review</h2><span class="meta">${rows.length} flag(s)</span></div>
   <div style="display:flex;gap:6px;margin-bottom:14px">${tab('all', 'All')}${tab('afid_ratio_breach', 'AFID ratio')}${tab('cycling', 'Cycling')}${tab('duplicate', 'Duplicate')}</div>
-  ${rows.length === 0 ? '<div class="empty">No fraud flags.</div>' : `<table>
+  ${rows.length === 0 ? '<div class="empty">No fraud flags.</div>' : `<div class="table-wrap"><table>
     <thead><tr><th>#</th><th>Click</th><th>Publisher</th><th>Advertiser</th><th>Flag</th><th>Detail</th><th>Auto-reject</th><th>When</th></tr></thead>
-    <tbody>${trs}</tbody></table>`}
+    <tbody>${trs}</tbody></table></div>`}
 </section></main>`;
   return adminLayout('Fraud Review', body);
 }
@@ -9916,7 +9944,7 @@ function renderPacing({ rows }) {
     }).join('');
     return `<section data-advertiser="${H(r.slug)}" data-margin="${r.margin}" data-revenue="${r.revenue}" data-payout="${r.payout}">
       <div class="sh"><h2>${H(r.name)}</h2><span class="meta">blended D30 ${r.blendedPct}% vs gate ${r.gate}% · proj. actives ${N(r.projActives)} · margin ${fm(r.margin, 'USD')}${r.marginPct != null ? ` (${r.marginPct}%)` : ''}</span></div>
-      <table><thead><tr><th>Phase</th><th>Quota (opens)</th><th>Actual opens</th><th>Pacing</th><th>Base/open</th></tr></thead><tbody>${phaseRows}</tbody></table>
+      <div class="table-wrap"><table><thead><tr><th>Phase</th><th>Quota (opens)</th><th>Actual opens</th><th>Pacing</th><th>Base/open</th></tr></thead><tbody>${phaseRows}</tbody></table></div>
       <div style="margin-top:6px"><a href="/admin/advertisers/${H(r.slug)}/quota" class="btn btn-ghost">Set quota</a></div>
     </section>`;
   }).join('');
@@ -9972,7 +10000,7 @@ function renderFxRates({ rows, csrfToken, flash }) {
       <label>Rate<input name="rate" type="number" step="0.0000001" min="0" required></label>
       <label>Period (YYYY-MM)<input name="reconciliation_period" placeholder="optional"></label>
       <button class="btn btn-primary">Add / Lock</button></form>
-    ${rows.length === 0 ? '<div class="empty">No FX rates yet.</div>' : `<table><thead><tr><th>From</th><th>To</th><th>Rate</th><th>Status</th><th>Locked at</th></tr></thead><tbody>${trs}</tbody></table>`}
+    ${rows.length === 0 ? '<div class="empty">No FX rates yet.</div>' : `<div class="table-wrap"><table><thead><tr><th>From</th><th>To</th><th>Rate</th><th>Status</th><th>Locked at</th></tr></thead><tbody>${trs}</tbody></table></div>`}
   </section></main>`;
   return adminLayout('FX Rates', body);
 }
@@ -10073,11 +10101,12 @@ cron.schedule('0 2 * * *', () => {
 }, { timezone: 'UTC' });
 
 // ---- Group 8 render helpers ----------------------------------------------
-function renderActiveDef({ adv, json, hasConfig, csrfToken, flash, error }) {
+function renderActiveDef({ adv, json, hasConfig, csrfToken, flash, error, errorNote }) {
   const body = `${adminHeader(`<a href="/admin/advertisers/${H(adv.slug)}/edit" class="hbtn ghost">Edit Advertiser</a>`)}
 <main>
 <div style="margin-bottom:14px"><a href="/admin/advertisers" style="font-size:13px;color:#0071e3">← Advertisers</a></div>
 ${flashHtml(flash ? { type: 'success', text: flash } : (error ? { type: 'error', text: error } : null))}
+${errorNote ? `<div style="font-size:12px;color:#6e6e73;margin:-8px 0 14px">${H(errorNote)}</div>` : ''}
 <section style="max-width:760px">
   <div class="sh"><h2>Active Definition — ${H(adv.name)}</h2></div>
   ${!hasConfig ? `<div style="background:#fff8e1;color:#8a6d00;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px">No config — using safe defaults. Edit and save the JSON below to activate funnel ingestion, cohort tracking and phased payouts for this advertiser.</div>` : ''}
@@ -10112,9 +10141,9 @@ ${flashHtml(flash)}
 <section>
   <div class="sh"><h2>Cohort D30 Active-Rate${slug ? ` — ${H(slug)}` : ''}</h2><span class="meta">${rows.length} cohort(s)</span></div>
   <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">Aged = opens old enough to evaluate (7d / 30d). Rates only populate once aged opens reach the configured <code>min_sample</code>. Projected = D7 rate ÷ k.</p>
-  ${rows.length === 0 ? '<div class="empty">No cohort data yet. Funnel postbacks populate cohorts; click “Recompute now” to refresh.</div>' : `<table>
+  ${rows.length === 0 ? '<div class="empty">No cohort data yet. Funnel postbacks populate cohorts; click “Recompute now” to refresh.</div>' : `<div class="table-wrap"><table>
     <thead><tr><th>Advertiser</th><th>Publisher</th><th>Cohort</th><th>Opens</th><th>Aged 7/30</th><th>Active 7/30</th><th>D7 rate</th><th>Actual D30</th><th>Projected D30</th><th>Maturity</th></tr></thead>
-    <tbody>${trs}</tbody></table>`}
+    <tbody>${trs}</tbody></table></div>`}
 </section>
 </main>`;
   return adminLayout('Cohort Stats', body);
@@ -10146,9 +10175,9 @@ function renderPayoutPreview({ adv, rows, hasConfig, csrfToken = '' }) {
   <div class="sh"><h2>Payout Preview — ${H(adv.name)}</h2><span class="meta">read-only — not committed</span></div>
   ${!hasConfig ? `<div style="background:#fff8e1;color:#8a6d00;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px">No active definition saved — preview uses safe defaults (base 0, no bonus).</div>` : ''}
   <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">Total = base_per_open + (bonus_per_active × active accounts in cohort). Phase is chosen by the cohort's open month.</p>
-  ${rows.length === 0 ? '<div class="empty">No cohorts to preview yet.</div>' : `<table>
+  ${rows.length === 0 ? '<div class="empty">No cohorts to preview yet.</div>' : `<div class="table-wrap"><table>
     <thead><tr><th>Publisher</th><th>Cohort</th><th>Phase</th><th>Base/open</th><th>Actual D30</th><th>Bonus/active</th><th>Active</th><th>Total</th></tr></thead>
-    <tbody>${trs}</tbody></table>`}
+    <tbody>${trs}</tbody></table></div>`}
 </section>
 <section>
   <div class="sh"><h2>Holdback Summary</h2></div>
@@ -10280,14 +10309,20 @@ app.use((err, req, res, next) => {
     const m = req.method === 'POST' && req.path.match(/^\/admin\/advertisers\/([^/]+)\/active-def$/);
     const adv = m ? db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(decodeURIComponent(m[1])) : null;
     if (adv) {
-      // The oversized body was never parsed, so re-render the saved config.
-      // Session middleware may not have run yet (the parser sits before it),
-      // hence the optional csrfToken — a reload restores the real token.
-      const saved = getRawActiveDef(adv.slug);
-      return res.status(400).send(renderActiveDef({
-        adv, json: saved || JSON.stringify(SAFE_DEFAULT_ACTIVE_DEF, null, 2), hasConfig: !!saved,
-        csrfToken: req.session?.csrfToken || '', error: 'Config JSON too large (max 10KB)',
-      }));
+      const renderEditor = () => {
+        // The oversized body was never parsed, so re-render the saved config.
+        const saved = getRawActiveDef(adv.slug);
+        res.status(400).send(renderActiveDef({
+          adv, json: saved || JSON.stringify(SAFE_DEFAULT_ACTIVE_DEF, null, 2), hasConfig: !!saved,
+          csrfToken: req.session?.csrfToken || '', error: 'Config JSON too large (max 10KB)',
+          errorNote: 'Your submitted config was too large to retain — the saved config is shown below.',
+        }));
+      };
+      // The parser threw before the session middleware ran, so replay it here
+      // to load the admin's session — the form needs the real CSRF token to be
+      // resubmittable straight from the error page.
+      if (req.session) return renderEditor();
+      return sessionMiddleware(req, res, () => renderEditor());
     }
     return res.status(413).json({ error: 'Payload too large' });
   }
