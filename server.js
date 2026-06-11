@@ -7882,6 +7882,12 @@ function renderResetPassword({ token, error, invalid } = {}) {
 </div>`);
 }
 
+// Publishers only ever see operationally-meaningful rejection reasons; internal
+// attribution/reconciliation reasons (telesale_wins, split_50, mmp_*, …) collapse
+// to a neutral "adjustment" label. Admin views render the raw reason unchanged.
+const PUB_SAFE_REASONS = new Set(['below_min_value', 'duplicate', 'duplicate_user', 'duplicate_click_id', 'not_activated', 'no_event']);
+const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'adjustment');
+
 function renderPubConversions({ pub, conversions }) {
   // F17 — show loan_amount / revenue columns only when at least one row has them.
   const showLoan    = conversions.some(c => c.loan_amount != null);
@@ -7894,7 +7900,7 @@ function renderPubConversions({ pub, conversions }) {
     <td style="white-space:nowrap;font-size:11px">${H(r.received_at.slice(0,10))}</td>
     <td>${H(r.adv_name||r.advertiser_slug)}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
-        ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
+        ${pubSafeReason(r.reason) ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(pubSafeReason(r.reason))}</div>` : ''}</td>
     <td><code class="xs">${H(r.click_id)}</code></td>
     <td><span class="badge">${H(r.event)}</span></td>
     ${showSub     ? `<td>${r.af_sub1 ? `<code class="xs">${H(r.af_sub1)}</code>` : ''}</td>` : ''}
@@ -8150,7 +8156,7 @@ function renderPubDashboard({ pub, totalClicks, totalConversions,
     <td><span class="badge">${H(r.event)}</span></td>
     <td>${fmtCur(r.payout, r.currency)}${calc}</td>
     <td><span class="badge ${H(r.status||'pending')}">${H(r.status||'pending')}</span>
-        ${r.reason ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(r.reason)}</div>` : ''}</td>
+        ${pubSafeReason(r.reason) ? `<div style="font-size:10px;color:#6e6e73;margin-top:2px">${H(pubSafeReason(r.reason))}</div>` : ''}</td>
   </tr>`;
   }).join('');
 
@@ -10259,6 +10265,35 @@ cron.schedule('0 0 * * *', () => {
   sendDailySummaryEmail().catch(e => console.error('Daily summary email error:', e.message));
   fireWebhookDailySummary().catch(e => console.error('Daily summary webhook error:', e.message));
 }, { timezone: 'Asia/Singapore' });
+
+// ---------------------------------------------------------------------------
+// Global error handler — registered after every route so nothing falls through
+// to Express's default handler, which renders the stack trace (and filesystem
+// paths) into the response. Body-parser 413s on the active-def editor get the
+// same friendly flash as the in-handler 10KB cap (F21); other routes get clean
+// JSON. Everything else logs server-side and returns a generic 500, regardless
+// of NODE_ENV.
+// ---------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err.type === 'entity.too.large') {
+    const m = req.method === 'POST' && req.path.match(/^\/admin\/advertisers\/([^/]+)\/active-def$/);
+    const adv = m ? db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(decodeURIComponent(m[1])) : null;
+    if (adv) {
+      // The oversized body was never parsed, so re-render the saved config.
+      // Session middleware may not have run yet (the parser sits before it),
+      // hence the optional csrfToken — a reload restores the real token.
+      const saved = getRawActiveDef(adv.slug);
+      return res.status(400).send(renderActiveDef({
+        adv, json: saved || JSON.stringify(SAFE_DEFAULT_ACTIVE_DEF, null, 2), hasConfig: !!saved,
+        csrfToken: req.session?.csrfToken || '', error: 'Config JSON too large (max 10KB)',
+      }));
+    }
+    return res.status(413).json({ error: 'Payload too large' });
+  }
+  console.error('[error]', req.method, req.path, err.stack || err);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
 // ---------------------------------------------------------------------------
 // Memory monitoring — every 5 minutes, alert if > 85%, at most once per hour

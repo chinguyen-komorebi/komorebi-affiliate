@@ -174,6 +174,38 @@ const seedConv = db.prepare("INSERT INTO conversions (click_id, advertiser_slug,
   // F24.5 — payout reflects recomputed D30 rate: a non-aged cohort yields base only (no bonus)
   ok('F24.5 D30-driven bonus only after maturity (matured rate used)', cohortRow('g8adv', 'g8pubA', '2024-01').is_matured === 1);
 
+  // ===== UIUX review fixes — B1 (413 stack-trace leak) + D (publisher reason exposure) =====
+  const noStack = t => !/PayloadTooLargeError|SyntaxError|node_modules|\/server\.js/.test(t);
+
+  // (a) 24KB config blows the 10kb urlencoded body limit → friendly flash, no stack trace
+  const hugeRes = await post(admin, '/admin/advertisers/g8adv/active-def', { config: JSON.stringify({ pad: 'x'.repeat(24000) }) }, '/admin/advertisers/g8adv/active-def');
+  const hugeBody = await txt(hugeRes);
+  ok('B1.a oversized (24KB) active-def → 400 with friendly flash', hugeRes.status === 400 && hugeBody.includes('Config JSON too large (max 10KB)'), 'status=' + hugeRes.status);
+  ok('B1.a oversized active-def response has no stack trace', noStack(hugeBody));
+
+  // (b) >10kb body on any other route → clean 413 JSON
+  const otherRes = await fetch(`${BASE}/admin/login`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'username=' + 'x'.repeat(12000), redirect: 'manual' });
+  const otherBody = await otherRes.text();
+  ok('B1.b oversized body on other route → 413 JSON', otherRes.status === 413 && JSON.parse(otherBody).error === 'Payload too large', `status=${otherRes.status} body=${otherBody.slice(0, 120)}`);
+  ok('B1.b 413 response has no stack trace', noStack(otherBody));
+
+  // (c) parser-level error (malformed JSON body) → generic 500, no stack trace
+  const errRes = await fetch(`${BASE}/admin/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{invalid json', redirect: 'manual' });
+  const errBody = await errRes.text();
+  ok('B1.c unexpected error → generic 500 JSON', errRes.status === 500 && JSON.parse(errBody).error === 'Internal server error', `status=${errRes.status} body=${errBody.slice(0, 120)}`);
+  ok('B1.c 500 response has no stack trace', noStack(errBody));
+
+  // (d) publisher views collapse internal reasons to "adjustment"; safe ones stay visible
+  db.prepare("INSERT INTO conversions (click_id, advertiser_slug, publisher, event, payout, currency, status, reason) VALUES ('g8-internal-reason','g8adv','g8pub','first_trade',0,'VND','rejected','telesale_wins')").run();
+  const pubJar = makeJar();
+  await post(pubJar, '/publisher/login', { username: 'g8pub', password: 'g8pubpass1' }, '/publisher/login');
+  const pubConvPage = await txt(await pubJar.req('GET', '/publisher/conversions'));
+  ok('D.1 internal reason hidden from publisher', !pubConvPage.includes('telesale_wins'));
+  ok('D.1 internal reason shown as neutral "adjustment"', pubConvPage.includes('adjustment'));
+  ok('D.2 publisher-safe reason still visible', pubConvPage.includes('below_min_value'));
+  const pubDashPage = await txt(await pubJar.req('GET', '/publisher/dashboard'));
+  ok('D.3 publisher dashboard also masks internal reason', !pubDashPage.includes('telesale_wins'));
+
   console.log(`\nPASSED: ${pass}`);
   if (failures.length) { console.log(`FAILED: ${failures.length}`); failures.forEach(f => console.log('  ✗ ' + f)); process.exit(1); }
   console.log('ALL GREEN ✓'); process.exit(0);
