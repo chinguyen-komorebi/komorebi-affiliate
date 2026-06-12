@@ -529,6 +529,13 @@ function detectTz(req) {
   return validTz(getCookie(req, 'tz')) || FALLBACK_TZ;
 }
 
+// "Asia/Saigon" is a legacy IANA alias of Asia/Ho_Chi_Minh (same UTC+7 zone)
+// that some client OSes still report in the tz cookie. Normalize at the render
+// layer so timestamps don't show two names for the same zone.
+function displayTz(tz) {
+  return tz === 'Asia/Saigon' ? 'Asia/Ho_Chi_Minh' : tz;
+}
+
 // Format a SQLite UTC string ("YYYY-MM-DD HH:MM:SS") in any IANA timezone
 function formatInTz(utcStr, tz) {
   const date = new Date(utcStr.replace(' ', 'T') + 'Z');
@@ -1477,7 +1484,7 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const ip = getIp(req);
   if (!isWhitelisted(ip)) {
     logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted' });
-    return res.status(403).json({ error: 'Forbidden — IP not whitelisted', ip });
+    return res.status(403).json({ error: 'Forbidden — IP not whitelisted' });
   }
 
   const { slug }                             = req.params;
@@ -1805,7 +1812,7 @@ app.get('/postback/:slug/protect360', postbackLimiter, (req, res) => {
   const ip = getIp(req);
   if (!isWhitelisted(ip)) {
     logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted' });
-    return res.status(403).json({ error: 'Forbidden — IP not whitelisted', ip });
+    return res.status(403).json({ error: 'Forbidden — IP not whitelisted' });
   }
   const { slug } = req.params;
   const click_id = (req.query.click_id || '').toString().trim();
@@ -4903,6 +4910,23 @@ const ADMIN_CSS = `
   .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
   .table-wrap code.xs{word-break:normal;white-space:nowrap}
   .table-wrap .badge{white-space:nowrap}
+  /* UIUX sweep — FX add-rate form: 5-across on desktop, stacked on phones */
+  .fx-add-form{display:grid;grid-template-columns:repeat(4,1fr) auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px;margin-bottom:14px}
+  .fx-add-form input{width:100%}
+  @media (max-width:640px){
+    .fx-add-form{grid-template-columns:1fr}
+    .fx-add-form .btn{width:100%;justify-content:center;min-height:44px}
+  }
+  /* UIUX sweep — per-row actions dropdown (advertisers list). The list is
+     position:fixed (placed by JS) so section{overflow:hidden} can't clip it. */
+  .act-menu{position:relative;display:inline-block}
+  .act-menu-list{display:none;position:fixed;background:#fff;border:1px solid #e2e6ea;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.14);min-width:190px;z-index:60;padding:4px}
+  .act-menu-list.open{display:block}
+  .act-menu-list a,.act-menu-list button{display:flex;align-items:center;width:100%;min-height:44px;padding:0 14px;font-size:13px;color:#111827;background:none;border:none;border-radius:6px;cursor:pointer;text-align:left;font-family:inherit;white-space:nowrap}
+  .act-menu-list a:hover,.act-menu-list button:hover{background:#f3f4f6}
+  .act-menu-list form{margin:0}
+  .act-menu-list .menu-danger{color:#991b1b}
+  .act-menu-list .menu-warn{color:#92651a}
   th{background:#f9fafb;padding:8px 13px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:#6b7280;border-bottom:1px solid #f3f4f6;white-space:nowrap}
   td{padding:9px 13px;border-bottom:1px solid #f3f4f6;vertical-align:middle;font-size:13px;color:#111827}
   tr:last-child td{border-bottom:none}
@@ -5649,21 +5673,28 @@ function renderAdvList({ advStats, flash, csrfToken = '' }) {
       </td>
       <td><div class="act">
         ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/edit" class="btn btn-ghost">Edit</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/campaigns" class="btn btn-ghost">Campaigns</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/publishers" class="btn btn-ghost">Publishers</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/tiers" class="btn btn-ghost">Tiers</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/active-def" class="btn btn-ghost">Active Def</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/payout-preview" class="btn btn-ghost">Payout</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/attribution" class="btn btn-ghost">Attribution</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/mmp" class="btn btn-ghost">MMP</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/analytics" class="btn btn-ghost">Analytics</a>`}
-        ${isLegacy ? '' : `<a href="/admin/advertisers/${H(a.slug)}/reconcile" class="btn btn-primary">Reconcile</a>`}
-        ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle" style="display:inline">${csrfField(csrfToken)}
-          <button class="btn ${a.status==='active'?'btn-warn':'btn-ghost'}">${a.status==='active'?'Pause':'Activate'}</button></form>`}
-        ${isLegacy ? '' : `<form method="POST" action="/admin/advertisers/${H(a.slug)}/delete" style="display:inline"
-          data-confirm="Delete ${H(a.name)}? Historical data is kept.">${csrfField(csrfToken)}
-          <button class="btn btn-danger">Delete</button></form>`}
-        <a href="/admin/export.csv?advertiser=${H(a.slug)}" class="btn btn-ghost">CSV</a>
+        ${isLegacy
+          ? `<a href="/admin/export.csv?advertiser=${H(a.slug)}" class="btn btn-ghost">CSV</a>`
+          : `<div class="act-menu">
+          <button type="button" class="btn btn-ghost" data-act-toggle aria-haspopup="true" aria-expanded="false" title="More actions">⋯</button>
+          <div class="act-menu-list">
+            <a href="/admin/advertisers/${H(a.slug)}/campaigns">Campaigns</a>
+            <a href="/admin/advertisers/${H(a.slug)}/publishers">Publishers</a>
+            <a href="/admin/advertisers/${H(a.slug)}/tiers">Tiers</a>
+            <a href="/admin/advertisers/${H(a.slug)}/active-def">Active Def</a>
+            <a href="/admin/advertisers/${H(a.slug)}/payout-preview">Payout</a>
+            <a href="/admin/advertisers/${H(a.slug)}/attribution">Attribution</a>
+            <a href="/admin/advertisers/${H(a.slug)}/mmp">MMP</a>
+            <a href="/admin/advertisers/${H(a.slug)}/analytics">Analytics</a>
+            <a href="/admin/advertisers/${H(a.slug)}/reconcile">Reconcile</a>
+            <a href="/admin/export.csv?advertiser=${H(a.slug)}">CSV</a>
+            <form method="POST" action="/admin/advertisers/${H(a.slug)}/toggle">${csrfField(csrfToken)}
+              <button class="${a.status==='active'?'menu-warn':''}">${a.status==='active'?'Pause':'Activate'}</button></form>
+            <form method="POST" action="/admin/advertisers/${H(a.slug)}/delete"
+              data-confirm="Delete ${H(a.name)}? Historical data is kept.">${csrfField(csrfToken)}
+              <button class="menu-danger">Delete</button></form>
+          </div>
+        </div>`}
       </div></td>
     </tr>`;
   }).join('');
@@ -5683,7 +5714,40 @@ ${flashHtml(flash)}
         <th>Conv</th><th>Payout</th><th>CVR</th><th>Postback URL</th><th>Actions</th>
       </tr></thead><tbody>${rows}</tbody></table>`}
 </section>
-</main><script>${CP_JS}</script>`;
+</main><script>${CP_JS}</script>
+<script>
+// Actions dropdown — one open at a time, closes on outside click / scroll /
+// resize / Escape. The list is position:fixed and placed from the button's
+// rect so section{overflow:hidden} can't clip it (flips upward near the
+// bottom edge).
+(function(){
+  function closeAll(){
+    document.querySelectorAll('.act-menu-list.open').forEach(function(l){
+      l.classList.remove('open'); l.style.left=''; l.style.top='';
+      var b=l.parentElement.querySelector('[data-act-toggle]');
+      if(b) b.setAttribute('aria-expanded','false');
+    });
+  }
+  document.addEventListener('click', function(e){
+    var btn=e.target.closest('[data-act-toggle]');
+    if(!btn){ if(!e.target.closest('.act-menu-list')) closeAll(); return; }
+    var list=btn.parentElement.querySelector('.act-menu-list');
+    var wasOpen=list.classList.contains('open');
+    closeAll();
+    if(wasOpen) return;
+    list.classList.add('open');
+    btn.setAttribute('aria-expanded','true');
+    var r=btn.getBoundingClientRect(), lr=list.getBoundingClientRect();
+    var left=Math.max(8, Math.min(r.right-lr.width, window.innerWidth-lr.width-8));
+    var top=r.bottom+4;
+    if(top+lr.height>window.innerHeight-8) top=Math.max(8, r.top-lr.height-4);
+    list.style.left=left+'px'; list.style.top=top+'px';
+  });
+  document.addEventListener('keydown', function(e){ if(e.key==='Escape') closeAll(); });
+  window.addEventListener('scroll', closeAll, true);
+  window.addEventListener('resize', closeAll);
+})();
+</script>`;
 
   return adminLayout('Advertisers', body);
 }
@@ -6609,7 +6673,7 @@ function renderAuditLog({ logs, actions, filters }) {
     return `<tr>
       <td style="white-space:nowrap;font-size:11px;color:#6e6e73">
         ${H(localTs)}
-        <div style="font-size:9px;color:#aaa;margin-top:2px">${H(rowTz)}</div>
+        <div style="font-size:9px;color:#aaa;margin-top:2px">${H(displayTz(rowTz))}</div>
       </td>
       <td><span class="badge ${actionColor(l.action)}" style="white-space:nowrap">${H(l.action)}</span></td>
       <td style="font-size:12px">${H(l.entity_type || '')}</td>
@@ -6921,7 +6985,7 @@ ${resultHtml}
     <h2>Upload Reconciliation File — ${H(adv.name)}</h2>
   </div>
   <div style="padding:20px 24px">
-    <div style="background:#f5f5f7;border-radius:8px;padding:14px 16px;margin-bottom:20px;font-size:12px;line-height:1.6">
+    <div style="background:#f5f5f7;border-radius:8px;padding:14px 16px;margin-bottom:20px;font-size:12px;line-height:1.6;overflow-x:auto">
       <strong>Expected CSV format:</strong><br>
       <code>click_id,transaction_id,status,reason,payout</code><br>
       <code>abc-123-def,,approved,,15.00</code><br>
@@ -9994,7 +10058,7 @@ function renderFxRates({ rows, csrfToken, flash }) {
   const body = `${adminHeader()}<main>${flashHtml(flash)}
   <section><div class="sh"><h2>FX Rates</h2><span class="meta">${rows.length} rate(s)</span></div>
     <p style="font-size:12px;color:#6e6e73;margin:0 0 12px">A rate with a reconciliation period is <strong>locked</strong> for that month; reconciliation uses the locked rate, not the live one.</p>
-    <form method="POST" action="/admin/fx-rates" style="display:grid;grid-template-columns:repeat(4,1fr) auto;gap:8px;align-items:end;background:#f5f5f7;padding:14px;border-radius:10px;margin-bottom:14px">${csrfField(csrfToken)}
+    <form method="POST" action="/admin/fx-rates" class="fx-add-form">${csrfField(csrfToken)}
       <label>From<input name="from_currency" placeholder="VND" maxlength="8" required></label>
       <label>To<input name="to_currency" value="USD" maxlength="8"></label>
       <label>Rate<input name="rate" type="number" step="0.0000001" min="0" required></label>
@@ -10294,6 +10358,29 @@ cron.schedule('0 0 * * *', () => {
   sendDailySummaryEmail().catch(e => console.error('Daily summary email error:', e.message));
   fireWebhookDailySummary().catch(e => console.error('Daily summary webhook error:', e.message));
 }, { timezone: 'Asia/Singapore' });
+
+// ---------------------------------------------------------------------------
+// Catch-all 404 — Express's default is plain-text "Cannot GET /path", which
+// echoes the request path back. API-style paths get clean JSON; browser paths
+// get a minimal styled page linking back to their section's home. The
+// requested path is never echoed into the response.
+// ---------------------------------------------------------------------------
+app.use((req, res) => {
+  if (/^\/(api|postback|track)\//.test(req.path)) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const home = req.path.startsWith('/publisher') ? '/publisher/login'
+             : req.path.startsWith('/admin')     ? '/admin'
+             : '/';
+  res.status(404).send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Page not found</title></head>
+<body style="font-family:'Inter',system-ui,-apple-system,sans-serif;background:#f5f7fa;color:#111827;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="background:#fff;border:1px solid #e2e6ea;border-radius:8px;padding:28px 32px;max-width:420px;text-align:center">
+  <h1 style="font-size:16px;font-weight:600;margin:0 0 8px">Page not found</h1>
+  <p style="font-size:13px;color:#6b7280;margin:0 0 18px">The page you're looking for doesn't exist or may have moved.</p>
+  <a href="${home}" style="display:inline-block;background:#00e5c3;color:#0d1117;padding:8px 18px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">← Back to home</a>
+</div></body></html>`);
+});
 
 // ---------------------------------------------------------------------------
 // Global error handler — registered after every route so nothing falls through
