@@ -1683,14 +1683,16 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
              : (payoutType === 'percent' && loanAmount != null && loanAmount > 1000) ? 'VND' : 'USD';
   }
 
-  // F15 — duplicate-user detection. If this user_id already converted for this advertiser
-  // (any publisher, any prior event), record the row as a zero-payout duplicate (HTTP 200).
-  // First conversion for the user_id+advertiser wins and keeps its payout.
+  // F15 — duplicate-user detection. Dedup is keyed by (advertiser + user_id + event):
+  // the same user converting again on the SAME product is a zero-payout duplicate, while
+  // distinct products for the same user — apps with multiple payable products (card + loan,
+  // open-account + first-trade, etc.) — each remain payable. The first matching conversion
+  // for a given (advertiser, user_id, event) wins and keeps its payout.
   let convStatus = null, convReason = null, duplicate = false;
   if (userId) {
     const prior = db.prepare(
-      'SELECT 1 FROM conversions WHERE advertiser_slug = ? AND user_id = ? LIMIT 1'
-    ).get(slug, userId);
+      'SELECT 1 FROM conversions WHERE advertiser_slug = ? AND user_id = ? AND event = ? LIMIT 1'
+    ).get(slug, userId, event);
     if (prior) {
       duplicate = true;
       convStatus = 'duplicate';
@@ -1754,8 +1756,13 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   // Backlog #14 — duplicate click_id across distinct events. Once a click_id has 2+
   // distinct events, flag every conversion for that click_id, preserving any CTIT flag
   // already set on the row (e.g. 'duplicate_click_id|ctit_too_fast').
+  // Multi-product advertisers — those configured with 2+ active goals (2+ distinct payable
+  // products on one app, e.g. card + loan, open-account + first-trade) — legitimately fire
+  // 2+ distinct events on one click_id, so they are exempt. Advertisers with 0-1 active
+  // goals keep the flag. (Exact-duplicate events stay blocked by UNIQUE(click_id, event).)
+  const activeGoalCount = db.prepare("SELECT COUNT(*) AS n FROM goals WHERE advertiser_id = ? AND status = 'active'").get(adv.id).n;
   const distinctEvents = db.prepare('SELECT COUNT(DISTINCT event) AS n FROM conversions WHERE click_id = ?').get(click_id).n;
-  if (distinctEvents >= 2) {
+  if (distinctEvents >= 2 && activeGoalCount < 2) {
     const dupRows = db.prepare('SELECT id, fraud_flag FROM conversions WHERE click_id = ?').all(click_id);
     const setFlag = db.prepare('UPDATE conversions SET fraud_flag = ? WHERE id = ?');
     for (const r of dupRows) {

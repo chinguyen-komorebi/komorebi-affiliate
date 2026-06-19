@@ -209,9 +209,15 @@ async function postback(slug, qs) {
   const cU1 = await track('adv-basic', 'p1');
   const rU1 = await postback('adv-basic', `click_id=${cU1}&event=sale&user_id=USER-X`);
   ok('F15 first user_id → ok + payout', rU1.json.status === 'ok' && rU1.json.payout === 10);
+  // Dedup is keyed by (advertiser + user_id + event): same user repeating the SAME event
+  // is a zero-payout duplicate.
   const cU2 = await track('adv-basic', 'p1');
-  const rU2 = await postback('adv-basic', `click_id=${cU2}&event=purchase&user_id=USER-X`);
-  ok('F15 repeat user_id → duplicate + payout 0 + 200', rU2.status === 200 && rU2.json.status === 'duplicate' && rU2.json.payout === 0);
+  const rU2 = await postback('adv-basic', `click_id=${cU2}&event=sale&user_id=USER-X`);
+  ok('F15 repeat user_id same event → duplicate + payout 0 + 200', rU2.status === 200 && rU2.json.status === 'duplicate' && rU2.json.payout === 0);
+  // Same user on a DIFFERENT event is a distinct product (multi-product) → stays payable.
+  const cU2b = await track('adv-basic', 'p1');
+  const rU2b = await postback('adv-basic', `click_id=${cU2b}&event=purchase&user_id=USER-X`);
+  ok('F15 same user different event → ok (multi-product)', rU2b.status === 200 && rU2b.json.status === 'ok');
   const cU3 = await track('adv-basic', 'p1');
   ok('F15 different user_id → ok', (await postback('adv-basic', `click_id=${cU3}&event=sale&user_id=USER-Y`)).json.status === 'ok');
   // admin override duplicate → approved

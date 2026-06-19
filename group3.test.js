@@ -146,6 +146,60 @@ const postback = (slug, qs) => fetch(`${BASE}/postback/${slug}?${qs}`, { redirec
   const csv = await txt(await admin.req('GET', '/admin/export.csv?advertiser=g3a'));
   ok('#17 CSV export has af_sub1/af_sub2 columns + value', csv.split('\n')[0].includes('af_sub1,af_sub2') && csv.includes('AGENCY1'));
 
+  // ===== Multi-product postback (advertisers with 2+ active goals) =====
+  // An app with two distinct payable products (card + loan) on one click_id. Each product is
+  // a separate goal/event, so two conversions on one click_id are legitimate — the advertiser
+  // is exempt from the #14 duplicate_click_id flag. Dedup stays per (advertiser+user+event).
+  await post(admin, '/admin/advertisers',
+    { name: 'G3 MultiProd', slug: 'g3mp', offer_url: 'https://g3mp.test/o', payout_amount: 10, payout_type: 'fixed', click_lookback_window: 90, status: 'active' },
+    '/admin/advertisers/new');
+  const mpId = db.prepare("SELECT id FROM advertisers WHERE slug='g3mp'").get().id;
+  await post(admin, `/admin/publishers/${pId}/assign`, { advertiser_id: mpId }, `/admin/publishers/${pId}/edit`);
+  await post(admin, '/admin/advertisers/g3mp/goals', { name: 'Card', event_token: 'card', payout: 325000, payout_type: 'fixed', description: '' }, '/admin/advertisers/g3mp/edit');
+  await post(admin, '/admin/advertisers/g3mp/goals', { name: 'Loan', event_token: 'loan', payout: 14, payout_type: 'fixed', description: '' }, '/admin/advertisers/g3mp/edit');
+  ok('MP setup: advertiser has 2 active goals', db.prepare("SELECT COUNT(*) n FROM goals WHERE advertiser_id=? AND status='active'").get(mpId).n === 2);
+
+  // one click_id fires both products
+  const cMP = await track('g3mp?pub=g3p');
+  db.prepare("UPDATE clicks SET created_at = datetime('now','-1 hour') WHERE click_id=?").run(cMP);
+  const jCard = await (await postback('g3mp', `click_id=${cMP}&event=card`)).json();
+  const jLoan = await (await postback('g3mp', `click_id=${cMP}&event=loan&loan_amount=99000000`)).json();
+  ok('MP card conversion ok + fixed payout 325000', jCard.status === 'ok' && jCard.payout === 325000, JSON.stringify(jCard));
+  // loan payout is FIXED — a large loan_amount must NOT scale it (no percent math)
+  ok('MP loan conversion ok + fixed payout 14 (no % scaling)', jLoan.status === 'ok' && jLoan.payout === 14, JSON.stringify(jLoan));
+  const mpRows = db.prepare('SELECT event, payout, fraud_flag FROM conversions WHERE click_id=? ORDER BY event').all(cMP);
+  ok('MP both products recorded, neither flagged duplicate_click_id',
+    mpRows.length === 2 && mpRows.every(r => !(r.fraud_flag || '').includes('duplicate_click_id')),
+    JSON.stringify(mpRows));
+
+  // same user + SAME event on a multi-product advertiser → duplicate_user $0
+  const cMPa = await track('g3mp?pub=g3p');
+  db.prepare("UPDATE clicks SET created_at = datetime('now','-1 hour') WHERE click_id=?").run(cMPa);
+  await postback('g3mp', `click_id=${cMPa}&event=card&user_id=MP-USER`);
+  const cMPb = await track('g3mp?pub=g3p');
+  db.prepare("UPDATE clicks SET created_at = datetime('now','-1 hour') WHERE click_id=?").run(cMPb);
+  const rDupU = await (await postback('g3mp', `click_id=${cMPb}&event=card&user_id=MP-USER`)).json();
+  ok('MP same user + same event → duplicate_user $0', rDupU.status === 'duplicate' && rDupU.payout === 0, JSON.stringify(rDupU));
+  // same user + DIFFERENT event → still payable (distinct product)
+  const rDiffEv = await (await postback('g3mp', `click_id=${cMPb}&event=loan&user_id=MP-USER`)).json();
+  ok('MP same user + different event → ok (multi-product)', rDiffEv.status === 'ok' && rDiffEv.payout === 14, JSON.stringify(rDiffEv));
+
+  // regression: advertiser with exactly 1 active goal still flags duplicate_click_id
+  await post(admin, '/admin/advertisers',
+    { name: 'G3 OneGoal', slug: 'g3og', offer_url: 'https://g3og.test/o', payout_amount: 10, payout_type: 'fixed', click_lookback_window: 90, status: 'active' },
+    '/admin/advertisers/new');
+  const ogId = db.prepare("SELECT id FROM advertisers WHERE slug='g3og'").get().id;
+  await post(admin, `/admin/publishers/${pId}/assign`, { advertiser_id: ogId }, `/admin/publishers/${pId}/edit`);
+  await post(admin, '/admin/advertisers/g3og/goals', { name: 'Sale', event_token: 'sale', payout: 20, payout_type: 'fixed', description: '' }, '/admin/advertisers/g3og/edit');
+  ok('OG setup: advertiser has exactly 1 active goal', db.prepare("SELECT COUNT(*) n FROM goals WHERE advertiser_id=? AND status='active'").get(ogId).n === 1);
+  const cOG = await track('g3og?pub=g3p');
+  db.prepare("UPDATE clicks SET created_at = datetime('now','-1 hour') WHERE click_id=?").run(cOG);
+  await postback('g3og', `click_id=${cOG}&event=sale`);
+  await postback('g3og', `click_id=${cOG}&event=purchase`);
+  const ogRows = db.prepare('SELECT fraud_flag FROM conversions WHERE click_id=? ORDER BY event').all(cOG);
+  ok('OG 1-goal advertiser (0-1 goals) still flags duplicate_click_id',
+    ogRows.length === 2 && ogRows.every(r => r.fraud_flag === 'duplicate_click_id'), JSON.stringify(ogRows));
+
   db.close?.();
   console.log(`\nPASSED: ${pass}`);
   if (failures.length) { console.log(`FAILED: ${failures.length}`); failures.forEach(f => console.log('  ✗ ' + f)); cleanup(); process.exit(1); }
