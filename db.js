@@ -1021,4 +1021,100 @@ if (backfilled !== 'done') {
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('assignments_backfilled', 'done')").run();
 }
 
+// ===========================================================================
+// Publisher S2S Integration (spec 30/07/2026) — schema foundation.
+// ALL new columns are nullable / have safe defaults → 100% backward compatible.
+// Existing publishers stay in 'standard' mode; nothing about current click,
+// conversion, dedup, API or postback behaviour changes until a publisher is
+// explicitly switched to an S2S mode.
+// ===========================================================================
+
+// --- external_click_id: Yana's own click id, stored alongside (never replacing)
+// Komorebi's internal click_id. Nullable; absence is normal (standard publishers).
+{
+  const cc = db.prepare('PRAGMA table_info(clicks)').all().map(c => c.name);
+  if (!cc.includes('external_click_id')) db.exec('ALTER TABLE clicks ADD COLUMN external_click_id TEXT');
+  const cv = db.prepare('PRAGMA table_info(conversions)').all().map(c => c.name);
+  if (!cv.includes('external_click_id')) db.exec('ALTER TABLE conversions ADD COLUMN external_click_id TEXT');
+  // Index for reconciliation by (publisher, external_click_id) — spec §15.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_clicks_extclick ON clicks(publisher, external_click_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_conv_extclick   ON conversions(publisher, external_click_id)');
+}
+
+// --- af_sub3/4/5 on conversions (spec §9 identity mapping — sub-level source ids).
+// af_sub1/af_sub2 already exist. These carry Yana source/placement ids under the
+// single AppsFlyer PID komorebi24_int.
+{
+  const cv = db.prepare('PRAGMA table_info(conversions)').all().map(c => c.name);
+  for (const col of ['af_sub3', 'af_sub4', 'af_sub5']) {
+    if (!cv.includes(col)) db.exec(`ALTER TABLE conversions ADD COLUMN ${col} TEXT`);
+  }
+  const ck = db.prepare('PRAGMA table_info(clicks)').all().map(c => c.name);
+  for (const col of ['af_sub3', 'af_sub4', 'af_sub5']) {
+    if (!ck.includes(col)) db.exec(`ALTER TABLE clicks ADD COLUMN ${col} TEXT`);
+  }
+}
+
+// --- publishers.integration_mode: 'standard' | 's2s_network' | 'portal_s2s'.
+// DEFAULT 'standard' — every existing and new publisher keeps current behaviour.
+// Outbound postback is gated on this + a configured URL + active flag (spec §5).
+{
+  const pc = db.prepare('PRAGMA table_info(publishers)').all().map(c => c.name);
+  if (!pc.includes('integration_mode')) db.exec("ALTER TABLE publishers ADD COLUMN integration_mode TEXT NOT NULL DEFAULT 'standard'");
+  // Independent access flags (spec §12) — nullable, default on to preserve today.
+  if (!pc.includes('s2s_postback_active')) db.exec('ALTER TABLE publishers ADD COLUMN s2s_postback_active INTEGER NOT NULL DEFAULT 0');
+  if (!pc.includes('postback_secret'))     db.exec('ALTER TABLE publishers ADD COLUMN postback_secret TEXT');
+}
+
+// BACKWARD-COMPAT (critical, spec §16 "no unintended outbound postback"): any
+// publisher that ALREADY had a postback_url before this feature was receiving
+// outbound postbacks. Gating on integration_mode must NOT silently stop them.
+// One-time: mark such publishers portal_s2s + active so their behaviour is
+// unchanged. New publishers stay standard + inactive (no postback until opted in).
+// Guarded by a settings flag so it runs exactly once.
+{
+  const done = db.prepare("SELECT value FROM settings WHERE key = 's2s_postback_backfill'").get()?.value;
+  if (done !== 'done') {
+    const hasPostbackCol = db.prepare('PRAGMA table_info(publishers)').all().some(c => c.name === 'postback_url');
+    if (hasPostbackCol) {
+      db.exec(`UPDATE publishers
+                 SET integration_mode = CASE WHEN integration_mode = 'standard' THEN 'portal_s2s' ELSE integration_mode END,
+                     s2s_postback_active = 1
+               WHERE postback_url IS NOT NULL AND TRIM(postback_url) <> ''`);
+    }
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('s2s_postback_backfill', 'done')").run();
+  }
+}
+
+// --- postback_log: carry external_click_id + richer delivery fields (spec §7).
+{
+  const pl = db.prepare('PRAGMA table_info(postback_log)').all().map(c => c.name);
+  if (!pl.includes('external_click_id')) db.exec('ALTER TABLE postback_log ADD COLUMN external_click_id TEXT');
+  if (!pl.includes('response_body'))     db.exec('ALTER TABLE postback_log ADD COLUMN response_body TEXT');
+  if (!pl.includes('response_ms'))       db.exec('ALTER TABLE postback_log ADD COLUMN response_ms INTEGER');
+  if (!pl.includes('is_test'))           db.exec('ALTER TABLE postback_log ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0');
+  if (!pl.includes('delivered'))         db.exec('ALTER TABLE postback_log ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0');
+}
+
+// --- Per-source caps (spec §8, BA điểm 3). Cap is at the EXTERNAL SOURCE level
+// (af_sub1), NOT the AppsFlyer PID — all Yana traffic shares komorebi24_int, so a
+// PID-level cap can't distinguish sources. Keyed by (publisher, advertiser, sub_id).
+// NULL cap = unlimited. Counters reset by day (campaign timezone) / month.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS source_caps (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher_id    INTEGER NOT NULL REFERENCES publishers(id)  ON DELETE CASCADE,
+    advertiser_id   INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    sub_id          TEXT NOT NULL,
+    daily_click_cap        INTEGER,
+    daily_conversion_cap   INTEGER,
+    monthly_conversion_cap INTEGER,
+    fallback_url    TEXT,
+    UNIQUE(publisher_id, advertiser_id, sub_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_source_caps_lookup ON source_caps(publisher_id, advertiser_id, sub_id);
+`);
+
+
+
 module.exports = db;

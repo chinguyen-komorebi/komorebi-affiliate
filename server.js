@@ -412,7 +412,20 @@ function hasValidPostbackSignature(req, adv) {
   } catch { return false; }
 }
 
-// Combined authorization for an inbound postback: allow if the source IP is
+// HMAC outbound signing (spec §11) — when a publisher has a postback_secret,
+// append a timestamp (ts) and an HMAC-SHA256 signature (sig) so the publisher can
+// verify the postback is genuinely from Komorebi and is fresh (anti-replay). The
+// signed base is the full URL (post-macro) + ts, matching what the publisher
+// recomputes. Reuses the same crypto primitive as the inbound path.
+function signOutboundUrl(url, secret) {
+  if (!secret) return url;
+  const ts = Math.floor(Date.now() / 1000);
+  const withTs = url + (url.includes('?') ? '&' : '?') + 'ts=' + ts;
+  const sig = crypto.createHmac('sha256', secret).update(withTs).digest('hex');
+  return withTs + '&sig=' + sig;
+}
+
+
 // trusted OR the request is validly signed for this advertiser. `adv` may be
 // null (advertiser not yet resolved) — then only the IP path can authorize.
 function isPostbackAuthorized(req, adv) {
@@ -955,38 +968,55 @@ const S2S_RETRY_MS     = 5 * 60 * 1_000; // 5 minutes
 
 async function fireS2SPostback(publisher, data, attempt = 1) {
   const { click_id, payout, event, advertiser } = data;
-  const pub = db.prepare('SELECT postback_url FROM publishers WHERE username = ?').get(publisher);
+  const pub = db.prepare('SELECT postback_url, integration_mode, s2s_postback_active, postback_secret FROM publishers WHERE username = ?').get(publisher);
   if (!pub?.postback_url) return;
+  // Integration Mode gate (spec §5): only send when the publisher is in an S2S
+  // mode AND outbound is active. Standard-portal publishers never get outbound.
+  // (Publishers that already had a postback_url were migrated to portal_s2s+active,
+  // so their existing behaviour is unchanged.)
+  const s2sEnabled = (pub.integration_mode === 's2s_network' || pub.integration_mode === 'portal_s2s')
+    && pub.s2s_postback_active === 1;
+  if (!s2sEnabled) return;
 
-  // Macro map — supports {click_id} {payout} {event} {advertiser},
-  // sub-params {sub1}…{sub5} {subpub} (F7), and mapped {campaign} {adgroup} {creative} {network} (F10).
-  // Missing values resolve to empty string; every occurrence is replaced.
+  // Macro map. Adds S2S macros: {external_click_id} {status} {currency}
+  // {conversion_time} {af_sub1..5} {af_siteid} on top of the existing set.
+  // Missing values resolve to empty string; never "undefined"/"null" (spec §5).
   const macros = {
     click_id, payout, event, advertiser,
+    external_click_id: data.external_click_id,
+    status: data.status, currency: data.currency, conversion_time: data.conversion_time,
     sub1: data.sub1, sub2: data.sub2, sub3: data.sub3, sub4: data.sub4, sub5: data.sub5, subpub: data.subpub,
+    af_sub1: data.af_sub1, af_sub2: data.af_sub2, af_sub3: data.af_sub3, af_sub4: data.af_sub4, af_sub5: data.af_sub5,
+    af_siteid: data.af_siteid,
     campaign: data.campaign, adgroup: data.adgroup, creative: data.creative, network: data.network,
   };
   const url = Object.entries(macros).reduce(
     (u, [k, v]) => u.replaceAll(`{${k}}`, encodeURIComponent(v == null ? '' : String(v))),
     pub.postback_url
   );
+  // Sign the outbound request when the publisher has a secret (spec §11).
+  const finalUrl = signOutboundUrl(url, pub.postback_secret);
 
   let http_status = null;
   let success     = false;
   let error       = null;
+  let responseBody = null;
+  const started   = Date.now();
 
   try {
-    const resp  = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const resp  = await fetch(finalUrl, { signal: AbortSignal.timeout(10_000) });
     http_status = resp.status;
     success     = resp.ok;
+    try { responseBody = (await resp.text()).slice(0, 2000); } catch { /* ignore body read */ }
   } catch (e) {
     error = e.message;
   }
+  const responseMs = Date.now() - started;
 
   db.prepare(`
-    INSERT INTO postback_log (publisher, click_id, url, http_status, attempt, success, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(publisher, click_id, url, http_status, attempt, success ? 1 : 0, error);
+    INSERT INTO postback_log (publisher, click_id, external_click_id, url, http_status, attempt, success, delivered, error, response_body, response_ms, is_test)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+  `).run(publisher, click_id, data.external_click_id || null, finalUrl, http_status, attempt, success ? 1 : 0, success ? 1 : 0, error, responseBody, responseMs);
 
   if (!success && attempt < S2S_MAX_ATTEMPTS) {
     setTimeout(
@@ -999,6 +1029,8 @@ async function fireS2SPostback(publisher, data, attempt = 1) {
 // ---------------------------------------------------------------------------
 // Admin auth — Session-based
 // ---------------------------------------------------------------------------
+
+
 
 function generateCsrfToken() {
   return crypto.randomBytes(24).toString('hex');
@@ -1259,6 +1291,38 @@ function advertiserApprovedCount(adv) {
   `).get(adv.slug, adv.cap_reset_at, adv.cap_reset_at).n;
 }
 
+// #5 (spec §8, BA điểm 3) — per-EXTERNAL-SOURCE cap. Caps are keyed by
+// (publisher, advertiser, sub_id=af_sub1), NOT the AppsFlyer PID: all of a
+// network's traffic shares one AF PID (komorebi24_int), so a PID-level cap can't
+// tell sources apart. Returns null when allowed, or { reason, fallback_url } when
+// a cap is hit. Only APPROVED conversions count toward conversion caps; clicks
+// count toward the click cap. Empty/unset cap = unlimited. No sub_id → exempt.
+function checkSourceCap(pubRow, advRow, subId) {
+  if (!subId) return null;
+  const cap = db.prepare(
+    'SELECT * FROM source_caps WHERE publisher_id = ? AND advertiser_id = ? AND sub_id = ?'
+  ).get(pubRow.id, advRow.id, subId);
+  if (!cap) return null; // no cap configured → unlimited
+
+  const pubName = pubRow.username || db.prepare('SELECT username FROM publishers WHERE id = ?').get(pubRow.id)?.username;
+
+  // Daily conversion cap (approved, today UTC).
+  if (cap.daily_conversion_cap != null) {
+    const n = db.prepare(`SELECT COUNT(*) AS n FROM conversions
+      WHERE publisher = ? AND advertiser_slug = ? AND af_sub1 = ? AND status = 'approved'
+        AND date(received_at) = date('now')`).get(pubName, advRow.slug, subId).n;
+    if (n >= cap.daily_conversion_cap) return { reason: 'cap_reached', scope: 'daily_conversion', fallback_url: cap.fallback_url || null };
+  }
+  // Monthly conversion cap (approved, this UTC month).
+  if (cap.monthly_conversion_cap != null) {
+    const n = db.prepare(`SELECT COUNT(*) AS n FROM conversions
+      WHERE publisher = ? AND advertiser_slug = ? AND af_sub1 = ? AND status = 'approved'
+        AND strftime('%Y-%m', received_at) = strftime('%Y-%m','now')`).get(pubName, advRow.slug, subId).n;
+    if (n >= cap.monthly_conversion_cap) return { reason: 'cap_reached', scope: 'monthly_conversion', fallback_url: cap.fallback_url || null };
+  }
+  return null;
+}
+
 // F12 — send a Telegram cap alert at a threshold (80 or 100) at most once per
 // UTC month per threshold. Alert-throttle state lives on the advertiser row.
 function maybeAlertAdvertiserCap(adv, used, cap, threshold) {
@@ -1377,17 +1441,23 @@ function recordClick(req, slug, pub, smartLinkSlug = null, campaignId = null) {
   const network  = af_siteid   || adjust_network  || null;
   // Backlog #17 — agency / sub-affiliate dimension carried on the tracking link
   const af_sub1 = q('af_sub1'), af_sub2 = q('af_sub2');
+  // S2S Integration — Yana's own click id (stored alongside, never replacing the
+  // internal click_id) + sub-level source ids under the shared komorebi24_int PID.
+  const external_click_id = q('external_click_id');
+  const af_sub3 = q('af_sub3'), af_sub4 = q('af_sub4'), af_sub5 = q('af_sub5');
 
   db.prepare(
     `INSERT INTO clicks (click_id, advertiser_slug, publisher, ip, user_agent, country, device_type, os, browser,
        sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
        af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-       campaign, adgroup, creative, network, af_sub1, af_sub2, smart_link_slug, campaign_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       campaign, adgroup, creative, network, af_sub1, af_sub2, smart_link_slug, campaign_id,
+       external_click_id, af_sub3, af_sub4, af_sub5)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(clickId, slug, pub, clickIp, clickUa, country, device, os, browser,
     sub1, sub2, sub3, sub4, sub5, subpub, gclid, fbclid, referrer,
     af_siteid, af_campaign, af_adset, af_ad, adjust_network, adjust_campaign, adjust_adgroup, adjust_creative,
-    campaign, adgroup, creative, network, af_sub1, af_sub2, smartLinkSlug, campaignId);
+    campaign, adgroup, creative, network, af_sub1, af_sub2, smartLinkSlug, campaignId,
+    external_click_id, af_sub3, af_sub4, af_sub5);
 
   // Group 5 #4 — record an attribution touchpoint for this click. user_id (when the
   // tracking link carries one) is the journey key linking multiple clicks together.
@@ -1747,6 +1817,20 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
     return res.status(403).json({ error: pidBlock.message });
   }
 
+  // #5 — per-external-source cap (spec §8). Cap is at the af_sub1 level so it
+  // affects only this source, never other sources or publishers. On cap:
+  // record cap_reached and reject (or redirect to a configured fallback URL).
+  const capBlock = checkSourceCap({ id: assignment.publisher_id }, adv, click.af_sub1 || null);
+  if (capBlock) {
+    logPostback(req, { status: 'rejected', reason: capBlock.reason, publisher: pub, advertiser: slug, sub_id: click.af_sub1 || null });
+    // Fire an admin alert (best-effort) — spec §8 point 5.
+    sendTelegram(`⚠️ Source cap reached — ${pub}/${slug}/${click.af_sub1} (${capBlock.scope})`).catch(() => {});
+    if (capBlock.fallback_url) {
+      return res.redirect(302, capBlock.fallback_url);
+    }
+    return res.status(403).json({ error: `Source cap reached (${capBlock.scope})` });
+  }
+
   // F22 — multi-event funnel ingestion for advertisers configured with an
   // active-definition (F21). Each funnel event (open/deposit/active/withdraw, or an
   // unrecognised event) is recorded as its own conversion under UNIQUE(click_id,event).
@@ -1905,6 +1989,13 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   // Backlog #17 — propagate the sub-affiliate dimension from the click.
   const afSub1 = click.af_sub1 || null;
   const afSub2 = click.af_sub2 || null;
+  // S2S — restore Yana's identifiers from the click so the conversion (and the
+  // outbound postback) can echo them back for reconciliation. Internal click_id
+  // stays the attribution key; these are carried alongside.
+  const extClickId = click.external_click_id || null;
+  const afSub3 = click.af_sub3 || null;
+  const afSub4 = click.af_sub4 || null;
+  const afSub5 = click.af_sub5 || null;
 
   // Group 5 #1 — local-currency amount (mirrors `payout`) + USD-normalized amount.
   const payoutLocal = amount;
@@ -1913,9 +2004,9 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   let result, conversionId;
   try {
     conversionId = db.prepare(
-      `INSERT INTO conversions (click_id, advertiser_slug, campaign_id, publisher, event, payout, payout_local, payout_usd, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?)`
-    ).run(click_id, slug, click.campaign_id || null, pub, event, amount, payoutLocal, payoutUsd, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2).lastInsertRowid;
+      `INSERT INTO conversions (click_id, advertiser_slug, campaign_id, publisher, event, payout, payout_local, payout_usd, currency, loan_amount, revenue, transaction_id, user_id, status, reason, raw_params, ctit_seconds, fraud_flag, af_sub1, af_sub2, external_click_id, af_sub3, af_sub4, af_sub5)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'pending'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(click_id, slug, click.campaign_id || null, pub, event, amount, payoutLocal, payoutUsd, currency, loanAmount, revenue, transactionId, userId, convStatus, convReason, JSON.stringify(maskPII(req.query)), ctitSeconds, fraudFlag, afSub1, afSub2, extClickId, afSub3, afSub4, afSub5).lastInsertRowid;
     result = { status: duplicate ? 'duplicate' : 'ok', click_id, advertiser: slug, publisher: pub, event,
                payout: amount, payout_local: payoutLocal, payout_usd: payoutUsd, currency, goal: goal?.name || null, loan_amount: loanAmount, revenue, transaction_id: transactionId, user_id: userId,
                ctit_seconds: ctitSeconds };
@@ -1981,7 +2072,10 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   // Pass sub-params (F7) and mapped AppsFlyer/Adjust fields (F10) for macro substitution.
   fireS2SPostback(pub, {
     click_id, payout: amount, event, advertiser: slug,
+    external_click_id: extClickId, status: convStatus || 'pending', currency,
+    conversion_time: new Date().toISOString(),
     sub1: click.sub1, sub2: click.sub2, sub3: click.sub3, sub4: click.sub4, sub5: click.sub5, subpub: click.subpub,
+    af_sub1: afSub1, af_sub2: afSub2, af_sub3: afSub3, af_sub4: afSub4, af_sub5: afSub5, af_siteid: click.af_siteid,
     campaign: click.campaign, adgroup: click.adgroup, creative: click.creative, network: click.network,
   }).catch(() => {});
   sendConversionEmail({
@@ -2981,6 +3075,86 @@ app.post('/admin/advertisers/:slug/postback-test', requireAdmin, async (req, res
   res.send(renderPostbackTest({ adv, csrfToken: req.session.csrfToken, prefillClick: clickId, result }));
 });
 
+// ---------------------------------------------------------------------------
+// #4 (spec §6, BA điểm 4) — OUTBOUND postback test tool. Tests the postback
+// Komorebi SENDS to a publisher (e.g. Yana), distinct from the inbound tool
+// above. Lets admin enter external_click_id + sample values, PREVIEW the URL
+// after macro substitution, send a real test request, and see status + body.
+// Critical: the test is marked is_test=1 so it NEVER counts in reports, caps or
+// payout, and is NEVER retried like a real conversion.
+// ---------------------------------------------------------------------------
+app.get('/admin/publishers/:id/postback-test', requireAdmin, (req, res) => {
+  const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+  res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result: null, preview: null, sample: {} }));
+});
+
+app.post('/admin/publishers/:id/postback-test', requireAdmin, async (req, res) => {
+  const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(req.params.id);
+  if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
+
+  // Sample values for macro substitution (admin-provided).
+  const sample = {
+    click_id:          (req.body.click_id || 'test-click-0001').trim(),
+    external_click_id: (req.body.external_click_id || '').trim(),
+    payout:            (req.body.payout || '1.00').trim(),
+    event:             (req.body.event || 'install').trim(),
+    status:            (req.body.status || 'approved').trim(),
+    currency:          (req.body.currency || 'USD').trim(),
+    af_sub1:           (req.body.af_sub1 || '').trim(),
+    af_sub2:           (req.body.af_sub2 || '').trim(),
+    advertiser:        (req.body.advertiser || 'tambadana').trim(),
+    conversion_time:   new Date().toISOString(),
+  };
+
+  const action = (req.body.action || 'preview').trim();
+
+  if (!pub.postback_url) {
+    return res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken,
+      result: { error: 'This publisher has no postback URL configured.' }, preview: null, sample }));
+  }
+
+  // Build the preview URL exactly as fireS2SPostback would (same macro map + encoding).
+  const macros = {
+    click_id: sample.click_id, payout: sample.payout, event: sample.event, advertiser: sample.advertiser,
+    external_click_id: sample.external_click_id, status: sample.status, currency: sample.currency,
+    conversion_time: sample.conversion_time,
+    af_sub1: sample.af_sub1, af_sub2: sample.af_sub2,
+  };
+  const previewUrl = Object.entries(macros).reduce(
+    (u, [k, v]) => u.replaceAll(`{${k}}`, encodeURIComponent(v == null ? '' : String(v))),
+    pub.postback_url
+  );
+
+  // action=preview → just show the URL, do not send.
+  if (action === 'preview') {
+    return res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result: null, preview: previewUrl, sample }));
+  }
+
+  // action=send → fire ONE real request (no retry), log as is_test=1.
+  // Sign it the same way production does, so the test exercises the real path.
+  const sentUrl = signOutboundUrl(previewUrl, pub.postback_secret);
+  let result;
+  const started = Date.now();
+  try {
+    const r = await fetch(sentUrl, { redirect: 'manual', signal: AbortSignal.timeout(8000) });
+    let bodyTxt = ''; try { bodyTxt = await r.text(); } catch {}
+    result = { ok: r.ok, status: r.status, body: bodyTxt.slice(0, 1500), ms: Date.now() - started };
+  } catch (e) {
+    result = { ok: false, status: 0, body: `Request failed: ${e.message}`, ms: Date.now() - started };
+  }
+  // Log the test — is_test=1 keeps it OUT of reports/cap/payout, and there is NO
+  // retry scheduling here (unlike fireS2SPostback).
+  db.prepare(`INSERT INTO postback_log (publisher, click_id, external_click_id, url, http_status, attempt, success, delivered, error, response_body, response_ms, is_test)
+              VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 1)`)
+    .run(pub.username, sample.click_id, sample.external_click_id || null, sentUrl, result.status,
+         result.ok ? 1 : 0, result.ok ? 1 : 0, result.ok ? null : 'test_failed', result.body, result.ms);
+  logAudit('publisher.postback_test', 'publisher', pub.username, { status: result.status, is_test: true }, req);
+
+  res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result, preview: previewUrl, sample }));
+});
+
+
 // Backlog #11 — set/clear advertiser portal password
 app.post('/admin/advertisers/:slug/portal-password', requireAdmin, (req, res) => {
   const adv = db.prepare('SELECT id, slug FROM advertisers WHERE slug = ?').get(req.params.slug);
@@ -3315,12 +3489,16 @@ app.post('/admin/publishers/:id/update', requireAdmin, (req, res) => {
   const pbUrl  = (postback_url || '').trim();
   const minPay = parseFloat(minimum_payout) >= 0 ? parseFloat(minimum_payout) : 50;
   const customDomain = normalizeDomain(req.body.custom_domain);
+  // S2S Integration — mode + outbound-active flag.
+  const validModes = ['standard', 's2s_network', 'portal_s2s'];
+  const intMode = validModes.includes(req.body.integration_mode) ? req.body.integration_mode : (pub.integration_mode || 'standard');
+  const s2sActive = req.body.s2s_postback_active ? 1 : 0;
   if (password) {
-    db.prepare('UPDATE publishers SET password_hash=?, postback_url=?, custom_domain=?, status=?, minimum_payout=? WHERE id=?')
-      .run(hashPassword(password), pbUrl, customDomain, status || 'active', minPay, id);
+    db.prepare('UPDATE publishers SET password_hash=?, postback_url=?, custom_domain=?, status=?, minimum_payout=?, integration_mode=?, s2s_postback_active=? WHERE id=?')
+      .run(hashPassword(password), pbUrl, customDomain, status || 'active', minPay, intMode, s2sActive, id);
   } else {
-    db.prepare('UPDATE publishers SET postback_url=?, custom_domain=?, status=?, minimum_payout=? WHERE id=?')
-      .run(pbUrl, customDomain, status || 'active', minPay, id);
+    db.prepare('UPDATE publishers SET postback_url=?, custom_domain=?, status=?, minimum_payout=?, integration_mode=?, s2s_postback_active=? WHERE id=?')
+      .run(pbUrl, customDomain, status || 'active', minPay, intMode, s2sActive, id);
   }
   const detail = { status: status || 'active', password_changed: !!password, minimum_payout: minPay };
   if (pbUrl !== (pub.postback_url || '')) {
@@ -3431,7 +3609,7 @@ app.get('/admin/publishers/:id/postback-log', requireAdmin, (req, res) => {
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
 
   const logs = db.prepare(`
-    SELECT id, click_id, url, http_status, attempt, success, error, fired_at
+    SELECT id, click_id, url, http_status, attempt, success, delivered, is_test, error, fired_at
     FROM postback_log
     WHERE publisher = ?
     ORDER BY fired_at DESC
@@ -3445,7 +3623,43 @@ app.get('/admin/publishers/:id/postback-log', requireAdmin, (req, res) => {
     FROM postback_log WHERE publisher = ?
   `).get(pub.username);
 
-  res.send(renderPostbackLog({ pub, logs, stats }));
+  res.send(renderPostbackLog({ pub, logs, stats, csrfToken: req.session.csrfToken, flash: req.query.msg ? { msg: req.query.msg, ok: req.query.ok === '1' } : null }));
+});
+
+// P1 (spec §7) — MANUAL retry of a single failed outbound postback. Re-fires the
+// exact URL that was logged. Guards: only failed, non-test rows can be retried,
+// and a row already delivered for that click_id+event is not re-sent (dedup —
+// spec §7 "no duplicate delivered conversion"). Logs a fresh attempt row.
+app.post('/admin/postback-log/:logId/retry', requireAdmin, async (req, res) => {
+  const row = db.prepare('SELECT * FROM postback_log WHERE id = ?').get(req.params.logId);
+  const back = req.get('referer') || '/admin/postback-log';
+  if (!row) return res.redirect('/admin/postback-log?msg=Log+not+found&ok=0');
+  if (row.is_test) return res.redirect(`${back}${back.includes('?') ? '&' : '?'}msg=Cannot+retry+a+test+postback&ok=0`);
+  if (row.success || row.delivered) return res.redirect(`${back}${back.includes('?') ? '&' : '?'}msg=Already+delivered&ok=0`);
+
+  // Prevent re-delivering if some later attempt for the same click already succeeded.
+  const alreadyDelivered = db.prepare(
+    "SELECT 1 FROM postback_log WHERE publisher = ? AND click_id = ? AND is_test = 0 AND (success = 1 OR delivered = 1) LIMIT 1"
+  ).get(row.publisher, row.click_id);
+  if (alreadyDelivered) return res.redirect(`${back}${back.includes('?') ? '&' : '?'}msg=Already+delivered+in+another+attempt&ok=0`);
+
+  const started = Date.now();
+  let http_status = null, success = false, error = null, responseBody = null;
+  try {
+    const r = await fetch(row.url, { redirect: 'manual', signal: AbortSignal.timeout(10_000) });
+    http_status = r.status; success = r.ok;
+    try { responseBody = (await r.text()).slice(0, 2000); } catch {}
+  } catch (e) { error = e.message; }
+  const responseMs = Date.now() - started;
+
+  // Log as a manual attempt (attempt number continues from the highest so far).
+  const maxAttempt = db.prepare('SELECT MAX(attempt) m FROM postback_log WHERE publisher = ? AND click_id = ? AND is_test = 0').get(row.publisher, row.click_id).m || 0;
+  db.prepare(`INSERT INTO postback_log (publisher, click_id, external_click_id, url, http_status, attempt, success, delivered, error, response_body, response_ms, is_test)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`)
+    .run(row.publisher, row.click_id, row.external_click_id || null, row.url, http_status, maxAttempt + 1, success ? 1 : 0, success ? 1 : 0, error, responseBody, responseMs);
+  logAudit('publisher.postback_retry', 'publisher', row.publisher, { click_id: row.click_id, status: http_status, manual: true }, req);
+
+  return res.redirect(`${back}${back.includes('?') ? '&' : '?'}msg=${success ? 'Retry+delivered' : 'Retry+failed+(HTTP+' + http_status + ')'}&ok=${success ? 1 : 0}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -4000,36 +4214,49 @@ app.get('/api/v1/conversions', requireApiKey, (req, res) => {
   const offset = (page - 1) * limit;
 
   // --- filters (all optional) ---
-  const where = ['publisher = ?'];
+  const where = ['cv.publisher = ?'];
   const params = [pub.username];
 
   const advSlug = (req.query.advertiser || req.query.advertiser_slug || '').trim();
-  if (advSlug) { where.push('advertiser_slug = ?'); params.push(advSlug); }
+  if (advSlug) { where.push('cv.advertiser_slug = ?'); params.push(advSlug); }
 
   const subId = (req.query.sub_id || req.query.af_sub1 || '').trim();
-  if (subId) { where.push('af_sub1 = ?'); params.push(subId); }
+  if (subId) { where.push('cv.af_sub1 = ?'); params.push(subId); }
+
+  const extClick = (req.query.external_click_id || '').trim();
+  if (extClick) { where.push('cv.external_click_id = ?'); params.push(extClick); }
 
   const status = (req.query.status || '').trim().toLowerCase();
   if (['approved', 'pending', 'rejected', 'duplicate'].includes(status)) {
-    where.push('status = ?'); params.push(status);
+    where.push('cv.status = ?'); params.push(status);
   }
 
   // date range on received_at (YYYY-MM-DD inclusive). Basic shape validation.
   const dateRe = /^\d{4}-\d{2}-\d{2}$/;
   const from = (req.query.from || '').trim();
   const to   = (req.query.to   || '').trim();
-  if (dateRe.test(from)) { where.push("date(received_at) >= date(?)"); params.push(from); }
-  if (dateRe.test(to))   { where.push("date(received_at) <= date(?)"); params.push(to); }
+  if (dateRe.test(from)) { where.push("date(cv.received_at) >= date(?)"); params.push(from); }
+  if (dateRe.test(to))   { where.push("date(cv.received_at) <= date(?)"); params.push(to); }
 
   const w = where.join(' AND ');
 
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM conversions WHERE ${w}`).get(...params).n;
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM conversions cv WHERE ${w}`).get(...params).n;
 
   const rows = db.prepare(`
-    SELECT click_id, advertiser_slug, event, status, payout, currency,
-           af_sub1, af_sub2, reason, received_at
-    FROM conversions WHERE ${w}
-    ORDER BY received_at DESC, id DESC
+    SELECT cv.click_id, cv.advertiser_slug, cv.event, cv.status, cv.payout, cv.currency,
+           cv.af_sub1, cv.af_sub2, cv.af_sub3, cv.af_sub4, cv.af_sub5,
+           cv.external_click_id, cv.reason, cv.received_at,
+           pl.delivered AS pb_delivered, pl.attempt AS pb_attempts, pl.http_status AS pb_status,
+           pl.response_body AS pb_response
+    FROM conversions cv
+    LEFT JOIN (
+      -- latest non-test postback attempt per click_id for this publisher
+      SELECT p1.* FROM postback_log p1
+      JOIN (SELECT click_id, MAX(id) AS mid FROM postback_log WHERE is_test = 0 GROUP BY click_id) p2
+        ON p1.id = p2.mid
+    ) pl ON pl.click_id = cv.click_id
+    WHERE ${w}
+    ORDER BY cv.received_at DESC, cv.id DESC
     LIMIT ? OFFSET ?
   `).all(...params, limit, offset);
 
@@ -4045,23 +4272,32 @@ app.get('/api/v1/conversions', requireApiKey, (req, res) => {
     filters: {
       advertiser: advSlug || null,
       sub_id: subId || null,
+      external_click_id: extClick || null,
       status: status || null,
       from: dateRe.test(from) ? from : null,
       to: dateRe.test(to) ? to : null,
     },
     conversions: rows.map(r => ({
-      click_id:        r.click_id,
-      advertiser_slug: r.advertiser_slug,
-      event:           r.event,
-      status:          r.status,
-      payout:          +(Number(r.payout) || 0).toFixed(2),
-      currency:        r.currency,
-      sub_id:          r.af_sub1 || null,   // primary sub-affiliate id
-      af_sub1:         r.af_sub1 || null,
-      af_sub2:         r.af_sub2 || null,
+      click_id:          r.click_id,
+      external_click_id: r.external_click_id || null,   // Yana's click id (reconciliation)
+      advertiser_slug:   r.advertiser_slug,
+      event:             r.event,
+      status:            r.status,
+      payout:            +(Number(r.payout) || 0).toFixed(2),
+      currency:          r.currency,
+      sub_id:            r.af_sub1 || null,   // primary sub-affiliate id
+      af_sub1:           r.af_sub1 || null,
+      af_sub2:           r.af_sub2 || null,
+      af_sub3:           r.af_sub3 || null,
+      af_sub4:           r.af_sub4 || null,
+      af_sub5:           r.af_sub5 || null,
+      // outbound postback delivery (null when no outbound was attempted)
+      postback_delivery_status: r.pb_delivered == null ? null : (r.pb_delivered ? 'delivered' : 'failed'),
+      postback_attempts: r.pb_attempts != null ? r.pb_attempts : null,
+      last_postback_response: r.pb_response || null,
       // publisher-safe reason: internal attribution reasons are masked.
       rejection_reason: r.status === 'rejected' ? (pubSafeReason(r.reason) || null) : null,
-      timestamp:       r.received_at,
+      timestamp:         r.received_at,
     })),
   });
 });
@@ -4167,6 +4403,63 @@ app.get('/admin/pids', requireAdmin, (req, res) => {
   `).get();
 
   res.send(renderPidManagement({ rows, counts, flt, csrfToken: req.session.csrfToken }));
+});
+
+// ---------------------------------------------------------------------------
+// Source caps CRUD (spec §8) — per-(publisher, advertiser, external source)
+// conversion/click caps. Cap is at the af_sub1 level, not the AppsFlyer PID.
+// ---------------------------------------------------------------------------
+app.get('/admin/source-caps', requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT sc.id, sc.sub_id, sc.daily_click_cap, sc.daily_conversion_cap, sc.monthly_conversion_cap, sc.fallback_url,
+           p.username AS publisher, a.name AS advertiser, a.slug AS advertiser_slug
+    FROM source_caps sc
+    JOIN publishers  p ON p.id = sc.publisher_id
+    JOIN advertisers a ON a.id = sc.advertiser_id
+    ORDER BY p.username, a.name, sc.sub_id
+  `).all();
+  const publishers = db.prepare('SELECT id, username FROM publishers ORDER BY username').all();
+  const advertisers = db.prepare("SELECT id, name, slug FROM advertisers WHERE slug != 'legacy' ORDER BY name").all();
+  res.send(renderSourceCaps({ rows, publishers, advertisers, csrfToken: req.session.csrfToken,
+    flash: req.query.msg ? { msg: req.query.msg, ok: req.query.ok === '1' } : null }));
+});
+
+app.post('/admin/source-caps', requireAdmin, (req, res) => {
+  const publisherId  = parseInt(req.body.publisher_id, 10);
+  const advertiserId = parseInt(req.body.advertiser_id, 10);
+  const subId = (req.body.sub_id || '').trim();
+  if (!publisherId || !advertiserId || !subId) {
+    return res.redirect('/admin/source-caps?msg=Publisher,+advertiser+and+source+are+required&ok=0');
+  }
+  // empty → NULL (unlimited); otherwise a non-negative integer
+  const intOrNull = v => { const n = parseInt(v, 10); return Number.isInteger(n) && n >= 0 ? n : null; };
+  const dc = intOrNull(req.body.daily_click_cap);
+  const dv = intOrNull(req.body.daily_conversion_cap);
+  const mv = intOrNull(req.body.monthly_conversion_cap);
+  const fb = (req.body.fallback_url || '').trim() || null;
+  try {
+    db.prepare(`INSERT INTO source_caps (publisher_id, advertiser_id, sub_id, daily_click_cap, daily_conversion_cap, monthly_conversion_cap, fallback_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(publisher_id, advertiser_id, sub_id) DO UPDATE SET
+                  daily_click_cap=excluded.daily_click_cap,
+                  daily_conversion_cap=excluded.daily_conversion_cap,
+                  monthly_conversion_cap=excluded.monthly_conversion_cap,
+                  fallback_url=excluded.fallback_url`)
+      .run(publisherId, advertiserId, subId, dc, dv, mv, fb);
+    logAudit('source_cap.set', 'source_cap', subId, { publisher_id: publisherId, advertiser_id: advertiserId, daily_conversion_cap: dv, monthly_conversion_cap: mv }, req);
+    res.redirect('/admin/source-caps?msg=Cap+saved&ok=1');
+  } catch (e) {
+    res.redirect('/admin/source-caps?msg=' + encodeURIComponent('Could not save: ' + e.message) + '&ok=0');
+  }
+});
+
+app.post('/admin/source-caps/:id/delete', requireAdmin, (req, res) => {
+  const row = db.prepare('SELECT * FROM source_caps WHERE id = ?').get(req.params.id);
+  if (row) {
+    db.prepare('DELETE FROM source_caps WHERE id = ?').run(req.params.id);
+    logAudit('source_cap.delete', 'source_cap', row.sub_id, { id: row.id }, req);
+  }
+  res.redirect('/admin/source-caps?msg=Cap+removed&ok=1');
 });
 
 // Shared handler for the four PID state actions. `field`/`value` decide the change.
@@ -5620,6 +5913,7 @@ function adminSidebar() {
   ${nav('/admin/fraud-review',     'Trading Fraud',     'fraud',  '/admin/fraud-review')}
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
   ${nav('/admin/pids',        'PID Management','pids',    '/admin/pids')}
+  ${nav('/admin/source-caps', 'Source Caps',   'caps',    '/admin/source-caps')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
   ${nav('/admin/fx-rates',      'FX Rates (locked)','settings','/admin/fx-rates')}
@@ -6997,10 +7291,22 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <input type="number" name="minimum_payout" value="${H(pub.minimum_payout ?? 50)}" step="0.01" min="0" style="max-width:160px">
       <small>Publisher cannot request payment until approved balance reaches this threshold.</small>
     </div>
+    <div class="fg"><label>Integration Mode</label>
+      <select name="integration_mode">
+        <option value="standard"${(pub.integration_mode||'standard')==='standard'?' selected':''}>Standard Portal (no outbound postback)</option>
+        <option value="s2s_network"${pub.integration_mode==='s2s_network'?' selected':''}>S2S Network (outbound only)</option>
+        <option value="portal_s2s"${pub.integration_mode==='portal_s2s'?' selected':''}>Portal + S2S</option>
+      </select>
+      <small>Outbound postback fires only for S2S Network / Portal+S2S modes with an active URL.</small>
+    </div>
+    <div class="fg"><label>Outbound active</label>
+      <label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="checkbox" name="s2s_postback_active" value="1"${pub.s2s_postback_active?' checked':''} style="width:16px;height:16px"> Send outbound postbacks to this publisher</label>
+    </div>
     <div class="fg"><label>S2S Postback URL</label>
       <input type="text" name="postback_url" value="${H(pub.postback_url||'')}"
-             placeholder="https://partner.com/postback?cid={click_id}&payout={payout}&event={event}">
-      <small>Macros: <code>{click_id}</code> <code>{payout}</code> <code>{event}</code> <code>{advertiser}</code> — fired on every conversion. Up to 3 attempts with 5-min retry on failure.</small>
+             placeholder="https://partner.com/postback?cid={click_id}&ext={external_click_id}&payout={payout}&event={event}">
+      <small>Macros: <code>{click_id}</code> <code>{external_click_id}</code> <code>{payout}</code> <code>{event}</code> <code>{status}</code> <code>{currency}</code> <code>{conversion_time}</code> <code>{advertiser}</code> <code>{af_sub1}</code>…<code>{af_sub5}</code> — fired on every conversion. Up to 3 attempts, 5-min retry on failure.
+      ${isEdit ? `· <a href="/admin/publishers/${pub.id}/postback-test">Test outbound postback →</a>` : ''}</small>
     </div>
     <div class="fg"><label>Custom Tracking Domain <span style="font-size:11px;color:#6e6e73">(Backlog #12)</span></label>
       <input type="text" name="custom_domain" value="${H(pub.custom_domain||'')}" placeholder="e.g. go.partner.com (blank = platform default)">
@@ -7438,10 +7744,15 @@ ${resultHtml}
   return adminLayout(`Reconcile — ${adv.name}`, body);
 }
 
-function renderPostbackLog({ pub, logs, stats }) {
+function renderPostbackLog({ pub, logs, stats, csrfToken = '', flash = null }) {
   const rows = logs.map(l => {
     const statusClass = l.success ? 'active' : 'paused';
     const statusText  = l.success ? `${l.http_status} OK` : (l.http_status ? `${l.http_status} Error` : 'Failed');
+    // Retry only offered for failed, non-test attempts that aren't superseded by a delivery.
+    const canRetry = !l.success && !l.delivered && !l.is_test;
+    const retryBtn = canRetry
+      ? `<form method="POST" action="/admin/postback-log/${l.id}/retry" style="display:inline">${csrfField(csrfToken)}<button class="btn btn-ghost" style="padding:3px 9px;font-size:11px">Retry</button></form>`
+      : (l.is_test ? '<span style="font-size:10px;color:#8e8e93">test</span>' : '');
     return `<tr>
       <td>${H(l.fired_at)}</td>
       <td><code class="xs">${H(l.click_id)}</code></td>
@@ -7449,8 +7760,13 @@ function renderPostbackLog({ pub, logs, stats }) {
       <td><span class="badge ${statusClass}">${statusText}</span></td>
       <td style="text-align:center">${l.attempt}</td>
       <td style="font-size:11px;color:#c62828">${H(l.error||'')}</td>
+      <td style="text-align:right">${retryBtn}</td>
     </tr>`;
   }).join('');
+
+  const flashHtml = flash
+    ? `<div style="margin:0 20px 12px;padding:10px 14px;border-radius:8px;font-size:13px;background:${flash.ok?'#e8f5e9':'#fdecea'};color:${flash.ok?'#2e7d32':'#c62828'}">${H(flash.msg)}</div>`
+    : '';
 
   const body = `${adminHeader(`<a href="/admin/publishers/${H(pub.id)}/edit" class="hbtn ghost">Edit Publisher</a>
     <a href="/admin/publishers" class="hbtn ghost">← Publishers</a>`)}
@@ -7472,10 +7788,11 @@ function renderPostbackLog({ pub, logs, stats }) {
     : `<div class="empty" style="padding:16px 20px;text-align:left;font-size:13px">
         No S2S postback URL configured for this publisher.
         <a href="/admin/publishers/${H(pub.id)}/edit">Set one →</a></div>`}
+  ${flashHtml}
   ${logs.length===0
     ? '<div class="empty">No postback attempts yet.</div>'
     : `<table><thead><tr>
-        <th>Fired At</th><th>Click ID</th><th>URL Fired</th><th>Status</th><th style="text-align:center">Attempt</th><th>Error</th>
+        <th>Fired At</th><th>Click ID</th><th>URL Fired</th><th>Status</th><th style="text-align:center">Attempt</th><th>Error</th><th></th>
       </tr></thead><tbody>${rows}</tbody></table>`}
 </section>
 </main>`;
@@ -7587,6 +7904,66 @@ ${resultHtml}
 </main>
 <script>${CP_JS}</script>`;
   return adminLayout(`Postback Test — ${adv.name}`, body);
+}
+
+// #4 — OUTBOUND postback test tool render (tests postback SENT to a publisher).
+function renderOutboundPostbackTest({ pub, csrfToken = '', result, preview, sample = {} }) {
+  const v = k => H(sample[k] || '');
+  const previewHtml = preview ? `
+    <div style="padding:0 24px 16px">
+      <div style="font-size:12px;color:#6e6e73;margin-bottom:6px">Preview URL (after macro substitution):</div>
+      <div class="ubox" data-copy="${H(preview)}" style="word-break:break-all">${H(preview)}</div>
+    </div>` : '';
+  const resultHtml = result ? (result.error ? `
+    <section style="border:2px solid #c62828;margin-top:12px"><div class="sh"><h2>Cannot test</h2></div>
+      <div style="padding:16px 20px;color:#c62828">${H(result.error)}</div></section>` : `
+    <section style="border:2px solid ${result.ok ? '#2e7d32' : '#c62828'};margin-top:12px">
+      <div class="sh"><h2>Test Result — HTTP ${result.status}${result.ok ? ' ✓' : ' ✗'}</h2>
+        <span class="meta">${result.ms}ms · marked as test (not counted in reports/cap/payout, no retry)</span></div>
+      <div style="padding:16px 20px">
+        <div style="font-size:12px;color:#6e6e73;margin-bottom:6px">Response body:</div>
+        <pre style="background:#1d1d1f;color:#e8e8ed;padding:12px 14px;border-radius:8px;font-size:12px;overflow:auto;white-space:pre-wrap">${H(result.body || '(empty)')}</pre>
+      </div>
+    </section>`) : '';
+
+  const noUrl = !pub.postback_url;
+  const body = `${adminHeader(`<a href="/admin/publishers/${pub.id}/edit" class="hbtn ghost">← Edit publisher</a>`)}
+<main>
+<section>
+  <div class="sh"><h2>Outbound Postback Test — ${H(pub.username)}</h2><span class="meta">${H(pub.integration_mode || 'standard')}</span></div>
+  <div style="padding:20px 24px">
+    ${noUrl
+      ? `<p style="color:#c62828">This publisher has no postback URL configured. Set one on the publisher's edit page first.</p>`
+      : `<p style="font-size:12px;color:#6e6e73;margin-bottom:8px">Postback URL template: <code style="word-break:break-all">${H(pub.postback_url)}</code></p>
+    <p style="font-size:12px;color:#6e6e73;margin-bottom:16px">Fill sample values, <strong>Preview</strong> to see the substituted URL, then <strong>Send Test</strong> to fire one real request. Test requests are logged as <code>is_test</code> — they never count in reports, caps or payout, and are never retried.</p>
+    <form method="POST" action="/admin/publishers/${pub.id}/postback-test">${csrfField(csrfToken)}
+      <div class="fg-row">
+        <div class="fg"><label>click_id</label><input type="text" name="click_id" value="${v('click_id') || 'test-click-0001'}" style="font-family:monospace"></div>
+        <div class="fg"><label>external_click_id</label><input type="text" name="external_click_id" value="${v('external_click_id')}" placeholder="Yana's click id" style="font-family:monospace"></div>
+      </div>
+      <div class="fg-row">
+        <div class="fg"><label>event</label><input type="text" name="event" value="${v('event') || 'install'}"></div>
+        <div class="fg"><label>status</label><input type="text" name="status" value="${v('status') || 'approved'}"></div>
+        <div class="fg"><label>payout</label><input type="text" name="payout" value="${v('payout') || '1.00'}"></div>
+        <div class="fg"><label>currency</label><input type="text" name="currency" value="${v('currency') || 'USD'}"></div>
+      </div>
+      <div class="fg-row">
+        <div class="fg"><label>af_sub1</label><input type="text" name="af_sub1" value="${v('af_sub1')}"></div>
+        <div class="fg"><label>af_sub2</label><input type="text" name="af_sub2" value="${v('af_sub2')}"></div>
+        <div class="fg"><label>advertiser</label><input type="text" name="advertiser" value="${v('advertiser') || 'tambadana'}"></div>
+      </div>
+      <div style="display:flex;gap:10px">
+        <button type="submit" name="action" value="preview" class="btn btn-ghost">Preview URL</button>
+        <button type="submit" name="action" value="send" class="btn btn-primary">Send Test</button>
+      </div>
+    </form>`}
+  </div>
+  ${previewHtml}
+</section>
+${resultHtml}
+</main>
+<script>${CP_JS}</script>`;
+  return adminLayout(`Outbound Postback Test — ${pub.username}`, body);
 }
 
 // Backlog #9 — cohort / retention report view
@@ -7787,6 +8164,62 @@ function renderPidManagement({ rows, counts, flt, csrfToken }) {
 </section>
 </main>`;
   return adminLayout('PID Management', body);
+}
+
+// Source caps management (spec §8). List existing caps + a form to add/update.
+function renderSourceCaps({ rows, publishers, advertisers, csrfToken = '', flash = null }) {
+  const cap = v => v == null ? '<span style="color:#c7c7cc">∞</span>' : N(v);
+  const tableRows = rows.map(r => `<tr>
+    <td><strong>${H(r.publisher)}</strong></td>
+    <td>${H(r.advertiser)} <span style="color:#8e8e93;font-size:11px">${H(r.advertiser_slug)}</span></td>
+    <td><code class="xs">${H(r.sub_id)}</code></td>
+    <td style="text-align:center">${cap(r.daily_click_cap)}</td>
+    <td style="text-align:center">${cap(r.daily_conversion_cap)}</td>
+    <td style="text-align:center">${cap(r.monthly_conversion_cap)}</td>
+    <td style="font-size:11px;max-width:200px;word-break:break-all">${H(r.fallback_url||'')}</td>
+    <td style="text-align:right"><form method="POST" action="/admin/source-caps/${r.id}/delete" style="display:inline" data-confirm="Remove cap for ${H(r.sub_id)}?">${csrfField(csrfToken)}<button class="btn btn-ghost" style="padding:3px 9px;font-size:11px">Remove</button></form></td>
+  </tr>`).join('');
+
+  const pubOpts = publishers.map(p => `<option value="${p.id}">${H(p.username)}</option>`).join('');
+  const advOpts = advertisers.map(a => `<option value="${a.id}">${H(a.name)}</option>`).join('');
+
+  const flashHtml = flash
+    ? `<div style="margin:0 20px 12px;padding:10px 14px;border-radius:8px;font-size:13px;background:${flash.ok?'#e8f5e9':'#fdecea'};color:${flash.ok?'#2e7d32':'#c62828'}">${H(flash.msg)}</div>`
+    : '';
+
+  const body = `${adminHeader()}
+<main>
+<section>
+  <div class="sh"><h2>Source Caps</h2><span class="meta">${N(rows.length)} caps</span></div>
+  <div style="padding:0 20px 10px;font-size:12px;color:#6e6e73">
+    Caps apply per <strong>external source</strong> (the <code>af_sub1</code> value), so each network source is limited independently — one source hitting its cap never affects others. Blank = unlimited (∞). Only approved conversions count.
+  </div>
+  ${flashHtml}
+  <div style="padding:0 20px 16px">
+    <form method="POST" action="/admin/source-caps" style="background:#f9f9fb;border:1px solid #eee;border-radius:10px;padding:14px 16px">${csrfField(csrfToken)}
+      <div class="fg-row">
+        <div class="fg"><label>Publisher</label><select name="publisher_id" required><option value="">—</option>${pubOpts}</select></div>
+        <div class="fg"><label>Advertiser</label><select name="advertiser_id" required><option value="">—</option>${advOpts}</select></div>
+        <div class="fg"><label>Source (af_sub1)</label><input type="text" name="sub_id" required placeholder="e.g. src_a" style="font-family:monospace"></div>
+      </div>
+      <div class="fg-row">
+        <div class="fg"><label>Daily click cap</label><input type="number" name="daily_click_cap" min="0" placeholder="∞"></div>
+        <div class="fg"><label>Daily conversion cap</label><input type="number" name="daily_conversion_cap" min="0" placeholder="∞"></div>
+        <div class="fg"><label>Monthly conversion cap</label><input type="number" name="monthly_conversion_cap" min="0" placeholder="∞"></div>
+      </div>
+      <div class="fg"><label>Fallback URL (optional — redirect when capped)</label><input type="text" name="fallback_url" placeholder="https://..."></div>
+      <button type="submit" class="btn btn-primary">Save cap</button>
+    </form>
+  </div>
+  ${rows.length === 0 ? '<div class="empty">No source caps configured — all sources unlimited.</div>' : `
+  <div class="table-wrap"><table><thead><tr>
+    <th>Publisher</th><th>Advertiser</th><th>Source</th>
+    <th style="text-align:center">Daily clicks</th><th style="text-align:center">Daily conv</th><th style="text-align:center">Monthly conv</th>
+    <th>Fallback</th><th></th>
+  </tr></thead><tbody>${tableRows}</tbody></table></div>`}
+</section>
+</main>`;
+  return adminLayout('Source Caps', body);
 }
 
 // Backlog #14 — fraud review (flagged conversions grouped by click_id)
@@ -9699,10 +10132,13 @@ function renderDocs() {
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>click_id</code></td><td>string</td><td>The click this conversion attributed to</td></tr>
+          <tr><td><code>click_id</code></td><td>string</td><td>The click this conversion attributed to (Komorebi internal id — attribution key)</td></tr>
+          <tr><td><code>external_click_id</code></td><td>string</td><td>Your own click id as sent on the tracking link (for reconciliation). Null if not provided.</td></tr>
           <tr><td><code>status</code></td><td>string</td><td><code>approved</code> | <code>pending</code> | <code>rejected</code> | <code>duplicate</code> (duplicate = a repeat postback for a click+event already counted)</td></tr>
           <tr><td><code>payout</code></td><td>number</td><td>Payout for this conversion in <code>currency</code></td></tr>
-          <tr><td><code>sub_id</code> / <code>af_sub1</code> / <code>af_sub2</code></td><td>string</td><td>Your sub-affiliate identifiers as sent on the click</td></tr>
+          <tr><td><code>sub_id</code> / <code>af_sub1</code>…<code>af_sub5</code></td><td>string</td><td>Your sub-affiliate / source identifiers as sent on the click</td></tr>
+          <tr><td><code>postback_delivery_status</code></td><td>string</td><td><code>delivered</code> | <code>failed</code> | null (null = no outbound postback attempted)</td></tr>
+          <tr><td><code>postback_attempts</code></td><td>number</td><td>Number of outbound delivery attempts (null if none)</td></tr>
           <tr><td><code>rejection_reason</code></td><td>string</td><td><code>null</code> unless the row is rejected. Operational reasons are shown (e.g. <code>duplicate</code>, <code>not_activated</code>); internal adjustments appear as "Attribution adjustment"</td></tr>
           <tr><td><code>timestamp</code></td><td>string</td><td>When the conversion was recorded (<strong>UTC</strong>)</td></tr>
           <tr><td><code>paging.has_more</code></td><td>boolean</td><td>True when further pages are available</td></tr>
