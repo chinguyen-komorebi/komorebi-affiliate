@@ -7272,7 +7272,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
   <h2>${H(title)}</h2>
   ${flash   ? `<div class="flash success">${H(flash.text)}</div>` : ''}
   ${error   ? `<div class="form-err">${H(error)}</div>` : ''}
-  <form method="POST" action="${H(action)}">${csrfField(csrfToken)}
+  <form method="POST" action="${H(action)}" id="pubEditForm">${csrfField(csrfToken)}
     ${isEdit
       ? `<div class="fg"><label>Username</label>
           <input type="text" value="${H(pub.username||'')}" disabled style="background:#f5f5f7;color:#6e6e73">
@@ -7337,19 +7337,11 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
             ${keySuffix ? `<code style="font-size:11px;color:#2e7d32">…${H(keySuffix)}</code>` : ''}
           </div>`}
           <div style="display:flex;gap:8px">
-            <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline"
-                  data-confirm="Regenerate API key? The current key stops working immediately.">${csrfField(csrfToken)}
-              <button class="btn btn-warn">↻ Regenerate Key</button>
-            </form>
-            <form method="POST" action="/admin/publishers/${H(pub.id)}/revoke-key" style="display:inline"
-                  data-confirm="Revoke this API key? The publisher will lose API access until a new key is generated.">${csrfField(csrfToken)}
-              <button class="btn btn-danger">Revoke Key</button>
-            </form>
+            <button type="submit" form="regenKeyForm" class="btn btn-warn">↻ Regenerate Key</button>
+            <button type="submit" form="revokeKeyForm" class="btn btn-danger">Revoke Key</button>
           </div>`
         : `<div style="color:#c62828;font-size:13px;margin-bottom:8px">API key is revoked — publisher cannot use key auth.</div>
-           <form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" style="display:inline">${csrfField(csrfToken)}
-             <button class="btn btn-primary">Generate New Key</button>
-           </form>`}
+           <button type="submit" form="regenKeyForm" class="btn btn-primary">Generate New Key</button>`}
       <small style="display:block;margin-top:8px">The full key is shown only once, at generation. Only the last 8 characters are stored for reference. Use <code>X-API-Key: kom_live_...</code> for REST API access.</small>
     </div>` : ''}
     ${isEdit ? `<div class="fg"><label>Their Tracking URLs</label>
@@ -7370,6 +7362,8 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <a href="/admin/publishers" class="btn btn-ghost btn-lg">Cancel</a>
     </div>
   </form>
+  ${isEdit ? `<form method="POST" action="/admin/publishers/${H(pub.id)}/regenerate-key" id="regenKeyForm" style="display:none" data-confirm="Regenerate API key? The current key stops working immediately.">${csrfField(csrfToken)}</form>
+  <form method="POST" action="/admin/publishers/${H(pub.id)}/revoke-key" id="revokeKeyForm" style="display:none" data-confirm="Revoke this API key? The publisher will lose API access until a new key is generated.">${csrfField(csrfToken)}</form>` : ''}
   ${assignmentSection}
   ${resetSection}
 </div></main>
