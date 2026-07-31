@@ -311,6 +311,17 @@ for (const p of needKey) {
 // backfilled. Lookups are hash-only, so the plaintext column is no longer needed.
 db.exec('UPDATE publishers SET api_key = NULL WHERE api_key IS NOT NULL AND api_key_hash IS NOT NULL');
 
+// Fix #2 repair — some rows were left with api_key_hash SET but api_key_suffix
+// NULL (an older approve path wrote hash without suffix, then plaintext was
+// nulled above, so the suffix can no longer be derived). A hash cannot be
+// reversed to recover the last 8 chars, so the only consistent fix is to rotate
+// these to a fresh hash-only key. Idempotent: only touches inconsistent rows.
+const brokenSuffix = db.prepare("SELECT id FROM publishers WHERE api_key_hash IS NOT NULL AND (api_key_suffix IS NULL OR api_key_suffix = '')").all();
+for (const p of brokenSuffix) {
+  const k = 'kom_live_' + randomBytes(16).toString('hex');
+  setKey.run(createHash('sha256').update(k).digest('hex'), k.slice(-8), p.id);
+}
+
 // ---------------------------------------------------------------------------
 // Postback log  (S2S fire attempts)
 // ---------------------------------------------------------------------------
@@ -504,6 +515,47 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pa_publisher  ON publisher_advertisers(publisher_id);
   CREATE INDEX IF NOT EXISTS idx_pa_advertiser ON publisher_advertisers(advertiser_id);
 `);
+
+// ---------------------------------------------------------------------------
+// Fix #4 — per-PID (sub-affiliate) management.
+//   publisher_pids: one row per (publisher, advertiser, sub_id).
+//     approval_state — 'pending' | 'approved' | 'rejected'
+//       Only meaningful when the advertiser runs in "Duyệt trước" mode
+//       (advertisers.pid_approval_required = 1). In "Tự động" mode a PID is
+//       auto-approved on first sight so traffic flows without waiting.
+//     run_state — 'running' | 'paused'
+//       Independent of approval. An admin (or the owning publisher) can pause
+//       ANY single PID at any time without affecting other PIDs, regardless of
+//       the advertiser's approval mode.
+// A PID is allowed to convert only when approval_state='approved' AND
+// run_state='running'.
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS publisher_pids (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    publisher_id   INTEGER NOT NULL REFERENCES publishers(id)  ON DELETE CASCADE,
+    advertiser_id  INTEGER NOT NULL REFERENCES advertisers(id) ON DELETE CASCADE,
+    sub_id         TEXT NOT NULL,
+    approval_state TEXT NOT NULL DEFAULT 'approved',
+    run_state      TEXT NOT NULL DEFAULT 'running',
+    note           TEXT,
+    created_at     TEXT DEFAULT (datetime('now')),
+    decided_at     TEXT,
+    UNIQUE(publisher_id, advertiser_id, sub_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_pids_pub ON publisher_pids(publisher_id);
+  CREATE INDEX IF NOT EXISTS idx_pids_adv ON publisher_pids(advertiser_id);
+  CREATE INDEX IF NOT EXISTS idx_pids_sub ON publisher_pids(sub_id);
+`);
+
+// Advertiser flag: PID approval mode. 0 = "Tự động" (auto-approve, network-friendly,
+// DEFAULT). 1 = "Duyệt trước" (each new PID must be approved before it can convert).
+{
+  const advCols = db.prepare("PRAGMA table_info(advertisers)").all().map(c => c.name);
+  if (!advCols.includes('pid_approval_required')) {
+    db.exec('ALTER TABLE advertisers ADD COLUMN pid_approval_required INTEGER NOT NULL DEFAULT 0');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Password reset tokens  (publisher self-service + admin-surfaced)

@@ -11,6 +11,7 @@ const multer      = require('multer');
 const nodemailer  = require('nodemailer');
 const cron        = require('node-cron');
 const db          = require('./db');
+const { pidEffectiveStatus } = require('./pid-status');
 const geoip       = require('geoip-lite');
 const helmet      = require('helmet');
 
@@ -343,26 +344,32 @@ async function runMmpSync(adv) {
 
 // ---------------------------------------------------------------------------
 // IP whitelist for /postback/*
-// Full current lists:
-//   AppsFlyer : https://support.appsflyer.com/hc/en-us/articles/207032106
+// Sources (verified 2026):
+//   AppsFlyer : https://support.appsflyer.com/hc/en-us/articles/207447093
+//               Legacy per-IP list was DEPRECATED by AppsFlyer 2022-02-16.
+//               Current outgoing ranges are CIDR blocks only (below).
 //   Adjust    : https://help.adjust.com/en/article/server-to-server-events
-// Disable via POSTBACK_WHITELIST_ENABLED=false | add IPs via POSTBACK_TRUSTED_IPS=1.2.3.4
+// Disable via POSTBACK_WHITELIST_ENABLED=false
+// Add extra trusted IPs   via POSTBACK_TRUSTED_IPS=1.2.3.4,5.6.7.8
+// Add extra trusted CIDRs via POSTBACK_TRUSTED_CIDRS=10.0.0.0/24,...
+// NOTE: a valid per-advertiser HMAC signature bypasses the IP check entirely
+//       (see isPostbackAuthorized) — this is the robust path for advertisers /
+//       MMPs / the Postback Test Tool whose source IP is not fixed.
 // ---------------------------------------------------------------------------
 
-const APPSFLYER_IPS = [
-  '52.6.61.4','52.87.100.26','54.82.244.37','54.83.87.6','54.209.4.3',
-  '54.247.23.133','34.193.152.12','52.23.177.28','52.73.232.47',
-  '52.73.178.39','54.164.118.156','54.86.29.77','34.202.42.78',
-  '52.0.22.188','52.55.243.251','54.84.196.64','34.227.148.18',
-  '34.228.55.40','52.72.214.218','3.209.104.136','3.218.36.71',
-];
-const ADJUST_IPS = [
+// AppsFlyer current outgoing ranges (CIDR). The legacy /32 list is gone.
+const APPSFLYER_CIDRS = ['45.92.116.0/22', '194.28.46.0/23'];
+// Adjust S2S event source ranges.
+const ADJUST_IPS   = [
   '52.28.45.153','52.29.210.126','52.57.50.121','52.58.201.201',
   '52.212.58.78','54.220.181.220','34.253.115.83','52.209.165.161',
 ];
 const ADJUST_CIDRS = ['185.151.204.0/24'];
-const EXTRA_IPS    = (process.env.POSTBACK_TRUSTED_IPS || '').split(',').filter(Boolean);
+const EXTRA_IPS    = (process.env.POSTBACK_TRUSTED_IPS   || '').split(',').map(s => s.trim()).filter(Boolean);
+const EXTRA_CIDRS  = (process.env.POSTBACK_TRUSTED_CIDRS || '').split(',').map(s => s.trim()).filter(Boolean);
 const WHITELIST_ON = process.env.POSTBACK_WHITELIST_ENABLED !== 'false';
+
+const ALL_TRUSTED_CIDRS = [...APPSFLYER_CIDRS, ...ADJUST_CIDRS, ...EXTRA_CIDRS];
 
 function ipToInt(ip) {
   return ip.split('.').reduce((n, o) => (n << 8) | parseInt(o, 10), 0) >>> 0;
@@ -376,8 +383,42 @@ function isWhitelisted(ip) {
   if (!WHITELIST_ON) return true;
   const addr = ip.replace(/^::ffff:/, '');
   if (addr === '127.0.0.1' || addr === '::1') return true;
-  return [...APPSFLYER_IPS, ...ADJUST_IPS, ...EXTRA_IPS].includes(addr)
-    || ADJUST_CIDRS.some(c => inCidr(addr, c));
+  if (EXTRA_IPS.includes(addr)) return true;
+  // IPv6 (other than loopback) is not in any of our v4 CIDR lists → reject unless
+  // it was an explicit EXTRA_IP above. inCidr only understands IPv4.
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(addr)) return false;
+  return ALL_TRUSTED_CIDRS.some(c => inCidr(addr, c))
+    || ADJUST_IPS.includes(addr);
+}
+
+// Verify a per-advertiser HMAC signature on a postback. Returns true only when
+// the advertiser has a postback_secret AND the request carries a matching &sig=.
+// This lets a correctly-signed postback through regardless of source IP — the
+// robust auth path (IP allowlists are brittle: MMP/advertiser IPs drift).
+// Signature base is the SAME format already used below: "click_id:event:payout".
+function hasValidPostbackSignature(req, adv) {
+  if (!adv || !adv.postback_secret) return false;
+  const sig = String(req.query.sig || '').toLowerCase();
+  if (!sig) return false;
+  const base = [
+    String(req.query.click_id || ''),
+    String(req.query.event || 'sale'),
+    req.query.payout != null ? String(req.query.payout) : '',
+  ].join(':');
+  const expected = crypto.createHmac('sha256', adv.postback_secret).update(base).digest('hex');
+  if (sig.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  } catch { return false; }
+}
+
+// Combined authorization for an inbound postback: allow if the source IP is
+// trusted OR the request is validly signed for this advertiser. `adv` may be
+// null (advertiser not yet resolved) — then only the IP path can authorize.
+function isPostbackAuthorized(req, adv) {
+  if (isWhitelisted(getIp(req))) return { ok: true, via: 'ip' };
+  if (hasValidPostbackSignature(req, adv)) return { ok: true, via: 'hmac' };
+  return { ok: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +523,45 @@ function logPostback(req, result) {
   logStream.write(JSON.stringify({ ts: new Date().toISOString(), ip: req.ip, params: maskPII(req.query), result }) + '\n');
 }
 
+// Gate-level rejections (bad IP / bad signature) are rejected BEFORE any row is
+// written to the conversions table, so the admin "Received Log" (which reads
+// conversions) never showed them — that is why an allowlist misconfig looked
+// invisible. This reads the tail of postback.log and returns only those
+// gate-rejected entries, shaped like conversion rows, so the Received Log can
+// merge them in. Read-only, best-effort: any parse/IO error yields [].
+const GATE_REJECT_REASONS = new Set(['ip_not_whitelisted', 'invalid_signature', 'missing_click_id', 'invalid_click_id']);
+function readGateRejectedPostbacks(limit = 300, maxBytes = 512 * 1024) {
+  try {
+    const file = path.join(__dirname, 'postback.log');
+    const stat = fs.statSync(file);
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(stat.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    const lines = buf.toString('utf8').split('\n').filter(Boolean);
+    const out = [];
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      let e; try { e = JSON.parse(lines[i]); } catch { continue; }
+      const r = e && e.result;
+      if (!r || r.status !== 'rejected' || !GATE_REJECT_REASONS.has(r.reason)) continue;
+      out.push({
+        id: null,                                   // no DB id — file-sourced
+        click_id: r.click_id || (e.params && e.params.click_id) || '—',
+        advertiser_slug: r.advertiser || (e.params && e.params.slug) || '—',
+        publisher: r.publisher || '—',
+        event: (e.params && e.params.event) || '—',
+        status: 'rejected',
+        reason: r.reason,
+        ts: e.ts,
+        gate: true,                                 // marks it as a pre-DB gate reject
+        ip: e.ip || r.ip || '—',
+      });
+    }
+    return out;
+  } catch { return []; }
+}
+
 // ---------------------------------------------------------------------------
 // Email — nodemailer + daily cron
 // ---------------------------------------------------------------------------
@@ -569,6 +649,41 @@ function generateApiKey() {
 function hashApiKey(key) {
   return crypto.createHash('sha256').update(key).digest('hex');
 }
+
+// --- Fix #2: single source of truth for API-key state ----------------------
+// The revoked-vs-active bug came from several routes writing the key columns
+// in DIFFERENT shapes (one set plaintext+hash but forgot suffix; the nightly
+// migration then NULLed the plaintext, leaving an inconsistent row). These two
+// helpers make every write and every read go through one consistent path.
+//
+// Canonical invariant for an ACTIVE key: api_key IS NULL, api_key_hash SET,
+// api_key_suffix SET. For a REVOKED key: all three NULL. Nothing else is valid.
+function setPublisherKey(pubId) {
+  const key = generateApiKey();
+  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = ?, api_key_suffix = ? WHERE id = ?')
+    .run(hashApiKey(key), key.slice(-8), pubId);
+  return key; // plaintext returned once to show the admin; never stored
+}
+function revokePublisherKey(pubId) {
+  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = NULL, api_key_suffix = NULL WHERE id = ?')
+    .run(pubId);
+}
+// Consistent read: 'active' | 'revoked'. A row with a hash has a usable key,
+// regardless of whether the legacy plaintext column was ever populated.
+function keyStatus(pub) {
+  return pub && pub.api_key_hash ? 'active' : 'revoked';
+}
+function keySuffixOf(pub) {
+  return (pub && (pub.api_key_suffix || (pub.api_key ? pub.api_key.slice(-8) : null))) || null;
+}
+// ---------------------------------------------------------------------------
+
+// Publishers only ever see operationally-meaningful rejection reasons; internal
+// attribution/reconciliation reasons (telesale_wins, split_50, mmp_*, …) collapse
+// to a neutral "Attribution adjustment" label. Admin views render the raw reason
+// unchanged. Defined here (early) so both API and HTML views can share it.
+const PUB_SAFE_REASONS = new Set(['below_min_value', 'duplicate', 'duplicate_user', 'duplicate_click_id', 'not_activated', 'no_event']);
+const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'Attribution adjustment');
 
 function requireApiKey(req, res, next) {
   const key = (req.headers['x-api-key'] || '').trim();
@@ -1087,7 +1202,53 @@ function assignmentBlock(assignment, publisher, slug) {
   return null;
 }
 
-// F12 — count APPROVED conversions for an advertiser in the current UTC month,
+// Fix #4 — per-PID gating at postback time. Given the resolved publisher row,
+// advertiser row and the click's sub_id, decide whether this PID may convert,
+// and lazily create the PID record.
+//
+// Two independent controls:
+//   1. advertiser.pid_approval_required (mode):
+//        0 "Tự động"     → unknown PID is auto-created as approved+running.
+//        1 "Duyệt trước" → unknown PID is created as pending (NOT allowed to
+//                          convert until an admin approves it).
+//   2. publisher_pids.run_state (per-PID): an admin can pause any single PID at
+//        any time; a paused PID never converts, regardless of mode.
+//
+// Returns null when allowed, or { reason, message } when blocked.
+// A postback with no sub_id is exempt (nothing to gate) — legacy/simple traffic.
+function checkPidAllowed(pubRow, advRow, subId) {
+  if (!subId) return null; // no sub-affiliate → nothing to gate
+  const approvalMode = advRow.pid_approval_required ? 1 : 0;
+
+  let pid = db.prepare(
+    'SELECT * FROM publisher_pids WHERE publisher_id = ? AND advertiser_id = ? AND sub_id = ?'
+  ).get(pubRow.id, advRow.id, subId);
+
+  if (!pid) {
+    // First time we see this PID. Create it with the state implied by the mode.
+    const approvalState = approvalMode ? 'pending' : 'approved';
+    const decidedAt = approvalMode ? null : new Date().toISOString().replace('T', ' ').slice(0, 19);
+    db.prepare(`INSERT INTO publisher_pids (publisher_id, advertiser_id, sub_id, approval_state, run_state, decided_at)
+                VALUES (?, ?, ?, ?, 'running', ?)`)
+      .run(pubRow.id, advRow.id, subId, approvalState, decidedAt);
+    if (approvalMode) {
+      return { reason: 'pid_pending_approval', message: `Source "${subId}" is awaiting approval` };
+    }
+    return null; // auto-approved + running
+  }
+
+  // Existing PID — check both controls.
+  if (pid.run_state === 'paused') {
+    return { reason: 'pid_paused', message: `Source "${subId}" is paused` };
+  }
+  if (pid.approval_state === 'rejected') {
+    return { reason: 'pid_rejected', message: `Source "${subId}" was rejected` };
+  }
+  if (pid.approval_state === 'pending') {
+    return { reason: 'pid_pending_approval', message: `Source "${subId}" is awaiting approval` };
+  }
+  return null; // approved + running
+}
 // excluding anything before the manual cap-reset floor (cap_reset_at).
 function advertiserApprovedCount(adv) {
   return db.prepare(`
@@ -1263,7 +1424,7 @@ app.get('/track/:slug', (req, res) => {
   const dest = (campaign && campaign.offer_url) ? campaign.offer_url : adv.offer_url;
   if (!dest) return res.json({ click_id: clickId, advertiser: slug, publisher: pub, ...(campaign ? { campaign_id: campaign.id } : {}) });
 
-  const url = new URL(dest);
+  const url = new URL(dest.replace('{pub_id}', pub));
   url.searchParams.set('click_id', clickId);
   res.redirect(302, url.toString());
 });
@@ -1293,7 +1454,7 @@ app.get('/track/:slug/:campaign_id', (req, res) => {
   const dest = campaign.offer_url || adv.offer_url;
   if (!dest) return res.json({ click_id: clickId, advertiser: slug, publisher: pub, campaign_id: campaign.id });
 
-  const url = new URL(dest);
+  const url = new URL(dest.replace('{pub_id}', pub));
   url.searchParams.set('click_id', clickId);
   res.redirect(302, url.toString());
 });
@@ -1481,11 +1642,12 @@ function pickAiAdvertiser(linkId, candidateSlugs) {
 // ---------------------------------------------------------------------------
 
 app.get('/postback/:slug', postbackLimiter, (req, res) => {
+  // Authorization is decided below once the advertiser is resolved: a trusted
+  // source IP OR a valid per-advertiser HMAC signature authorizes the postback.
+  // We compute ipTrusted here but DEFER any reject, so a correctly-signed
+  // postback from a non-whitelisted IP (advertiser/MMP/test tool) still passes.
   const ip = getIp(req);
-  if (!isWhitelisted(ip)) {
-    logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted' });
-    return res.status(403).json({ error: 'Forbidden — IP not whitelisted' });
-  }
+  const ipTrusted = isWhitelisted(ip);
 
   const { slug }                             = req.params;
   const { click_id, payout }                 = req.query;
@@ -1517,20 +1679,30 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
 
-  // F18(B) — optional per-advertiser HMAC signature. If a secret is set, require
-  // &sig=HMAC-SHA256(secret, "click_id:event:payout"). No secret → accept as before.
-  // Advertiser must sign using the same format: click_id:event:payout
+  // --- Unified inbound authorization (fix #1, Hướng C) ---------------------
+  // A postback is authorized when EITHER:
+  //   (a) it comes from a trusted source IP (AppsFlyer/Adjust CIDR, extra IPs), OR
+  //   (b) it carries a valid per-advertiser HMAC signature (&sig=...).
+  // The signature path lets advertisers/MMPs/the Postback Test Tool send from
+  // any IP — the robust option, since MMP source IPs drift over time.
+  //
+  // Additionally, if the advertiser HAS configured a postback_secret, we require
+  // the signature to be valid whenever one is present/expected (no downgrade):
+  // a signed advertiser must always sign correctly, even from a trusted IP.
+  const sigValid = hasValidPostbackSignature(req, adv);
   if (adv.postback_secret) {
-    const sig = String(req.query.sig || '').toLowerCase();
-    const base = [click_id, rawEvent, payout ?? ''].join(':');
-    const expected = crypto.createHmac('sha256', adv.postback_secret).update(base).digest('hex');
-    const valid = sig.length === expected.length &&
-      crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
-    if (!valid) {
-      logPostback(req, { status: 'rejected', reason: 'invalid_signature', advertiser: slug });
+    // Secret configured → signature is mandatory (this also satisfies IP-less auth).
+    if (!sigValid) {
+      logPostback(req, { status: 'rejected', reason: 'invalid_signature', advertiser: slug, ip });
       return res.status(403).json({ error: 'Invalid or missing postback signature' });
     }
+  } else if (!ipTrusted) {
+    // No secret configured and IP not trusted → cannot authorize. Log so the
+    // rejected postback is visible for debugging (Received Log reads postback.log).
+    logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted', advertiser: slug, ip });
+    return res.status(403).json({ error: 'Forbidden — set a postback signature or send from an allowlisted IP' });
   }
+  // ------------------------------------------------------------------------
 
   const pub = click.publisher;
 
@@ -1563,6 +1735,16 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
   if (block) {
     logPostback(req, { status: 'rejected', reason: block.reason, publisher: pub, advertiser: slug });
     return res.status(403).json({ error: block.message });
+  }
+
+  // Fix #4 — per-PID gating. The click's sub_id (af_sub1) must be an approved +
+  // running PID. In "Tự động" mode an unknown PID is auto-approved; in "Duyệt
+  // trước" mode it is created pending and blocked until an admin approves. A
+  // paused PID is always blocked. No sub_id → exempt.
+  const pidBlock = checkPidAllowed({ id: assignment.publisher_id }, adv, click.af_sub1 || null);
+  if (pidBlock) {
+    logPostback(req, { status: 'rejected', reason: pidBlock.reason, publisher: pub, advertiser: slug, sub_id: click.af_sub1 || null });
+    return res.status(403).json({ error: pidBlock.message });
   }
 
   // F22 — multi-event funnel ingestion for advertisers configured with an
@@ -1817,10 +1999,7 @@ app.get('/postback/:slug', postbackLimiter, (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/postback/:slug/protect360', postbackLimiter, (req, res) => {
   const ip = getIp(req);
-  if (!isWhitelisted(ip)) {
-    logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted' });
-    return res.status(403).json({ error: 'Forbidden — IP not whitelisted' });
-  }
+  const ipTrusted = isWhitelisted(ip);
   const { slug } = req.params;
   const click_id = (req.query.click_id || '').toString().trim();
   const rawReason = (req.query.reason || '').toString().trim().slice(0, 120) || 'flagged';
@@ -1829,6 +2008,14 @@ app.get('/postback/:slug/protect360', postbackLimiter, (req, res) => {
 
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.status(404).json({ error: `Unknown advertiser: ${slug}` });
+
+  // Unified authorization (fix #1): trusted IP OR valid per-advertiser HMAC.
+  // protect360 signs the same base ("click_id:event:payout"); here event
+  // defaults to 'protect360' with empty payout unless the sender specifies them.
+  if (!ipTrusted && !hasValidPostbackSignature(req, adv)) {
+    logPostback(req, { status: 'rejected', reason: 'ip_not_whitelisted', advertiser: slug, ip });
+    return res.status(403).json({ error: 'Forbidden — set a postback signature or send from an allowlisted IP' });
+  }
 
   const existing = db.prepare('SELECT * FROM conversions WHERE click_id = ? AND advertiser_slug = ?').all(click_id, slug);
   let action;
@@ -2289,6 +2476,45 @@ app.get('/publisher/payments', requirePublisher, (req, res) => {
 app.get('/publisher/api-access', requirePublisher, (req, res) => {
   res.send(renderPubApiAccess({ pub: req.publisher }));
 });
+
+// ---------------------------------------------------------------------------
+// Fix #4 — publisher self-serve PID control. A network (e.g. Yana/Moonrover)
+// can pause/run ITS OWN sub-sources without waiting on the admin. Approval
+// (Duyệt trước) stays admin-only; publishers only get pause/run.
+//
+// SECURITY: every query is scoped to req.publisher.id (from the session), and
+// every mutation re-checks ownership by publisher_id. A PID id from the URL is
+// NEVER trusted on its own — publisher A can never touch publisher B's PID.
+// ---------------------------------------------------------------------------
+app.get('/publisher/pids', requirePublisher, (req, res) => {
+  const pub = req.publisher;
+  const rows = db.prepare(`
+    SELECT pp.id, pp.sub_id, pp.approval_state, pp.run_state, pp.created_at,
+           a.name AS advertiser, a.slug AS advertiser_slug,
+           a.pid_approval_required AS approval_mode
+    FROM publisher_pids pp
+    JOIN advertisers a ON a.id = pp.advertiser_id
+    WHERE pp.publisher_id = ?
+    ORDER BY a.name, pp.sub_id
+  `).all(pub.id);
+  res.send(renderPubPids({ pub, rows, csrfToken: req.session.csrfToken }));
+});
+
+// Shared owner-checked pause/run for publishers. Re-reads the PID constrained by
+// BOTH id AND publisher_id — a mismatched owner simply finds no row.
+function publisherPidAction(req, res, runState) {
+  const pid = db.prepare('SELECT * FROM publisher_pids WHERE id = ? AND publisher_id = ?')
+    .get(req.params.id, req.publisher.id);
+  if (!pid) return res.redirect('/publisher/pids?err=Not+found'); // not owned → treated as not found
+  db.prepare('UPDATE publisher_pids SET run_state = ? WHERE id = ? AND publisher_id = ?')
+    .run(runState, pid.id, req.publisher.id);
+  logAudit(runState === 'paused' ? 'pid.paused_by_publisher' : 'pid.resumed_by_publisher',
+    'publisher_pid', String(pid.id), { sub_id: pid.sub_id, publisher: req.publisher.username }, req);
+  return res.redirect('/publisher/pids?ok=1');
+}
+app.post('/publisher/pids/:id/pause', requirePublisher, verifyCsrf, (req, res) => publisherPidAction(req, res, 'paused'));
+app.post('/publisher/pids/:id/run',   requirePublisher, verifyCsrf, (req, res) => publisherPidAction(req, res, 'running'));
+
 
 // ---------------------------------------------------------------------------
 // Publisher — profile / change password
@@ -2791,6 +3017,8 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   // Backlog #4 — per-advertiser timezone + currency (validated; default USD)
   const timezone = validTz((req.body.timezone || '').trim()) || null;
   const currency = ((req.body.currency || 'USD').trim().toUpperCase().slice(0, 8)) || 'USD';
+  // Fix #4 — PID approval mode. Checkbox present = "Duyệt trước" (1); absent = "Tự động" (0).
+  const pidApprovalRequired = String(req.body.pid_approval_required) === '1' ? 1 : 0;
   const { slug } = req.params;
   const adv = db.prepare('SELECT * FROM advertisers WHERE slug = ?').get(slug);
   if (!adv) return res.redirect('/admin?msg=Advertiser+not+found&ok=0');
@@ -2808,17 +3036,17 @@ app.post('/admin/advertisers/:slug/update', requireAdmin, (req, res) => {
   if (isReset) {
     db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
         monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
-        mmp_type=?, mmp_app_id=?, mmp_api_token=?, timezone=?, currency=?,
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, timezone=?, currency=?, pid_approval_required=?,
         status='active', cap_reset_month=?, cap_reset_at=datetime('now'),
         cap_alert_month=strftime('%Y-%m','now'), cap_alerted_80=0, cap_alerted_100=0 WHERE slug=?`)
       .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
-        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, submittedReset, slug);
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, pidApprovalRequired, submittedReset, slug);
   } else {
     db.prepare(`UPDATE advertisers SET name=?, offer_url=?, payout_amount=?, payout_type=?, click_lookback_window=?,
         monthly_conversion_cap=?, is_public=?, category=?, description=?, countries_allowed=?, postback_secret=?,
-        mmp_type=?, mmp_app_id=?, mmp_api_token=?, timezone=?, currency=?, status=? WHERE slug=?`)
+        mmp_type=?, mmp_app_id=?, mmp_api_token=?, timezone=?, currency=?, pid_approval_required=?, status=? WHERE slug=?`)
       .run(name.trim(), offer_url || '', parseFloat(payout_amount) || 0, payoutType, lookback, cap,
-        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, status || 'active', slug);
+        isPublic, category, description, countriesAllowed, postbackSecret, mmpType, mmpAppId, mmpToken, timezone, currency, pidApprovalRequired, status || 'active', slug);
   }
   logAudit('advertiser.updated', 'advertiser', slug,
     { name: name.trim(), offer_url: offer_url || '', payout_amount: parseFloat(payout_amount) || 0, payout_type: payoutType,
@@ -3126,10 +3354,8 @@ app.post('/admin/publishers/:id/toggle', requireAdmin, (req, res) => {
 app.post('/admin/publishers/:id/regenerate-key', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT id, username, api_key_suffix FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
-  const newKey = generateApiKey();
   // M3 — store hash + suffix only; never retain the plaintext key.
-  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = ?, api_key_suffix = ? WHERE id = ?')
-    .run(hashApiKey(newKey), newKey.slice(-8), pub.id);
+  const newKey = setPublisherKey(pub.id);
   // M2 — surface the new key once via the session (not the redirect URL).
   req.session.newApiKey = newKey;
   logAudit('api_key.regenerated', 'publisher', pub.username, { old_key_suffix: pub.api_key_suffix || null }, req);
@@ -3140,7 +3366,7 @@ app.post('/admin/publishers/:id/regenerate-key', requireAdmin, (req, res) => {
 app.post('/admin/publishers/:id/revoke-key', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT id, username FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
-  db.prepare('UPDATE publishers SET api_key = NULL, api_key_hash = NULL, api_key_suffix = NULL WHERE id = ?').run(pub.id);
+  revokePublisherKey(pub.id);
   logAudit('api_key.revoked', 'publisher', pub.username, {}, req);
   res.redirect(`/admin/publishers/${pub.id}/edit?msg=API+key+revoked`);
 });
@@ -3183,8 +3409,8 @@ app.post('/admin/publishers/:id/payments', requireAdmin, (req, res) => {
 app.post('/admin/publishers/:id/approve', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
-  const apiKey = generateApiKey();
-  db.prepare("UPDATE publishers SET status='active', api_key=?, api_key_hash=? WHERE id=?").run(apiKey, hashApiKey(apiKey), pub.id);
+  db.prepare("UPDATE publishers SET status='active' WHERE id=?").run(pub.id);
+  setPublisherKey(pub.id); // consistent hash-only write (was the source of the state bug)
   logAudit('publisher.approved', 'publisher', pub.username, { email: pub.email }, req);
   res.redirect(`/admin/publishers?msg=Publisher+%22${encodeURIComponent(pub.username)}%22+approved`);
 });
@@ -3245,6 +3471,23 @@ app.get('/admin/postback-log', requireAdmin, (req, res) => {
     const w = where.join(' AND ');
     rows = db.prepare(`SELECT cv.id, cv.click_id, cv.advertiser_slug, cv.publisher, cv.event, cv.status, cv.reason, cv.received_at AS ts
       FROM conversions cv WHERE ${w} ORDER BY cv.received_at DESC LIMIT ${LIMIT}`).all(...params);
+
+    // Merge gate-level rejects (bad IP / signature) from postback.log — these
+    // never reach the conversions table, so without this they are invisible.
+    // Only shown when not filtering to 'ok', and matched against the search box.
+    if (status !== 'ok') {
+      let gate = readGateRejectedPostbacks(LIMIT);
+      if (q) {
+        const ql = q.toLowerCase();
+        gate = gate.filter(g =>
+          String(g.click_id).toLowerCase().includes(ql) ||
+          String(g.publisher).toLowerCase().includes(ql) ||
+          String(g.advertiser_slug).toLowerCase().includes(ql));
+      }
+      rows = [...rows, ...gate]
+        .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
+        .slice(0, LIMIT);
+    }
     const s = db.prepare(`SELECT COUNT(*) total,
         SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) ok,
         SUM(CASE WHEN status IN ('rejected','duplicate') THEN 1 ELSE 0 END) fail FROM conversions`).get();
@@ -3738,8 +3981,90 @@ app.get('/api/v1/stats', requireApiKey, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Audit log viewer
+// REST API  GET /api/v1/conversions  (X-API-Key: kom_live_...)
+// Fix #3 — conversion-level detail for networks (Moonrover/Yana). Returns one
+// row per conversion with click_id, event, timestamp, status, payout, sub-IDs
+// and a PUBLISHER-SAFE (masked) rejection reason. Scoped to the key's publisher
+// only. Paginated; filterable by date range, advertiser and sub_id.
 // ---------------------------------------------------------------------------
+app.get('/api/v1/conversions', requireApiKey, (req, res) => {
+  const pub = req.publisher;
+
+  // --- pagination (page-based, capped) ---
+  const MAX_LIMIT = 500, DEF_LIMIT = 100;
+  let limit = parseInt(req.query.limit, 10);
+  if (!(limit > 0)) limit = DEF_LIMIT;
+  limit = Math.min(limit, MAX_LIMIT);
+  let page = parseInt(req.query.page, 10);
+  if (!(page > 0)) page = 1;
+  const offset = (page - 1) * limit;
+
+  // --- filters (all optional) ---
+  const where = ['publisher = ?'];
+  const params = [pub.username];
+
+  const advSlug = (req.query.advertiser || req.query.advertiser_slug || '').trim();
+  if (advSlug) { where.push('advertiser_slug = ?'); params.push(advSlug); }
+
+  const subId = (req.query.sub_id || req.query.af_sub1 || '').trim();
+  if (subId) { where.push('af_sub1 = ?'); params.push(subId); }
+
+  const status = (req.query.status || '').trim().toLowerCase();
+  if (['approved', 'pending', 'rejected', 'duplicate'].includes(status)) {
+    where.push('status = ?'); params.push(status);
+  }
+
+  // date range on received_at (YYYY-MM-DD inclusive). Basic shape validation.
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const from = (req.query.from || '').trim();
+  const to   = (req.query.to   || '').trim();
+  if (dateRe.test(from)) { where.push("date(received_at) >= date(?)"); params.push(from); }
+  if (dateRe.test(to))   { where.push("date(received_at) <= date(?)"); params.push(to); }
+
+  const w = where.join(' AND ');
+
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM conversions WHERE ${w}`).get(...params).n;
+
+  const rows = db.prepare(`
+    SELECT click_id, advertiser_slug, event, status, payout, currency,
+           af_sub1, af_sub2, reason, received_at
+    FROM conversions WHERE ${w}
+    ORDER BY received_at DESC, id DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, limit, offset);
+
+  res.json({
+    publisher: pub.username,
+    paging: {
+      page,
+      limit,
+      total,
+      total_pages: Math.max(1, Math.ceil(total / limit)),
+      has_more: offset + rows.length < total,
+    },
+    filters: {
+      advertiser: advSlug || null,
+      sub_id: subId || null,
+      status: status || null,
+      from: dateRe.test(from) ? from : null,
+      to: dateRe.test(to) ? to : null,
+    },
+    conversions: rows.map(r => ({
+      click_id:        r.click_id,
+      advertiser_slug: r.advertiser_slug,
+      event:           r.event,
+      status:          r.status,
+      payout:          +(Number(r.payout) || 0).toFixed(2),
+      currency:        r.currency,
+      sub_id:          r.af_sub1 || null,   // primary sub-affiliate id
+      af_sub1:         r.af_sub1 || null,
+      af_sub2:         r.af_sub2 || null,
+      // publisher-safe reason: internal attribution reasons are masked.
+      rejection_reason: r.status === 'rejected' ? (pubSafeReason(r.reason) || null) : null,
+      timestamp:       r.received_at,
+    })),
+  });
+});
 
 app.get('/admin/audit-log', requireAdmin, (req, res) => {
   const { action, from, to } = req.query;
@@ -3811,6 +4136,72 @@ app.get('/admin/publisher-quality', requireAdmin, (req, res) => {
   const rows = pubs.map(p => publisherQualityScore(p.username)).sort((a, b) => a.score - b.score);
   res.send(renderPublisherQuality({ rows }));
 });
+
+// ---------------------------------------------------------------------------
+// Fix #4 — PID (sub-affiliate) management. Lists every PID grouped by advertiser
+// then publisher, with pending PIDs surfaced. Admin can approve/reject a PID
+// (only meaningful in "Duyệt trước" mode) and pause/run any PID at any time.
+// ---------------------------------------------------------------------------
+app.get('/admin/pids', requireAdmin, (req, res) => {
+  const flt = (req.query.status || '').trim();               // '', 'pending', 'paused'
+  const where = ['1=1'];
+  if (flt === 'pending') where.push("pp.approval_state = 'pending'");
+  if (flt === 'paused')  where.push("pp.run_state = 'paused'");
+
+  const rows = db.prepare(`
+    SELECT pp.id, pp.sub_id, pp.approval_state, pp.run_state, pp.created_at, pp.decided_at,
+           p.username AS publisher, a.name AS advertiser, a.slug AS advertiser_slug,
+           a.pid_approval_required AS approval_mode
+    FROM publisher_pids pp
+    JOIN publishers  p ON p.id = pp.publisher_id
+    JOIN advertisers a ON a.id = pp.advertiser_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY a.name, p.username, pp.sub_id
+  `).all();
+
+  const counts = db.prepare(`
+    SELECT SUM(CASE WHEN approval_state='pending' THEN 1 ELSE 0 END) AS pending,
+           SUM(CASE WHEN run_state='paused' THEN 1 ELSE 0 END) AS paused,
+           COUNT(*) AS total
+    FROM publisher_pids
+  `).get();
+
+  res.send(renderPidManagement({ rows, counts, flt, csrfToken: req.session.csrfToken }));
+});
+
+// Shared handler for the four PID state actions. `field`/`value` decide the change.
+function pidAction(req, res, apply) {
+  const pid = db.prepare(`
+    SELECT pp.*, p.username AS publisher, a.slug AS advertiser_slug
+    FROM publisher_pids pp
+    JOIN publishers p ON p.id = pp.publisher_id
+    JOIN advertisers a ON a.id = pp.advertiser_id
+    WHERE pp.id = ?
+  `).get(req.params.id);
+  if (!pid) return res.redirect('/admin/pids?msg=PID+not+found&ok=0');
+  apply(pid);
+  return res.redirect('/admin/pids?msg=Updated');
+}
+
+app.post('/admin/pids/:id/approve', requireAdmin, (req, res) => pidAction(req, res, (pid) => {
+  db.prepare("UPDATE publisher_pids SET approval_state='approved', decided_at=datetime('now') WHERE id=?").run(pid.id);
+  logAudit('pid.approved', 'publisher_pid', String(pid.id), { sub_id: pid.sub_id, publisher: pid.publisher, advertiser: pid.advertiser_slug }, req);
+}));
+
+app.post('/admin/pids/:id/reject', requireAdmin, (req, res) => pidAction(req, res, (pid) => {
+  db.prepare("UPDATE publisher_pids SET approval_state='rejected', decided_at=datetime('now') WHERE id=?").run(pid.id);
+  logAudit('pid.rejected', 'publisher_pid', String(pid.id), { sub_id: pid.sub_id, publisher: pid.publisher, advertiser: pid.advertiser_slug }, req);
+}));
+
+app.post('/admin/pids/:id/pause', requireAdmin, (req, res) => pidAction(req, res, (pid) => {
+  db.prepare("UPDATE publisher_pids SET run_state='paused' WHERE id=?").run(pid.id);
+  logAudit('pid.paused', 'publisher_pid', String(pid.id), { sub_id: pid.sub_id, publisher: pid.publisher, advertiser: pid.advertiser_slug }, req);
+}));
+
+app.post('/admin/pids/:id/run', requireAdmin, (req, res) => pidAction(req, res, (pid) => {
+  db.prepare("UPDATE publisher_pids SET run_state='running' WHERE id=?").run(pid.id);
+  logAudit('pid.resumed', 'publisher_pid', String(pid.id), { sub_id: pid.sub_id, publisher: pid.publisher, advertiser: pid.advertiser_slug }, req);
+}));
 
 app.get('/admin/fraud', requireAdmin, (req, res) => {
   const rows = db.prepare(`SELECT click_id, advertiser_slug,
@@ -5228,6 +5619,7 @@ function adminSidebar() {
   ${nav('/admin/fraud',            'Fraud Review',      'fraud',  '/admin/fraud')}
   ${nav('/admin/fraud-review',     'Trading Fraud',     'fraud',  '/admin/fraud-review')}
   ${nav('/admin/publisher-quality','Publisher Quality', 'quality','/admin/publisher-quality')}
+  ${nav('/admin/pids',        'PID Management','pids',    '/admin/pids')}
   <div class="adm-sb-group">SYSTEM</div>
   ${nav('/admin/exchange-rates','Exchange Rates','settings',  '/admin/exchange-rates')}
   ${nav('/admin/fx-rates',      'FX Rates (locked)','settings','/admin/fx-rates')}
@@ -5982,6 +6374,28 @@ function renderAdvForm({ title, action, adv = {}, error, csrfToken = '', goals =
         <small>If set, postbacks must include <code>&amp;sig=HMAC_SHA256(secret, click_id+event+payout)</code> as a hex digest, or they are rejected (403). Leave blank to accept unsigned postbacks (backward compatible).</small></div>
     </fieldset>
     <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <legend style="font-size:12px;font-weight:600;padding:0 6px">Source (PID) approval mode</legend>
+      <div class="fg">
+        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="radio" name="pid_approval_required" value="0" ${adv.pid_approval_required ? '' : 'checked'}
+                 style="margin-top:3px;width:16px;height:16px">
+          <span><strong>Auto</strong> <span style="color:#166534;font-size:11px">(recommended for networks)</span><br>
+            <small style="color:#6e6e73">Publishers add new sources and they run immediately — no approval step.</small></span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+          <input type="radio" name="pid_approval_required" value="1" ${adv.pid_approval_required ? 'checked' : ''}
+                 style="margin-top:3px;width:16px;height:16px">
+          <span><strong>Approval required</strong><br>
+            <small style="color:#6e6e73">Each new source (sub-id) must be approved by Komorebi before it can convert.</small></span>
+        </label>
+        <small style="display:block;color:#6e6e73;margin-top:10px;padding-top:8px;border-top:1px solid #f0f0f0">
+          The mode applies only to <strong>new</strong> sources. Already-approved sources keep running when you switch modes; sources that are still pending or were rejected stay blocked until you approve them here, even in Auto mode.
+          Either way, admins and publishers can pause/resume any single source in
+          <a href="/admin/pids">PID Management</a>.
+        </small>
+      </div>
+    </fieldset>
+    <fieldset style="border:1px solid #e0e0e0;border-radius:10px;padding:14px 16px;margin-bottom:14px">
       <legend style="font-size:12px;font-weight:600;padding:0 6px">MMP Integration (AppsFlyer / Adjust)</legend>
       <div class="fg-row">
         <div class="fg"><label>MMP Type</label>
@@ -6066,8 +6480,8 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
   </tr>`).join('');
 
   const rows = publishers.map(p => {
-    const keySuffix = p.api_key_suffix || (p.api_key ? p.api_key.slice(-8) : null);
-    const keyBadge = p.api_key_hash
+    const keySuffix = keySuffixOf(p);
+    const keyBadge = keyStatus(p) === 'active'
       ? `<code style="font-size:10px;color:#2e7d32">…${H(keySuffix || '')}</code>`
       : `<span style="font-size:10px;color:#c62828">revoked</span>`;
     const qs = publisherQualityScore(p.username);  // Backlog #16 — traffic-quality badge
@@ -6096,7 +6510,7 @@ function renderPubList({ publishers, pending = [], flash, csrfToken = '' }) {
             data-confirm="Regenerate API key for ${H(p.username)}? The old key stops working immediately.">${csrfField(csrfToken)}
         <button class="btn btn-ghost">↻ Key</button>
       </form>
-      ${p.api_key_hash ? `<form method="POST" action="/admin/publishers/${p.id}/revoke-key" style="display:inline"
+      ${keyStatus(p) === 'active' ? `<form method="POST" action="/admin/publishers/${p.id}/revoke-key" style="display:inline"
             data-confirm="Revoke API key for ${H(p.username)}?">${csrfField(csrfToken)}
         <button class="btn btn-danger">Revoke Key</button>
       </form>` : ''}
@@ -6505,7 +6919,7 @@ function renderAdminMarketplace({ pending, csrfToken = '', flash }) {
 function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
   assignments = [], allAdvertisers = [], resetLink = null, newApiKey = null }) {
   const isEdit = action.includes('/update');
-  const keySuffix = pub.api_key_suffix || (pub.api_key ? pub.api_key.slice(-8) : null);
+  const keySuffix = keySuffixOf(pub);
   const statusOpts = ['active','paused'].map(s =>
     `<option value="${s}" ${(pub.status||'active')===s?'selected':''}>${s[0].toUpperCase()+s.slice(1)}</option>`
   ).join('');
@@ -6601,7 +7015,7 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
               <button type="button" class="btn btn-ghost" data-copy="${H(newApiKey)}">Copy</button>
             </div>
           </div>` : ''}
-      ${pub.api_key_hash
+      ${keyStatus(pub) === 'active'
         ? `${newApiKey ? '' : `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
             <input type="text" value="••••••••••• (saved)" readonly disabled
                    style="font-family:monospace;font-size:12px;flex:1;background:#f5f5f7;color:#6e6e73">
@@ -7093,11 +7507,12 @@ function renderGlobalPostbackLog({ dir, status, q, rows, stats, dupCount, dupSet
   const recvRows = rows.map(l => {
     const dup = dupSet.has(l.click_id);
     const cls = l.status === 'approved' ? 'active' : (l.status === 'pending' ? '' : 'paused');
-    return `<tr${dup?' style="background:#fffbf0"':''}>
+    const gateBadge = l.gate ? ' <span class="badge" style="background:#fde7e7;color:#c62828" title="Rejected at the gate (IP/signature) — never reached the conversions table">gate</span>' : '';
+    return `<tr${dup?' style="background:#fffbf0"':''}${l.gate?' style="background:#fff5f5"':''}>
       <td>${H(l.ts)}</td>
       <td>${H(l.publisher)}</td>
       <td>${H(l.advertiser_slug)}</td>
-      <td><code class="xs">${H(l.click_id)}</code>${dup?' <span class="badge" style="background:#fff3e0;color:#e65100">dup</span>':''}</td>
+      <td><code class="xs">${H(l.click_id)}</code>${dup?' <span class="badge" style="background:#fff3e0;color:#e65100">dup</span>':''}${gateBadge}</td>
       <td>${H(l.event)}</td>
       <td><span class="badge ${cls}">${H(l.status)}</span></td>
       <td style="font-size:11px;color:#6e6e73">${H(l.reason||'')}</td>
@@ -7275,6 +7690,103 @@ function renderPublisherQuality({ rows }) {
 </section>
 </main>`;
   return adminLayout('Publisher Quality', body);
+}
+
+// Fix #4 — admin PID management page
+function renderPidManagement({ rows, counts, flt, csrfToken }) {
+  // Approval column. Purely informational. Only when the PID is genuinely
+  // approved AND the advertiser doesn't require approval do we show the neutral
+  // "No approval needed" — otherwise reflect the PID's real approval_state so it
+  // can never contradict the Active column.
+  const approvalBadge = (state, mode) => {
+    if (!mode && state === 'approved') return '<span class="badge" style="background:#eef2f7;color:#8e8e93">No approval needed</span>';
+    if (state === 'approved') return '<span class="badge active">Approved</span>';
+    if (state === 'rejected') return '<span class="badge" style="background:#fdecea;color:#c62828">Rejected</span>';
+    return '<span class="badge" style="background:#fff3e0;color:#e65100">Pending</span>';
+  };
+  // EFFECTIVE status (B1). Delegates to the shared pidEffectiveStatus so the UI
+  // is provably the same logic as enforcement (checkPidAllowed) — tested directly.
+  const EFF_BADGE = {
+    paused:               '<span class="badge" style="background:#fdecea;color:#c62828">Paused</span>',
+    not_running_rejected: '<span class="badge" style="background:#e8e8ec;color:#48484a">Not running (rejected)</span>',
+    not_running_pending:  '<span class="badge" style="background:#e8e8ec;color:#48484a">Not running (pending)</span>',
+    running:              '<span class="badge active">Running</span>',
+  };
+  const effectiveBadge = (r) => EFF_BADGE[pidEffectiveStatus(r.approval_state, r.run_state)];
+
+  const actionBtns = (r) => {
+    const btns = [];
+    // Blocked-by-approval mirrors checkPidAllowed: any non-approved state blocks,
+    // regardless of the advertiser's current mode (a PID created pending stays
+    // pending even after the advertiser is switched to Auto).
+    const blockedByApproval = r.approval_state !== 'approved';
+    // Approve is available whenever the PID isn't approved yet (B3: rejected is
+    // reversible, and a pending PID in a now-Auto advertiser still needs a way out).
+    if (r.approval_state !== 'approved') {
+      btns.push(`<form method="POST" action="/admin/pids/${r.id}/approve" style="display:inline">${csrfField(csrfToken)}<button class="btn btn-primary" style="padding:4px 10px;font-size:12px">Approve</button></form>`);
+    }
+    // Reject only offered while pending.
+    if (r.approval_state === 'pending') {
+      btns.push(`<form method="POST" action="/admin/pids/${r.id}/reject" style="display:inline" data-confirm="Reject source ${H(r.sub_id)}?">${csrfField(csrfToken)}<button class="btn btn-ghost" style="padding:4px 10px;font-size:12px">Reject</button></form>`);
+    }
+    // Pause/run only make sense for a PID that could otherwise run.
+    if (!blockedByApproval) {
+      if (r.run_state === 'paused') {
+        btns.push(`<form method="POST" action="/admin/pids/${r.id}/run" style="display:inline">${csrfField(csrfToken)}<button class="btn btn-ghost" style="padding:4px 10px;font-size:12px">Resume</button></form>`);
+      } else {
+        btns.push(`<form method="POST" action="/admin/pids/${r.id}/pause" style="display:inline" data-confirm="Pause source ${H(r.sub_id)}?">${csrfField(csrfToken)}<button class="btn btn-warn" style="padding:4px 10px;font-size:12px">Pause</button></form>`);
+      }
+    }
+    return btns.join(' ') || '<span style="color:#c7c7cc">—</span>';
+  };
+
+  const tab = (v, label) => `<a href="/admin/pids${v?`?status=${v}`:''}" class="btn ${flt===v?'btn-primary':'btn-ghost'}" style="margin-right:6px">${label}</a>`;
+
+  // M5 — group by advertiser: only print the advertiser cell when it changes.
+  let lastAdv = null;
+  const tableRows = rows.map(r => {
+    const showAdv = r.advertiser_slug !== lastAdv;
+    lastAdv = r.advertiser_slug;
+    const advCell = showAdv
+      ? `${H(r.advertiser)} <span style="color:#8e8e93;font-size:11px">${H(r.advertiser_slug)}</span>
+         ${r.approval_mode ? '<span class="badge" style="background:#eef;color:#3730a3;font-size:10px">Approval required</span>' : '<span class="badge" style="background:#efe;color:#166534;font-size:10px">Auto</span>'}`
+      : '<span style="color:#c7c7cc">↳</span>';
+    return `<tr>
+    <td>${advCell}</td>
+    <td><strong>${H(r.publisher)}</strong></td>
+    <td><code class="xs">${H(r.sub_id)}</code></td>
+    <td>${approvalBadge(r.approval_state, r.approval_mode)}</td>
+    <td>${effectiveBadge(r)}</td>
+    <td style="white-space:nowrap">${actionBtns(r)}</td>
+  </tr>`;
+  }).join('');
+
+  const body = `${adminHeader()}
+<main>
+<section>
+  <div class="sh"><h2>PID Management</h2><span class="meta">${N(counts.total||0)} PIDs · ${N(counts.pending||0)} pending · ${N(counts.paused||0)} paused</span></div>
+  <div style="padding:12px 20px">
+    ${tab('', 'All')}${tab('pending', `Pending (${N(counts.pending||0)})`)}${tab('paused', `Paused (${N(counts.paused||0)})`)}
+  </div>
+  <div style="padding:0 20px 10px;font-size:12px;color:#6e6e73">
+    <strong>Approval mode</strong> (Auto / Approval required) is set on the advertiser's edit page. <strong>Pause / Resume</strong> applies to a single source and works in either mode.
+  </div>
+  ${rows.length === 0 ? '<div class="empty">No PIDs yet.</div>' : `
+  <style>
+    /* M5 — keep the Advertiser column visible when the table scrolls sideways on
+       mobile, so grouped rows (↳) never lose their context. */
+    #pid-table td:first-child, #pid-table th:first-child {
+      position:sticky; left:0; background:#fff; z-index:1;
+      box-shadow:1px 0 0 #eee;
+    }
+    #pid-table tr:nth-child(even) td:first-child { background:#fafafa; }
+  </style>
+  <div class="table-wrap"><table id="pid-table"><thead><tr>
+    <th>Advertiser</th><th>Publisher</th><th>Source (sub-id)</th><th>Approval</th><th>Active</th><th></th>
+  </tr></thead><tbody>${tableRows}</tbody></table></div>`}
+</section>
+</main>`;
+  return adminLayout('PID Management', body);
 }
 
 // Backlog #14 — fraud review (flagged conversions grouped by click_id)
@@ -7776,6 +8288,61 @@ ${flash ? `<div class="flash success">${H(flash)}</div>` : ''}
 // Publisher portal HTML templates
 // ---------------------------------------------------------------------------
 
+// Fix #4 — publisher self-serve PID page. Publishers see only their own PIDs
+// and can pause/run them; approval stays admin-side. Uses the portal's existing
+// classes (badge / section / table / empty). English, consistent with the rest
+// of the portal.
+function renderPubPids({ pub, rows, csrfToken }) {
+  // Approval column: informational. "No approval needed" only when genuinely
+  // approved under an Auto advertiser; otherwise reflect the real approval_state.
+  const approvalBadge = (r) => {
+    if (!r.approval_mode && r.approval_state === 'approved') return '<span class="badge" style="background:#eef2f7;color:#8e8e93">No approval needed</span>';
+    if (r.approval_state === 'approved') return '<span class="badge active">Approved</span>';
+    if (r.approval_state === 'rejected') return '<span class="badge" style="background:#fdecea;color:#c62828">Rejected</span>';
+    return '<span class="badge" style="background:#fff3e0;color:#e65100">Pending review</span>';
+  };
+  // EFFECTIVE status (B1). Delegates to the shared pidEffectiveStatus (same as
+  // enforcement) — run_state + approval_state only, never the advertiser's mode.
+  const PUB_EFF_BADGE = {
+    paused:               '<span class="badge" style="background:#fdecea;color:#c62828">Paused</span>',
+    not_running_rejected: '<span class="badge" style="background:#e8e8ec;color:#48484a">Not running (rejected)</span>',
+    not_running_pending:  '<span class="badge" style="background:#e8e8ec;color:#48484a">Not running (pending)</span>',
+    running:              '<span class="badge active">Running</span>',
+  };
+  const effectiveBadge = (r) => PUB_EFF_BADGE[pidEffectiveStatus(r.approval_state, r.run_state)];
+
+  const tableRows = rows.map(r => {
+    // Blocked-by-approval mirrors checkPidAllowed: any non-approved state blocks.
+    const blockedByApproval = r.approval_state !== 'approved';
+    const btn = blockedByApproval
+      ? '<span style="color:#c7c7cc">—</span>'
+      : (r.run_state === 'paused'
+        ? `<form method="POST" action="/publisher/pids/${r.id}/run" style="display:inline">${csrfField(csrfToken)}<button class="btn btn-primary" style="padding:4px 10px;font-size:12px">Resume</button></form>`
+        : `<form method="POST" action="/publisher/pids/${r.id}/pause" style="display:inline" data-confirm="Pause source ${H(r.sub_id)}?">${csrfField(csrfToken)}<button class="btn btn-ghost" style="padding:4px 10px;font-size:12px">Pause</button></form>`);
+    return `<tr>
+      <td>${H(r.advertiser)}</td>
+      <td><code class="xs">${H(r.sub_id)}</code></td>
+      <td>${approvalBadge(r)}</td>
+      <td>${effectiveBadge(r)}</td>
+      <td style="text-align:right">${btn}</td>
+    </tr>`;
+  }).join('');
+
+  const body = `<main>
+<section>
+  <div class="sh"><h2>Sources (PID)</h2><span class="meta">${N(rows.length)} sources</span></div>
+  <div style="padding:10px 20px;font-size:12px;color:#6e6e73">
+    Manage your traffic sources (each identified by the <code>af_sub1</code> value on your tracking link). You can pause or resume any source at any time. Approval of new sources (when an advertiser requires it) is handled by Komorebi.
+  </div>
+  ${rows.length === 0
+    ? '<div class="empty">No sources yet. A source appears here once you add <code>af_sub1</code> to your tracking link and traffic comes through.</div>'
+    : `<table><thead><tr><th>Advertiser</th><th>Source (sub-id)</th><th>Approval</th><th>Active</th><th></th></tr></thead>
+       <tbody>${tableRows}</tbody></table>`}
+</section>
+</main>`;
+  return pubLayout('Sources (PID)', body, pub, 'pids');
+}
+
 function pubLayout(title, body, pub = null, activeTab = null) {
   const fonts = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">';
   if (!pub) {
@@ -7796,6 +8363,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
     docs:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" d="M3.5 1h9a.5.5 0 0 1 .5.5v13a.5.5 0 0 1-.5.5h-9A.5.5 0 0 1 3 14.5v-13A.5.5 0 0 1 3.5 1z"/><path stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M5.5 5h5M5.5 8h5M5.5 11h3"/>`),
     market:      ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M2 6h12l-1 8H3L2 6zM5 6V4.5a3 3 0 0 1 6 0V6"/>`),
     link:        ic(`<path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M6.5 9.5l3-3M6 5.5l1-1a2.5 2.5 0 0 1 3.5 3.5l-1 1M10 10.5l-1 1A2.5 2.5 0 0 1 5.5 8l1-1"/>`),
+    pids:        ic(`<circle cx="4" cy="4" r="2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="12" cy="4" r="2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="12" r="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path fill="none" stroke="currentColor" stroke-width="1.3" d="M4 6v2a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2V6"/>`),
   };
   const navItem = (href, key, label, external = false) =>
     `<a href="${href}" class="pub-nav-a${activeTab===key?' active':''}"${external?' target="_blank" rel="noopener noreferrer"':''}>${PICONS[key]||''}<span>${label}</span>${external?'<svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor" style="margin-left:auto;opacity:.35"><path d="M6 3h7v7l-2-2-4 4-2-2 4-4L6 3z"/></svg>':''}</a>`;
@@ -7827,6 +8395,7 @@ function pubLayout(title, body, pub = null, activeTab = null) {
       ${navItem('/publisher/dashboard',   'dashboard',   'Dashboard')}
       ${navItem('/publisher/conversions', 'conversions', 'Conversions')}
       ${navItem('/publisher/link-generator', 'link',     'Link Generator')}
+      ${navItem('/publisher/pids',        'pids',        'Sources (PID)')}
       ${navItem('/publisher/payments',    'payments',    'Payments')}
       ${navItem('/publisher/holdback',    'payments',    'Holdback')}
       ${navItem('/marketplace',           'marketplace', 'Browse Offers')}
@@ -7981,12 +8550,6 @@ function renderResetPassword({ token, error, invalid } = {}) {
 </div>`);
 }
 
-// Publishers only ever see operationally-meaningful rejection reasons; internal
-// attribution/reconciliation reasons (telesale_wins, split_50, mmp_*, …) collapse
-// to a neutral "Attribution adjustment" label. Admin views render the raw reason unchanged.
-const PUB_SAFE_REASONS = new Set(['below_min_value', 'duplicate', 'duplicate_user', 'duplicate_click_id', 'not_activated', 'no_event']);
-const pubSafeReason = r => !r ? '' : (PUB_SAFE_REASONS.has(r) ? r : 'Attribution adjustment');
-
 function renderPubConversions({ pub, conversions }) {
   // F17 — show loan_amount / revenue columns only when at least one row has them.
   const showLoan    = conversions.some(c => c.loan_amount != null);
@@ -8091,13 +8654,13 @@ function renderPubPayments({ pub, payments, totalPaid, approvedByCurrency = [], 
 }
 
 function renderPubApiAccess({ pub }) {
-  const suffix = pub.api_key_suffix || (pub.api_key ? pub.api_key.slice(-8) : null);
+  const suffix = keySuffixOf(pub);
   const body = `
 <main>
 <section>
   <div class="sh"><h2>API Access</h2></div>
   <div style="padding:20px 22px">
-    ${pub.api_key_hash ? `
+    ${keyStatus(pub) === 'active' ? `
     <p style="font-size:13px;color:#6e6e73;margin-bottom:14px">Use your API key with the <code>X-API-Key</code> header to fetch your stats programmatically. See <a href="/docs#rest-api" style="color:#0F6E56">documentation</a> for details.</p>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
       <input type="text" value="••••••••••• (saved)" readonly disabled
@@ -8877,6 +9440,7 @@ function renderDocs() {
         <li><a href="#rest-api">REST API</a></li>
         <li><a href="#api-auth">&nbsp;&nbsp;Authentication</a></li>
         <li><a href="#api-stats">&nbsp;&nbsp;GET /api/v1/stats</a></li>
+        <li><a href="#api-conversions">&nbsp;&nbsp;GET /api/v1/conversions</a></li>
       </ul>
       <ul>
         <li><a href="#faq">FAQ</a></li>
@@ -9097,14 +9661,69 @@ function renderDocs() {
       </table>
     </section>
 
-    <!-- FAQ -->
-    <section id="faq">
+    <section>
+      <h3 class="sub-title" id="api-conversions">GET /api/v1/conversions</h3>
+      <p>Returns conversion-level detail — one row per conversion — for programmatic reconciliation and optimization. Results are scoped to your account only, ordered newest-first, and paginated.</p>
+
+      <div class="code-label">Request</div>
+      <div class="code-block"><pre>curl "${TRACK_DOMAIN}/api/v1/conversions?limit=100&amp;page=1&amp;from=2026-07-01&amp;to=2026-07-31" \\
+  -H <span class="str">"X-API-Key: kom_live_your_key_here"</span></pre></div>
+
+      <div class="code-label">Query parameters (all optional)</div>
+      <table>
+        <thead><tr><th>Param</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>limit</code></td><td>number</td><td>Rows per page (default 100, max 500)</td></tr>
+          <tr><td><code>page</code></td><td>number</td><td>Page number, 1-based (default 1)</td></tr>
+          <tr><td><code>advertiser</code></td><td>string</td><td>Filter by advertiser slug</td></tr>
+          <tr><td><code>sub_id</code></td><td>string</td><td>Filter by your sub-affiliate id (af_sub1)</td></tr>
+          <tr><td><code>status</code></td><td>string</td><td>Filter: <code>approved</code> | <code>pending</code> | <code>rejected</code> | <code>duplicate</code></td></tr>
+          <tr><td><code>from</code>, <code>to</code></td><td>date</td><td>Inclusive date range, YYYY-MM-DD, matched on conversion time in <strong>UTC</strong></td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-label">Response (200 OK)</div>
+      <div class="code-block"><pre>{
+  "publisher": "your_username",
+  "paging": { "page": 1, "limit": 100, "total": 240, "total_pages": 3, "has_more": true },
+  "conversions": [
+    {
+      "click_id": "…", "advertiser_slug": "tambadana", "event": "install",
+      "status": "approved", "payout": 11.00, "currency": "USD",
+      "sub_id": "yourSubId", "af_sub1": "yourSubId", "af_sub2": null,
+      "rejection_reason": null, "timestamp": "2026-07-15 10:22:04"
+    }
+  ]
+}</pre></div>
+
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>click_id</code></td><td>string</td><td>The click this conversion attributed to</td></tr>
+          <tr><td><code>status</code></td><td>string</td><td><code>approved</code> | <code>pending</code> | <code>rejected</code> | <code>duplicate</code> (duplicate = a repeat postback for a click+event already counted)</td></tr>
+          <tr><td><code>payout</code></td><td>number</td><td>Payout for this conversion in <code>currency</code></td></tr>
+          <tr><td><code>sub_id</code> / <code>af_sub1</code> / <code>af_sub2</code></td><td>string</td><td>Your sub-affiliate identifiers as sent on the click</td></tr>
+          <tr><td><code>rejection_reason</code></td><td>string</td><td><code>null</code> unless the row is rejected. Operational reasons are shown (e.g. <code>duplicate</code>, <code>not_activated</code>); internal adjustments appear as "Attribution adjustment"</td></tr>
+          <tr><td><code>timestamp</code></td><td>string</td><td>When the conversion was recorded (<strong>UTC</strong>)</td></tr>
+          <tr><td><code>paging.has_more</code></td><td>boolean</td><td>True when further pages are available</td></tr>
+        </tbody>
+      </table>
+
+      <div class="code-label">Errors &amp; rate limit</div>
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>401</code></td><td>Missing, invalid, or revoked API key. Send a valid <code>X-API-Key: kom_live_...</code></td></tr>
+          <tr><td><code>429</code></td><td>Rate limit exceeded. The API is limited to 100 requests/minute per IP. When paginating large result sets, space out requests or reduce page frequency.</td></tr>
+        </tbody>
+      </table>
+    </section>
       <h2 class="section-title">FAQ</h2>
 
       <div class="faq-item">
         <div class="faq-q">How are conversions validated?</div>
         <div class="faq-a">
-          <p>Every postback is validated against three criteria: (1) the <code>click_id</code> must exist in our system — if it does not match a known click, the postback is rejected; (2) the <code>click_id + event</code> pair must be unique — duplicate postbacks are deduplicated and return HTTP 409; (3) the postback must originate from a whitelisted IP address belonging to AppsFlyer or Adjust.</p>
+          <p>Every postback is validated against three criteria: (1) the <code>click_id</code> must exist in our system — if it does not match a known click, the postback is rejected; (2) the <code>click_id + event</code> pair must be unique — duplicate postbacks are deduplicated and return HTTP 409; (3) the postback must be authorized — either it comes from a current AppsFlyer/Adjust source IP range, <strong>or</strong> it carries a valid per-advertiser HMAC signature (<code>&amp;sig=</code>). The signature path lets advertisers and test tools send from any IP.</p>
           <p>Conversions recorded via postback initially enter a <strong>pending</strong> status. They move to <strong>approved</strong> or <strong>rejected</strong> only after the monthly reconciliation process.</p>
         </div>
       </div>
