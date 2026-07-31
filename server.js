@@ -966,17 +966,26 @@ async function sendDailySummaryEmail() {
 const S2S_MAX_ATTEMPTS = 3;
 const S2S_RETRY_MS     = 5 * 60 * 1_000; // 5 minutes
 
+// Single source of truth for whether outbound S2S postback fires for a publisher
+// (spec §5). Enforcement (fireS2SPostback), the test tool, and the publisher-edit
+// UI all use this, so the tool/UI can never claim outbound works when enforcement
+// would skip it — the failure class UI/UX flagged (B1 / test-tool false positive).
+// Returns { enabled, reason } where reason ∈ 'ok' | 'no_url' | 'standard_mode' | 'inactive'.
+function outboundGate(pub) {
+  if (!pub || !pub.postback_url || !String(pub.postback_url).trim()) return { enabled: false, reason: 'no_url' };
+  const modeOk = pub.integration_mode === 's2s_network' || pub.integration_mode === 'portal_s2s';
+  if (!modeOk) return { enabled: false, reason: 'standard_mode' };
+  if (pub.s2s_postback_active !== 1) return { enabled: false, reason: 'inactive' };
+  return { enabled: true, reason: 'ok' };
+}
+
 async function fireS2SPostback(publisher, data, attempt = 1) {
   const { click_id, payout, event, advertiser } = data;
   const pub = db.prepare('SELECT postback_url, integration_mode, s2s_postback_active, postback_secret FROM publishers WHERE username = ?').get(publisher);
-  if (!pub?.postback_url) return;
-  // Integration Mode gate (spec §5): only send when the publisher is in an S2S
-  // mode AND outbound is active. Standard-portal publishers never get outbound.
-  // (Publishers that already had a postback_url were migrated to portal_s2s+active,
-  // so their existing behaviour is unchanged.)
-  const s2sEnabled = (pub.integration_mode === 's2s_network' || pub.integration_mode === 'portal_s2s')
-    && pub.s2s_postback_active === 1;
-  if (!s2sEnabled) return;
+  // Integration Mode gate (spec §5): only send when in an S2S mode AND outbound
+  // active AND a URL is set. Uses the shared outboundGate so the test tool and UI
+  // reflect the exact same decision.
+  if (!outboundGate(pub).enabled) return;
 
   // Macro map. Adds S2S macros: {external_click_id} {status} {currency}
   // {conversion_time} {af_sub1..5} {af_siteid} on top of the existing set.
@@ -3086,7 +3095,7 @@ app.post('/admin/advertisers/:slug/postback-test', requireAdmin, async (req, res
 app.get('/admin/publishers/:id/postback-test', requireAdmin, (req, res) => {
   const pub = db.prepare('SELECT * FROM publishers WHERE id = ?').get(req.params.id);
   if (!pub) return res.redirect('/admin/publishers?msg=Not+found&ok=0');
-  res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result: null, preview: null, sample: {} }));
+  res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result: null, preview: null, sample: {}, gate: outboundGate(pub) }));
 });
 
 app.post('/admin/publishers/:id/postback-test', requireAdmin, async (req, res) => {
@@ -3108,10 +3117,11 @@ app.post('/admin/publishers/:id/postback-test', requireAdmin, async (req, res) =
   };
 
   const action = (req.body.action || 'preview').trim();
+  const gate = outboundGate(pub);  // same decision as real enforcement
 
   if (!pub.postback_url) {
     return res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken,
-      result: { error: 'This publisher has no postback URL configured.' }, preview: null, sample }));
+      result: { error: 'This publisher has no postback URL configured.' }, preview: null, sample, gate }));
   }
 
   // Build the preview URL exactly as fireS2SPostback would (same macro map + encoding).
@@ -3128,7 +3138,7 @@ app.post('/admin/publishers/:id/postback-test', requireAdmin, async (req, res) =
 
   // action=preview → just show the URL, do not send.
   if (action === 'preview') {
-    return res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result: null, preview: previewUrl, sample }));
+    return res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result: null, preview: previewUrl, sample, gate }));
   }
 
   // action=send → fire ONE real request (no retry), log as is_test=1.
@@ -3151,7 +3161,7 @@ app.post('/admin/publishers/:id/postback-test', requireAdmin, async (req, res) =
          result.ok ? 1 : 0, result.ok ? 1 : 0, result.ok ? null : 'test_failed', result.body, result.ms);
   logAudit('publisher.postback_test', 'publisher', pub.username, { status: result.status, is_test: true }, req);
 
-  res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result, preview: previewUrl, sample }));
+  res.send(renderOutboundPostbackTest({ pub, csrfToken: req.session.csrfToken, result, preview: previewUrl, sample, gate }));
 });
 
 
@@ -5607,6 +5617,7 @@ const ADMIN_CSS = `
   @media (max-width:640px){
     .fx-add-form{grid-template-columns:1fr}
     .fx-add-form .btn{width:100%;justify-content:center;min-height:44px}
+    .fg-row{grid-template-columns:1fr}
   }
   /* UIUX sweep — per-row actions dropdown (advertisers list). The list is
      position:fixed (placed by JS) so section{overflow:hidden} can't clip it. */
@@ -7308,6 +7319,16 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       <small>Macros: <code>{click_id}</code> <code>{external_click_id}</code> <code>{payout}</code> <code>{event}</code> <code>{status}</code> <code>{currency}</code> <code>{conversion_time}</code> <code>{advertiser}</code> <code>{af_sub1}</code>…<code>{af_sub5}</code> — fired on every conversion. Up to 3 attempts, 5-min retry on failure.
       ${isEdit ? `· <a href="/admin/publishers/${pub.id}/postback-test">Test outbound postback →</a>` : ''}</small>
     </div>
+    ${isEdit ? (() => {
+      // S3 — show the EFFECTIVE outbound status (mirrors enforcement gate), so
+      // "mode set but not active" or "no URL" is never a silent surprise.
+      const g = outboundGate(pub);
+      const label = g.enabled ? '<span class="badge active">Outbound: ACTIVE</span>'
+        : g.reason === 'no_url' ? '<span class="badge" style="background:#eef2f7;color:#48484a">Outbound: OFF (no URL)</span>'
+        : g.reason === 'standard_mode' ? '<span class="badge" style="background:#fff3e0;color:#e65100">Outbound: OFF (Standard mode)</span>'
+        : '<span class="badge" style="background:#fff3e0;color:#e65100">Outbound: OFF (not active)</span>';
+      return `<div class="fg" style="background:#f9f9fb;border-radius:8px;padding:10px 12px"><label style="margin-bottom:4px">Effective outbound status</label>${label}<small style="display:block;margin-top:6px">Conversions send an outbound postback only when this reads ACTIVE (S2S mode + Outbound active + URL set).</small></div>`;
+    })() : ''}
     <div class="fg"><label>Custom Tracking Domain <span style="font-size:11px;color:#6e6e73">(Backlog #12)</span></label>
       <input type="text" name="custom_domain" value="${H(pub.custom_domain||'')}" placeholder="e.g. go.partner.com (blank = platform default)">
       <small>Branded domain for this publisher's tracking links. Point a CNAME at the Komorebi host; links are generated against it (e.g. <code>https://${H(pub.custom_domain||'go.partner.com')}/track/SLUG?pub=${H(pub.username||'PUB')}</code>). Enter the bare host, no scheme or path.</small>
@@ -7764,9 +7785,7 @@ function renderPostbackLog({ pub, logs, stats, csrfToken = '', flash = null }) {
     </tr>`;
   }).join('');
 
-  const flashHtml = flash
-    ? `<div style="margin:0 20px 12px;padding:10px 14px;border-radius:8px;font-size:13px;background:${flash.ok?'#e8f5e9':'#fdecea'};color:${flash.ok?'#2e7d32':'#c62828'}">${H(flash.msg)}</div>`
-    : '';
+  const flashBar = flash ? flashHtml({ type: flash.ok ? 'success' : 'error', text: flash.msg }) : '';
 
   const body = `${adminHeader(`<a href="/admin/publishers/${H(pub.id)}/edit" class="hbtn ghost">Edit Publisher</a>
     <a href="/admin/publishers" class="hbtn ghost">← Publishers</a>`)}
@@ -7788,12 +7807,12 @@ function renderPostbackLog({ pub, logs, stats, csrfToken = '', flash = null }) {
     : `<div class="empty" style="padding:16px 20px;text-align:left;font-size:13px">
         No S2S postback URL configured for this publisher.
         <a href="/admin/publishers/${H(pub.id)}/edit">Set one →</a></div>`}
-  ${flashHtml}
+  ${flashBar}
   ${logs.length===0
     ? '<div class="empty">No postback attempts yet.</div>'
-    : `<table><thead><tr>
+    : `<div class="table-wrap"><table><thead><tr>
         <th>Fired At</th><th>Click ID</th><th>URL Fired</th><th>Status</th><th style="text-align:center">Attempt</th><th>Error</th><th></th>
-      </tr></thead><tbody>${rows}</tbody></table>`}
+      </tr></thead><tbody>${rows}</tbody></table></div>`}
 </section>
 </main>`;
 
@@ -7907,8 +7926,18 @@ ${resultHtml}
 }
 
 // #4 — OUTBOUND postback test tool render (tests postback SENT to a publisher).
-function renderOutboundPostbackTest({ pub, csrfToken = '', result, preview, sample = {} }) {
+function renderOutboundPostbackTest({ pub, csrfToken = '', result, preview, sample = {}, gate = null }) {
   const v = k => H(sample[k] || '');
+  // S1 fix — when outbound is disabled by the same gate enforcement uses, warn
+  // loudly. Otherwise a green "200 OK" here misleads: real conversions won't fire.
+  const gateBanner = (gate && !gate.enabled && gate.reason !== 'no_url') ? `
+    <div style="margin:0 24px 16px;padding:12px 16px;border-radius:8px;background:#fff3e0;border:1px solid #e65100;color:#e65100;font-size:13px;line-height:1.5">
+      ⚠️ <strong>Outbound is currently OFF for this publisher</strong>
+      ${gate.reason === 'standard_mode' ? '(Integration Mode = Standard Portal).' : '(Outbound active is unchecked).'}
+      This test will still fire, but <strong>real conversions will NOT send a postback</strong>.
+      Change Integration Mode to an S2S mode and tick "Outbound active" on the
+      <a href="/admin/publishers/${pub.id}/edit">publisher's edit page</a> before relying on this for Yana go-live.
+    </div>` : '';
   const previewHtml = preview ? `
     <div style="padding:0 24px 16px">
       <div style="font-size:12px;color:#6e6e73;margin-bottom:6px">Preview URL (after macro substitution):</div>
@@ -7919,18 +7948,24 @@ function renderOutboundPostbackTest({ pub, csrfToken = '', result, preview, samp
       <div style="padding:16px 20px;color:#c62828">${H(result.error)}</div></section>` : `
     <section style="border:2px solid ${result.ok ? '#2e7d32' : '#c62828'};margin-top:12px">
       <div class="sh"><h2>Test Result — HTTP ${result.status}${result.ok ? ' ✓' : ' ✗'}</h2>
-        <span class="meta">${result.ms}ms · marked as test (not counted in reports/cap/payout, no retry)</span></div>
+        <span class="meta">${result.ms}ms · marked as test (not counted in reports/cap/payout, no retry)${gate && !gate.enabled ? ' · NOTE: outbound is OFF — real conversions will not fire' : ''}</span></div>
       <div style="padding:16px 20px">
         <div style="font-size:12px;color:#6e6e73;margin-bottom:6px">Response body:</div>
         <pre style="background:#1d1d1f;color:#e8e8ed;padding:12px 14px;border-radius:8px;font-size:12px;overflow:auto;white-space:pre-wrap">${H(result.body || '(empty)')}</pre>
       </div>
     </section>`) : '';
 
+  const outStatus = gate ? (gate.enabled ? '<span class="badge active">Outbound ACTIVE</span>'
+    : gate.reason === 'no_url' ? '<span class="badge" style="background:#eef2f7;color:#48484a">OFF (no URL)</span>'
+    : gate.reason === 'standard_mode' ? '<span class="badge" style="background:#fff3e0;color:#e65100">OFF (Standard mode)</span>'
+    : '<span class="badge" style="background:#fff3e0;color:#e65100">OFF (not active)</span>') : '';
+
   const noUrl = !pub.postback_url;
   const body = `${adminHeader(`<a href="/admin/publishers/${pub.id}/edit" class="hbtn ghost">← Edit publisher</a>`)}
 <main>
 <section>
-  <div class="sh"><h2>Outbound Postback Test — ${H(pub.username)}</h2><span class="meta">${H(pub.integration_mode || 'standard')}</span></div>
+  <div class="sh"><h2>Outbound Postback Test — ${H(pub.username)}</h2><span class="meta">${outStatus}</span></div>
+  ${gateBanner}
   <div style="padding:20px 24px">
     ${noUrl
       ? `<p style="color:#c62828">This publisher has no postback URL configured. Set one on the publisher's edit page first.</p>`
@@ -8183,18 +8218,16 @@ function renderSourceCaps({ rows, publishers, advertisers, csrfToken = '', flash
   const pubOpts = publishers.map(p => `<option value="${p.id}">${H(p.username)}</option>`).join('');
   const advOpts = advertisers.map(a => `<option value="${a.id}">${H(a.name)}</option>`).join('');
 
-  const flashHtml = flash
-    ? `<div style="margin:0 20px 12px;padding:10px 14px;border-radius:8px;font-size:13px;background:${flash.ok?'#e8f5e9':'#fdecea'};color:${flash.ok?'#2e7d32':'#c62828'}">${H(flash.msg)}</div>`
-    : '';
+  const flashBar = flash ? flashHtml({ type: flash.ok ? 'success' : 'error', text: flash.msg }) : '';
 
   const body = `${adminHeader()}
 <main>
 <section>
   <div class="sh"><h2>Source Caps</h2><span class="meta">${N(rows.length)} caps</span></div>
   <div style="padding:0 20px 10px;font-size:12px;color:#6e6e73">
-    Caps apply per <strong>external source</strong> (the <code>af_sub1</code> value), so each network source is limited independently — one source hitting its cap never affects others. Blank = unlimited (∞). Only approved conversions count.
+    Caps apply per <strong>external source</strong> (the <code>af_sub1</code> value), so each network source is limited independently — one source hitting its cap never affects others. Blank = unlimited (∞). Only approved conversions count. Saving an existing publisher + advertiser + source updates its caps.
   </div>
-  ${flashHtml}
+  ${flashBar}
   <div style="padding:0 20px 16px">
     <form method="POST" action="/admin/source-caps" style="background:#f9f9fb;border:1px solid #eee;border-radius:10px;padding:14px 16px">${csrfField(csrfToken)}
       <div class="fg-row">
@@ -10177,7 +10210,7 @@ function renderDocs() {
         <div class="faq-q">How often are S2S postbacks fired back to my system?</div>
         <div class="faq-a">
           <p>If you have configured a publisher-side postback URL in your account settings, Komorebi fires it in real time — within seconds of recording the conversion. If the initial request fails (non-2xx response or timeout), the system will automatically retry up to <strong>3 times</strong>, with a <strong>5-minute delay</strong> between each attempt.</p>
-          <p>You can view the full postback delivery log, including HTTP status codes and any error messages, in the publisher portal under your account settings. Contact your account manager to configure or update your postback URL.</p>
+          <p>Delivery status for each conversion is available via the API: the <code>postback_delivery_status</code> and <code>postback_attempts</code> fields on <code>GET /api/v1/conversions</code>. For the full delivery log (HTTP status codes and error messages) or to configure your postback URL, contact your account manager.</p>
         </div>
       </div>
 
