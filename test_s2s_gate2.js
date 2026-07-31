@@ -3,14 +3,7 @@ const assert = require('node:assert');
 let pass=0,fail=0;
 const t=(n,fn)=>{try{fn();console.log('  ✓',n);pass++;}catch(e){console.log('  ✗',n,'\n     ',e.message);fail++;}};
 
-// mirror of outboundGate
-function outboundGate(pub){
-  if(!pub||!pub.postback_url||!String(pub.postback_url).trim()) return {enabled:false,reason:'no_url'};
-  const modeOk = pub.integration_mode==='s2s_network'||pub.integration_mode==='portal_s2s';
-  if(!modeOk) return {enabled:false,reason:'standard_mode'};
-  if(pub.s2s_postback_active!==1) return {enabled:false,reason:'inactive'};
-  return {enabled:true,reason:'ok'};
-}
+const { outboundGate } = require('./outbound-gate');
 
 console.log('S1 — test tool gate mirrors enforcement (no false positive):');
 t('standard mode + URL → disabled (standard_mode)', ()=>{

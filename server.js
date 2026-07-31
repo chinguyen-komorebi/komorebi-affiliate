@@ -12,6 +12,7 @@ const nodemailer  = require('nodemailer');
 const cron        = require('node-cron');
 const db          = require('./db');
 const { pidEffectiveStatus } = require('./pid-status');
+const { outboundGate } = require('./outbound-gate');
 const geoip       = require('geoip-lite');
 const helmet      = require('helmet');
 
@@ -965,19 +966,6 @@ async function sendDailySummaryEmail() {
 
 const S2S_MAX_ATTEMPTS = 3;
 const S2S_RETRY_MS     = 5 * 60 * 1_000; // 5 minutes
-
-// Single source of truth for whether outbound S2S postback fires for a publisher
-// (spec §5). Enforcement (fireS2SPostback), the test tool, and the publisher-edit
-// UI all use this, so the tool/UI can never claim outbound works when enforcement
-// would skip it — the failure class UI/UX flagged (B1 / test-tool false positive).
-// Returns { enabled, reason } where reason ∈ 'ok' | 'no_url' | 'standard_mode' | 'inactive'.
-function outboundGate(pub) {
-  if (!pub || !pub.postback_url || !String(pub.postback_url).trim()) return { enabled: false, reason: 'no_url' };
-  const modeOk = pub.integration_mode === 's2s_network' || pub.integration_mode === 'portal_s2s';
-  if (!modeOk) return { enabled: false, reason: 'standard_mode' };
-  if (pub.s2s_postback_active !== 1) return { enabled: false, reason: 'inactive' };
-  return { enabled: true, reason: 'ok' };
-}
 
 async function fireS2SPostback(publisher, data, attempt = 1) {
   const { click_id, payout, event, advertiser } = data;
@@ -7325,8 +7313,8 @@ function renderPubForm({ title, action, pub = {}, error, flash, csrfToken = '',
       const g = outboundGate(pub);
       const label = g.enabled ? '<span class="badge active">Outbound: ACTIVE</span>'
         : g.reason === 'no_url' ? '<span class="badge" style="background:#eef2f7;color:#48484a">Outbound: OFF (no URL)</span>'
-        : g.reason === 'standard_mode' ? '<span class="badge" style="background:#fff3e0;color:#e65100">Outbound: OFF (Standard mode)</span>'
-        : '<span class="badge" style="background:#fff3e0;color:#e65100">Outbound: OFF (not active)</span>';
+        : g.reason === 'standard_mode' ? '<span class="badge" style="background:#fff3e0;color:#b34700">Outbound: OFF (Standard mode)</span>'
+        : '<span class="badge" style="background:#fff3e0;color:#b34700">Outbound: OFF (not active)</span>';
       return `<div class="fg" style="background:#f9f9fb;border-radius:8px;padding:10px 12px"><label style="margin-bottom:4px">Effective outbound status</label>${label}<small style="display:block;margin-top:6px">Conversions send an outbound postback only when this reads ACTIVE (S2S mode + Outbound active + URL set).</small></div>`;
     })() : ''}
     <div class="fg"><label>Custom Tracking Domain <span style="font-size:11px;color:#6e6e73">(Backlog #12)</span></label>
@@ -7931,7 +7919,7 @@ function renderOutboundPostbackTest({ pub, csrfToken = '', result, preview, samp
   // S1 fix — when outbound is disabled by the same gate enforcement uses, warn
   // loudly. Otherwise a green "200 OK" here misleads: real conversions won't fire.
   const gateBanner = (gate && !gate.enabled && gate.reason !== 'no_url') ? `
-    <div style="margin:0 24px 16px;padding:12px 16px;border-radius:8px;background:#fff3e0;border:1px solid #e65100;color:#e65100;font-size:13px;line-height:1.5">
+    <div style="margin:0 24px 16px;padding:12px 16px;border-radius:8px;background:#fff3e0;border:1px solid #b34700;color:#b34700;font-size:13px;line-height:1.5">
       ⚠️ <strong>Outbound is currently OFF for this publisher</strong>
       ${gate.reason === 'standard_mode' ? '(Integration Mode = Standard Portal).' : '(Outbound active is unchecked).'}
       This test will still fire, but <strong>real conversions will NOT send a postback</strong>.
@@ -7957,8 +7945,8 @@ function renderOutboundPostbackTest({ pub, csrfToken = '', result, preview, samp
 
   const outStatus = gate ? (gate.enabled ? '<span class="badge active">Outbound ACTIVE</span>'
     : gate.reason === 'no_url' ? '<span class="badge" style="background:#eef2f7;color:#48484a">OFF (no URL)</span>'
-    : gate.reason === 'standard_mode' ? '<span class="badge" style="background:#fff3e0;color:#e65100">OFF (Standard mode)</span>'
-    : '<span class="badge" style="background:#fff3e0;color:#e65100">OFF (not active)</span>') : '';
+    : gate.reason === 'standard_mode' ? '<span class="badge" style="background:#fff3e0;color:#b34700">OFF (Standard mode)</span>'
+    : '<span class="badge" style="background:#fff3e0;color:#b34700">OFF (not active)</span>') : '';
 
   const noUrl = !pub.postback_url;
   const body = `${adminHeader(`<a href="/admin/publishers/${pub.id}/edit" class="hbtn ghost">← Edit publisher</a>`)}
